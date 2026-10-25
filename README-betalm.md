@@ -132,6 +132,26 @@ python3 tools/remotezip.py IPSW_URL DeviceTree.d22ap.im4p research/ipsw-x/dt
 ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im4p -o research/ipsw-x/d22ap.adt
 ```
 
+**On WSL2 (no HFS+ in Microsoft's kernel):** use `tools/mkiosroot-wsl.sh`,
+which does the same as `mkiosroot.sh` + `sweet-root-tweaks.py` but fills the
+HFS+ image through libguestfs (a small VM with a stock Ubuntu kernel). Keep
+everything under `~`, not `/mnt/c`:
+
+```
+sudo apt install -y hfsprogs rsync python3 libguestfs-tools linux-generic \
+    android-sdk-libsparse-utils
+sudo chmod 0644 /boot/vmlinuz-*          # libguestfs reads the kernel as you
+export LIBGUESTFS_BACKEND=direct
+libguestfs-test-tool | tail -3           # must end in TEST FINISHED OK
+tools/mkiosroot-wsl.sh OS.dmg SystemOS.dmg AppOS.dmg ~/ios16-root.img 16G
+img2simg ~/ios16-root.img ~/ios16-root.simg
+```
+
+`apfs-fuse` is not packaged on newer Ubuntu: build it from
+[sgan81/apfs-fuse](https://github.com/sgan81/apfs-fuse) with
+`cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5`, after adding
+`#include <cstdint>` to `ApfsLib/PList.h` (GCC 15).
+
 ### 5. Choose where the root goes
 
 **A. Dual boot (keeps Android).** Make a 16 GiB+ partition named `iosroot`
