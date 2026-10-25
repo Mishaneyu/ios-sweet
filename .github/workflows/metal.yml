@@ -1,0 +1,101 @@
+name: metal
+
+# SweetMetal2.bundle for iOS 16 arm64: Metal on the Adreno 640 through
+# metal2vulkan + Mesa's Turnip, exactly as ios-flame (Pixel 4, SM8150) builds
+# it (NWylynko/ios-flame, MIT; UniXNU's Mesa patches and Metal frontend, MIT;
+# metal2vulkan, GPL-2.0-or-later OR LGPL-3.0-or-later; Mesa, MIT). Nothing is
+# vendored: every source is fetched at a pinned commit. The kernel side is
+# xnu/patches/0090 (SweetAccelerator v2 user client = NativeAdreno ABI).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [betalm]
+    paths:
+      - ".github/workflows/metal.yml"
+      - "gpu/**"
+
+concurrency:
+  group: metal-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLAME_REPO: https://github.com/NWylynko/ios-flame
+  FLAME_SHA: 745c4341af86089efb0df851fa8a27fb8face624
+  UNIXNU_REPO: https://github.com/UniXNU/UniXNU
+  UNIXNU_SHA: 16e592abee8a550dec8154ed1f38b5ebc4f16213
+  MESA_REPO: https://gitlab.freedesktop.org/mesa/mesa.git
+  MESA_MIRROR: https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa
+  MESA_SHA: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+  M2V_REPO: https://github.com/steelbrain/metal2vulkan
+  M2V_SHA: 720ef1ce
+  RUST_VERSION: 1.98.0
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch ios-flame and UniXNU (pinned)
+        run: |
+          set -eux
+          git init -q flame && git -C flame fetch -q --depth 1 "$FLAME_REPO" "$FLAME_SHA" && git -C flame checkout -q FETCH_HEAD
+          git init -q unixnu && git -C unixnu fetch -q --depth 1 "$UNIXNU_REPO" "$UNIXNU_SHA" && git -C unixnu checkout -q FETCH_HEAD
+          ls flame/phone/metal2 flame/phone/turnip unixnu/patches/mesa
+
+      - name: Host tools
+        run: |
+          set -eux
+          brew install bison flex glslang llvm ninja || true
+          python3 -m venv flame/work/turnip/venv
+          flame/work/turnip/venv/bin/pip install -q meson mako pyyaml packaging
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup target add --toolchain "$RUST_VERSION" aarch64-apple-ios
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Mesa (UniXNU pin + its Turnip darwin patches + ios-flame's)
+        run: |
+          set -eux
+          M=flame/work/turnip/mesa
+          git init -q "$M"
+          git -C "$M" fetch -q --depth 1 "$MESA_REPO" "$MESA_SHA" || git -C "$M" fetch -q --depth 1 "$MESA_MIRROR" "$MESA_SHA"
+          git -C "$M" checkout -q FETCH_HEAD
+          for p in $(python3 -c "import json; print(' '.join(json.load(open('unixnu/scripts/data/adreno-compiler-inputs.json'))['patches']))"); do
+            echo "== $p"; git -C "$M" apply --whitespace=nowarn "$PWD/unixnu/$p"
+          done
+          for p in flame/phone/turnip/patches/*.patch; do
+            echo "== $p"; git -C "$M" apply --whitespace=nowarn "$PWD/$p"
+          done
+
+      - name: Turnip for iOS 16
+        run: |
+          set -eux
+          sh flame/tools/build-turnip-ios.sh || { tail -80 flame/work/turnip/configure-ios.log || true; tail -80 flame/work/turnip/build-ios.log || true; exit 1; }
+
+      - name: metal2vulkan bridge for iOS 16
+        run: |
+          set -eux
+          git clone -q "$M2V_REPO" flame/work/metal2vulkan
+          git -C flame/work/metal2vulkan checkout -q "$M2V_SHA"
+          for p in flame/phone/metal2/bridge/patches/*.patch; do
+            echo "== $p"; git -C flame/work/metal2vulkan apply --whitespace=nowarn "$PWD/$p"
+          done
+          export PATH=/opt/homebrew/opt/llvm/bin:$PATH
+          sh flame/tools/build-m2v-bridge.sh || { tail -120 flame/work/m2v-bridge/build-ios.log || true; exit 1; }
+
+      - name: SweetMetal2.bundle
+        run: |
+          set -eux
+          sh flame/phone/metal2/build.sh
+          cd flame/phone/metal2/out
+          tar -czf "$GITHUB_WORKSPACE/SweetMetal2.bundle.tar.gz" SweetMetal2.bundle
+          ls -la SweetMetal2.bundle
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetmetal2
+          path: SweetMetal2.bundle.tar.gz
+          if-no-files-found: error
