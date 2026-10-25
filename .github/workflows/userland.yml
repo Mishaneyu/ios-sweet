@@ -66,16 +66,17 @@ jobs:
             git -C work/turnip/mesa fetch --depth 1 https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa 85fda3b36405bcaea8bffc64aa4f2651dc90770d
           git -C work/turnip/mesa checkout -q FETCH_HEAD
           python3 - <<'PY'
-          import json, subprocess
+          import json, os, subprocess
           cfg = json.load(open("reference-repos/UniXNU/scripts/data/adreno-compiler-inputs.json"))
           for rel in cfg["patches"]:
-              p = "reference-repos/UniXNU/" + rel
-              r = subprocess.run(["git", "-C", "work/turnip/mesa", "apply", "--check", "../../" + p], capture_output=True)
+              p = os.path.abspath("reference-repos/UniXNU/" + rel)
+              r = subprocess.run(["git", "-C", "work/turnip/mesa", "apply", "--check", p], capture_output=True, text=True)
               if r.returncode == 0:
-                  subprocess.run(["git", "-C", "work/turnip/mesa", "apply", "../../" + p], check=True)
+                  subprocess.run(["git", "-C", "work/turnip/mesa", "apply", p], check=True)
                   print("Applied:", rel)
               else:
-                  print("Skipped (not needed for runtime dylib):", rel)
+                  print("Skipped (not needed for runtime dylib):", rel, r.stderr.strip())
+          assert os.path.exists("work/turnip/mesa/src/freedreno/vulkan/tu_knl_darwin.cc"), "tu_knl_darwin.cc missing!"
           PY
           for p in phone/turnip/patches/*.patch; do
             git -C work/turnip/mesa apply "$PWD/$p"
@@ -96,27 +97,30 @@ jobs:
           sh tools/build-m2v-bridge.sh ios
           sh phone/metal2/build.sh
 
-      - name: Build dash + dropbearmulti for iOS 16 arm64 SSH shell
+      - name: Build dash + dropbearmulti + toybox for iOS 16 arm64 SSH shell
         continue-on-error: true
         run: |
           mkdir -p work/userland/stage work/userland/src
           CC_IOS="$PWD/work/userland/bin/ios-cc"
           # 1. dash (/bin/sh)
-          curl -sfL https://git.kernel.org/pub/scm/utils/dash/dash.git/snapshot/dash-0.5.12.tar.gz | tar xzf - -C work/userland/src
           (
+            set -e
+            git clone --depth 1 --branch v0.5.12 https://git.kernel.org/pub/scm/utils/dash/dash.git work/userland/src/dash-0.5.12
             cd work/userland/src/dash-0.5.12
             ./autogen.sh
             CC="$CC_IOS" CC_FOR_BUILD=/usr/bin/clang ac_cv_func_strchrnul=no ac_cv_func_stat64=no ac_cv_func_open64=no \
-              ./configure --host=aarch64-apple-darwin --enable-static
+              ./configure --host=aarch64-apple-darwin
             make -j4
             strip -x src/dash
             codesign -f -s - src/dash
+            nm -m src/dash | grep "weak external" || true
             cp src/dash ../../stage/dash
-          )
+          ) || echo "WARN: dash build failed"
           # 2. dropbearmulti (root pubkey SSH server)
-          curl -sfL https://matt.ucc.asn.au/dropbear/releases/dropbear-2024.86.tar.bz2 | tar xjf - -C work/userland/src
           (
-            cd work/userland/src/dropbear-2024.86
+            set -e
+            curl -sfL https://github.com/mkj/dropbear/archive/refs/tags/DROPBEAR_2024.86.tar.gz | tar xzf - -C work/userland/src
+            cd work/userland/src/dropbear-DROPBEAR_2024.86
             cat > localoptions.h <<'EOF'
           #define DROPBEAR_SVR_PASSWORD_AUTH 0
           #define DROPBEAR_SVR_PAM_AUTH 0
@@ -125,22 +129,41 @@ jobs:
           #define DROPBEAR_PATH_SSH_PROGRAM "/var/local/bin/dbclient"
           #define DEFAULT_PATH "/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
           EOF
-            # Allow uid 0 single-user login on iOS without getspnam/crypt
             python3 - <<'PY'
-          for fn in ("src/svr-auth.c", "svr-auth.c"):
-              import os
-              if os.path.exists(fn):
-                  s = open(fn).read()
-                  s = s.replace("svr_opts.multiauthmethod", "0 && svr_opts.multiauthmethod")
-                  open(fn, "w").write(s)
+          cs = open("src/common-session.c").read()
+          cs = cs.replace("#if !DROPBEAR_SVR_MULTIUSER", "#if 0 /* IOSONPIXEL_SINGLE_ROOT */")
+          open("src/common-session.c", "w").write(cs)
+          sa = open("src/svr-auth.c").read()
+          sa = sa.replace("setusershell();", "goto goodshell; setusershell();")
+          open("src/svr-auth.c", "w").write(sa)
           PY
+            autoconf && autoheader
             CC="$CC_IOS" ac_cv_func_strchrnul=no ac_cv_func_getpass=yes ac_cv_func_utmpname=no ac_cv_func_utmpxname=no \
               ./configure --host=aarch64-apple-darwin --disable-zlib --disable-syslog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx --disable-pututline --disable-pututxline --disable-lastlog
             make -j4 PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1
             strip -x dropbearmulti
             codesign -f -s - dropbearmulti
+            nm -m dropbearmulti | grep "weak external" || true
             cp dropbearmulti ../../stage/dropbearmulti
-          )
+          ) || echo "WARN: dropbear build failed"
+          # 3. toybox (macos_defconfig, iOS SDK lacks sys/disk.h)
+          (
+            set -e
+            curl -sfL https://github.com/landley/toybox/archive/refs/tags/0.8.11.tar.gz | tar xzf - -C work/userland/src
+            cd work/userland/src/toybox-0.8.11
+            python3 - <<'PY'
+          s = open("lib/portability.c").read()
+          s = s.replace("#if defined(__APPLE__)\n#include <sys/disk.h>", "#if 0 && defined(__APPLE__)\n#include <sys/disk.h>")
+          open("lib/portability.c", "w").write(s)
+          PY
+            export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
+            HOSTCC=/usr/bin/clang CC="$CC_IOS" make macos_defconfig
+            HOSTCC=/usr/bin/clang CC="$CC_IOS" NOSTRIP=1 make -j4 toybox
+            strip -x toybox
+            codesign -f -s - toybox
+            nm -m toybox | grep "weak external" || true
+            cp toybox ../../stage/toybox
+          ) || echo "WARN: toybox build failed"
           ls -la work/userland/stage
 
       - name: Package userland bundle
