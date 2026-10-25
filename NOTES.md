@@ -120,3 +120,5 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 - 0124 10-bit surfaces as BGRA only for WebContent (`sweetsurf10`); the joined network keeps its scan record.
 - 0125 RMX1931 board: 1080x2400 @ 0x9d000000 framebuffer/GPU/HID, `sweet_fts` off by default, Synaptics S3706
   RMI4 touch over GENI I2C SE0 (`rmxtouch`), and `sweetprobe=1` read-only driver bring-up under `rd=md0`.
+- 0126 RMX1931 touch: fall back to open-drain TLMM GPIO I2C (`GPIO 55/56` with SCL clock stretching) when SE0
+  `GENI_IF_DISABLE_RO` (`0x64`) reports `FIFO_IF_DISABLE` (`rmxtouchgpio=1` forces it).

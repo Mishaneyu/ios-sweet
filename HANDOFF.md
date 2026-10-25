@@ -1,9 +1,27 @@
 # Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-25, 23:00 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-26, 00:38 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
+
+### APPLE XNU + USERSPACE PID 1 RUNNING ON RMX1931: Boots #2-#4 verified, kernel 0126 touch GPIO-I2C queued (2026-10-26, 00:38)
+- **Kernel 0125 (`246ed2898282b1777e2133d5d29837465a9083e5b688c243d5a91bec916fce21`, `xnu-8796.141.3`)**:
+  - Built cleanly on GitHub Actions `macos-15` (run `40218272439`).
+  - Packed with `work/boot/rmx1931-hi.adt` (`D22AP` `/product` included) and `work/boot/sweet-init.macho` (`rd=md0`).
+  - Boot-args (Boot #4): `debug=0xc serial=3 cpus=8 keepsyms=1 rd=md0 sweetprobe=1 ufsroot=rawdump ufsrw=1 ufslogsecs=2 rmxtouchdelay=2 rmxtouchlog=1 flamereboot=25` (`userdata` `sda16` never opened or written; `SWEETLOG` flushed to the unused zero tail of `rawdump` `sda10` at block `0x1d0e07`).
+- **Observed on hardware (`work/boot/boot3-shim.log` 3,790 B + `work/boot/boot4-xnu.log` 12,568 B, 11 flushes)**:
+  - **SMP & CPU boost**: `SWEET CPU: 8/8 CPUs initialized, SGI1 verified`; `SWEET CPUFREQ` boosted all three SM8150-AC Kryo 485 clusters and read back `pwrcl=1785 MHz` (idx 17), `perfcl=2419 MHz` (idx 16), `perfpcl=2956 MHz` (idx 20, Snapdragon 855+ prime core!).
+  - **Platform & storage**: `PM8150 RTC` (`ctrl 0x80`), `hfs-627.100.6`, `AppleKeyStore`, `IOCoreSurfaceRoot`, `SWEET AMFI`/`Sandbox`, `/dev/pmem`, `/dev/wlan`, and `SWEET UFS` v3.0 DMA on LUN 0 (`DMA at 0x1047f0000`) all initialized cleanly.
+  - **Buttons & USB**: `SWEET KEYS` (`pon-apid=247`, `gpio6-apid=260`) ready; `SWEET USB` `DWC3` (`GSNPSID 0x33313130`) + `usb30_prim` GDSC and all 7 GCC USB clocks ON.
+  - **EL0 Apple Mach-O userspace (`PID 1`)**: `*** SWEET userspace: init running as PID 1 ***` followed by `SWEET init: still alive` every 5.005 s on the `1080x2400` AMOLED display (`5.227 s .. 50.267 s`), then clean watchdog reset to Fastboot and automatic restore of `backup/boot.img` into the user's custom Android ROM.
+  - **Reset / DRAM note**: Realme's TZ/XBL zeroes DRAM around `0x1fe000000..0x1fff00000` on a watchdog reset (`ramlog: no mailbox`), and ABL places `dtb`/`initrd` around `0xb05fd000..0xb8000000` (overlapping `ramoops` `0xb7e00000`), so XNU's live `SWEETLOG` flusher (`ufsroot=rawdump ufsrw=1 ufslogsecs=2` during non-destructive runs, or `userdata` tail once `rd=ufsroot0` is installed) is the reliable log channel on `RMX1931`.
+  - **Touch rails & I2C finding**: `ldoa17` 3000 mV (`TCS0 done=1`) and `PM8150L GPIO5` 1.8 V (`apid=318 sub=0x10 post en=80 rt=80 ok=1`) both came up cleanly, and `SE0` (`0x00c80000`) reported `fw=0x303 proto=3` (I2C) with `ios=0x3` (SDA/SCL idle high at 1.8 V), but `GENI_IF_DISABLE_RO` (`0x64`) had bit 0 (`FIFO_IF_DISABLE`) set because `RMX1931`'s TZ `qupfw` provisions SE17 for GPI/GSI DMA (`dmas` in `live.dtb`).
+- **Kernel 0126 (`xnu/patches/0126-rmx1931-touch-gpio-i2c.patch`)**:
+  - Updated `bsd/dev/rmx1931_touch.c` to automatically switch `GPIO 55` (SDA) and `GPIO 56` (SCL) to open-drain TLMM GPIO I2C (with SCL clock-stretching and 9-clock bus recovery; `rmxtouchgpio=1` forces it) whenever `GENI_IF_DISABLE_RO & 1` is set, bypassing GSI/SMMU completely.
+- **Open (next)**:
+  1. Download `kernel.development.sweet` `0126` from CI and verify Synaptics `S3706` RMI4 PDT (`F01`/`F12`/`F34`) + finger coordinates under `rd=md0`.
+  2. When the user confirms wiping `userdata` (`sda16`) for full iOS: extract `RMX1931` Adreno 640 (`a640_*`) + `WCN3990` firmware from Android, build the iOS 16.7 (`iPhone10,3` / `D22AP`) HFS+ root image, flash to `sda16` in TWRP, and boot into SpringBoard (`rd=ufsroot0 ufsrw=1 sweetgpu=1 sweetmtl=2`).
 
 ### RMX1931 BRING-UP: hardware backups, Boot #1 shim probe on screen, kernel 0125 staged (2026-10-25, 23:00)
 Target device: **Realme X2 Pro (`RMX1931` / `RMX1931L1`, codename `samurai`, `oppo,prjname=19781`, `SM8150-AC`, 8 GB RAM)**.

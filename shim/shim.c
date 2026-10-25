@@ -365,7 +365,7 @@ void shim_main(uintptr_t dtb)
 	if (spmi_ok) {
 		log_pmic();
 		set_reboot_bootloader();
-#ifndef SHIM_READONLY
+#if !defined(SHIM_READONLY) && !defined(SHIM_WARM_RESET)
 		set_hard_reset();
 #endif
 	}

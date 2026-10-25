@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$Image,
-    [int]$TimeoutSeconds = 60
+    [int]$TimeoutSeconds = 60,
+    [string]$RescueProbe = ""
 )
 
 # Safe temporary boot-partition test runner for Realme X2 Pro (RMX1931 / samurai).
@@ -62,6 +63,23 @@ if (-not $returned) {
     Write-Host "WARNING: Did not auto-return within $($TimeoutSeconds + 5)s. Hold Power + Vol Down to enter Fastboot, then run:" -ForegroundColor Yellow
     Write-Host "  `"$Fb`" flash boot `"$BackupBoot`"" -ForegroundColor Yellow
     exit 2
+}
+
+if ($RescueProbe -ne "" -and (Test-Path $RescueProbe)) {
+    Write-Host "[3b/4] Flashing zero-write rescue probe ($RescueProbe) to capture SWEETMIR XNU console..." -ForegroundColor Cyan
+    & $Fb flash boot $RescueProbe
+    if ($LASTEXITCODE -eq 0) {
+        & $Fb reboot
+        Start-Sleep -Seconds 5
+        for ($t = 0; $t -lt 45; $t++) {
+            Start-Sleep -Seconds 1
+            $fbDevs = (& $Fb devices) | Out-String
+            if ($fbDevs.Trim().Length -gt 0) {
+                Write-Host "      Rescue probe returned to Fastboot at +$($t + 5)s." -ForegroundColor Green
+                break
+            }
+        }
+    }
 }
 
 Write-Host "[4/4] Restoring original backup\boot.img..." -ForegroundColor Cyan

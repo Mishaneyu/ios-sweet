@@ -157,11 +157,15 @@ static int find_userdata(void)
 		return -3;
 	if (read_blocks(entry_lba, (nent * esz + BLOCK - 1) / BLOCK, data))
 		return -4;
+#ifdef UFS_LOG_PART_RAWDUMP
+	static const char want[] = "rawdump";
+#else
 	static const char want[] = "userdata";
+#endif
 	for (uint32_t i = 0; i < nent; i++) {
 		const uint8_t *e = data + i * esz;
 		int match = 1;
-		for (int c = 0; c < 9; c++)
+		for (unsigned c = 0; c < sizeof(want); c++)
 			if (e[56 + 2 * c] != (uint8_t)want[c] || e[57 + 2 * c])
 				match = 0;
 		if (!match)

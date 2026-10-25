@@ -41,10 +41,17 @@ RAMLOG = CMDLINE + BOOT_LINE_LENGTH - 16	# 0x298: ring_va, total_va
 
 
 def kernel_symbols(path, *names):
-    """Addresses of the named symbols (0 if absent), from nm."""
-    import subprocess
+    """Addresses of the named symbols (0 if absent), from nm / llvm-nm."""
+    import shutil, subprocess
     found = dict.fromkeys(names, 0)
-    out = subprocess.run(['nm', path], capture_output=True, text=True).stdout
+    out = ''
+    for prog in ('llvm-nm', 'nm'):
+        if not shutil.which(prog):
+            continue
+        res = subprocess.run([prog, path], capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout:
+            out = res.stdout
+            break
     for line in out.splitlines():
         parts = line.split()
         if len(parts) == 3 and parts[2] in found:
