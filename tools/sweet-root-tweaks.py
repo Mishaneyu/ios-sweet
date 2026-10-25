@@ -80,6 +80,10 @@ def containers(root):
             os.chown(d, uid, uid)
             os.chmod(d, 0o755)
             print('mkdir', d)
+    for rel, mode in (('private/var/local', 0o777), ('private/var/local/m2v-cache', 0o777), ('private/etc/dropbear', 0o700)):
+        d = os.path.join(root, rel)
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, mode)
 
 
 def find_container(root, kind, identifier):

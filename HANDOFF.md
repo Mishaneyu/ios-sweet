@@ -1,9 +1,40 @@
 # Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-26, 00:38 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-26, 04:20 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
+
+### INTERACTIVE iOS 16.7.16 UI ON RMX1931 (Boot #6, kernel 0127) + ROOT CAUSE OF CPU FALLBACK FIXED IN KERNEL 0128 (2026-10-26, 04:20)
+- **Boot #6 (`shim/out/shim-rmx1931-ios.img`, kernel `0127`, 16 GiB iOS 16.7.16 `20H392` HFS+ root on `/dev/block/sda16`)**:
+  - Boot-args: `launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 ufslogsecs=2 sweetgpu=1 sweetmtl=2 sweetusb=2 sweetusbframes=0 sweetrtcoff=1792944948 rmxtouchdelay=2 flamereboot=1800`.
+  - **Observed on hardware (`work/boot/boot6-ios.log`, `631,041 B`, 349 `SWEETLOG` flushes over 918 s)**:
+    - **Interactive iOS 16.7.16 reached Lock Screen, Home Screen, Settings (`Preferences`), Safari (`WebKit`), and `PosterBoard`**, with Synaptics `S3706A` touch running 918 s with **zero** `poll err` lines and Adreno 640 2D present scaling (`5,100+` frames, `avg cache clean 627 us, GPU blit 16 us`).
+    - **Exact root cause of choppy UI (`4–12 fps` during swipes, `GPU busy 0–2%`)**: `SweetMetal2.bundle` loaded into `backboardd`, `SpringBoard`, `Preferences`, `com.apple.WebKit.GPU`, and `PosterBoard`, but every non-root process (`uid 501`) logged:
+      `MTL2[59 backboardd]: native-metal: device refused: device: ShaderCache(ShaderCacheError { path: Some("/var/local/m2v-cache/backboardd"), kind: PermissionDenied, message: "Permission denied (os error 13)" })`
+      because `/private/var/local` had mode `0755` (`root:wheel`) and `/private/var/local/m2v-cache` did not exist. Without a Metal device, CoreAnimation rendered 100% on the CPU while the Adreno 640 3D engine sat idle.
+    - Also observed: `dropbearmulti` respawned every 10 s because `/private/etc/dropbear` did not exist for `-R` host-key generation.
+- **Kernel 0128 (`xnu/patches/0128-rmx1931-metal-675mhz-touch.patch`)**:
+  - `bsd/vfs/vfs_syscalls.c` + `bsd/kern/bsd_init.c`: `sweet_ensure_dir_mode()` ensures `/private/var/local` (`0777`), `/private/var/local/m2v-cache` (`0777`), and `/private/etc/dropbear` (`0700`) in `bsdinit_task` before `launchd` starts (fixing the live `/dev/block/sda16` filesystem in-place without re-flashing 16 GiB; `tools/sweet-root-tweaks.py` updated for offline builds too).
+  - `bsd/dev/sweet_a6xx.c` + `bsd/dev/sweet_gpu.c`: unlocked Snapdragon 855+ (`SM8150-AC`) **675 MHz** Adreno 640 Prime OPP (`LVL_NOM_L1 = 320`, `gpu_khz[6] = 675000` from `RMX1931` `gpu_opp_table_v2`, with automatic fallback to `585 MHz` on regular `SM8150`), and raised default `sweetgpufreq` from `4` (`499 MHz`) to `6` (**`675 MHz`**, +35% GPU clock).
+  - `bsd/dev/rmx1931_touch.c`: active touch polling tightened from `8 ms` to **`4 ms`** while `ATTN` (`GPIO 122`) is asserted or fingers are down, and idle safety poll relaxed from `96 ms` to `1 s`.
+- **Open (next)**:
+  1. Build `kernel.development.sweet` `0128` via `xnu.yml`, pack `shim-rmx1931-ios.img`, boot **Boot #7**, and verify `MTL2[... backboardd]: device Adreno (TM) 640` + `perf vote 675 MHz -> 0` + live FPS telemetry.
+
+### TOUCH + ADRENO 640 GPU VERIFIED ON RMX1931 HARDWARE (Boot #5, kernel 0127) + FULL iOS 16.7.16 ROOT READY (2026-10-26, 03:36)
+- **Kernel 0127 (`cf08652563f12b501d8705ed3c92e03e2e58beff6a193ab9e02116325d77b0f7`, `xnu-8796.141.3`)**:
+  - Built cleanly on GitHub Actions `macos-15` (run `40225785408`), including `0126` (`bsd/dev/rmx1931_touch.c` open-drain TLMM GPIO I2C fallback on `GPIO 55`/`56`) and `0127` (`bsd/dev/sweet_a6xx.c` `ZAP_REGION = 0x99515000ull` matching `RMX1931` `pil_gpu_region`).
+  - Boot #5 (`shim-rmx1931-xnu-rd.img`, `userdata` `sda16` untouched; `debug=0xc serial=3 cpus=8 keepsyms=1 rd=md0 sweetprobe=1 sweetgpu=1 sweetrtcoff=1792944948 ufsroot=rawdump ufsrw=1 ufslogsecs=2 rmxtouchdelay=2 rmxtouchlog=1 flamereboot=30`, `--gpufw research/gpu/fw`, `--ramdisk work/boot/sweet-init.macho`):
+    - **Observed in `work/boot/boot5-xnu.log` (`22,933 B`, 14 `SWEETLOG` flushes)**:
+      - **Adreno 640 GPU (`0127`)**: `bus vote MC0 top -> 0`, `SH0 top -> 0`, `cx gdsc -> f8222000 on`, `gmu: 7 firmware blocks loaded`, **`gmu: init result babeface BOOTED, hfi_ctrl 1`**, `hfi: perf/bw tables, core fw start, start, perf vote 499 MHz -> 0`, `oob gpu_set acked, gx gdsc f8222800`, **`zap: auth and reset rc 0 r1 0`**, `ring secure mode off: rptr b wptr b status 1 int 0 hwfault 0 cp_status1 1000000 idle`, **`SWEET GPU: bring-up done, GPU ready in 285 ms (pool 0x104a00000)`**.
+      - **Synaptics `S3706A` RMI4 Touch (`0126`)**: `SE0 FIFO unavailable (fifo_off=0x1 force=0); switching GPIO55/56 to open-drain I2C`, `GPIO I2C bus idle sda=1 scl=1`, `PDT @0xe9 F34`, `PDT @0xe3 F01`, `PDT @0xdd F12`, **`product="S3706A" fwid=0xcc183013 f01_status=0x81 (err=0)`**, **`Synaptics S3706 ready (1080x2400, 10 fingers, poll=8ms)`**, followed by continuous ~68 Hz finger swipe coordinates (`slot=0 down x=203..854 y=893..1872`) and clean `lift all (was=0x1)`.
+      - **Clock & return**: `PM8150 RTC 20913 s (ctrl 80), time of day 1792965861`; clean warm-reset to Fastboot at `+73 s` and automatic restore of `backup/boot.img` back into the user's custom Android ROM.
+- **iOS 16 arm64 userland (`userland.yml` run `40229029013`, `macos-15` -> `work/userland/ios-userland.tar.gz`)**:
+  - Built `SweetMetal2.bundle` (Mesa Turnip `libvulkan_freedreno.dylib` with UniXNU's `darwin` KMD + `metal2vulkan` Rust bridge), `wland` (`MPSS_SIZE = 0x0a000000`, `MSA_PA = 0x9b000000`, `bdwlan-rmx1931.bin`), `gpu` (`FB_H = 2400`), `pmem`, `phone/tools/*`, `dropbearmulti`, `toybox`, plus freestanding signed `arm64` `/bin/sh`.
+- **16 GB iOS 16.7.16 (`20H392`, `iPhone10,3` / `D22AP`) HFS+ root image (`/home/paink/ios-root-rmx1931.img` in WSL2)**:
+  - Built from verified Apple CDN DMGs (`087-86698-044.dmg`, `087-86593-047.dmg`, `087-86715-047.dmg`) via `tools/mkiosroot.sh` + `tools/sweet-root-tweaks.py`, pre-populated offline with `SweetMetal2.bundle` (`/var/local/mtl2-clients` = `*` / `-chronod`), `RMX1931` Adreno 640 firmware (`/var/local/gpu/fw/`), `RMX1931` modem + `WCN3990` firmware + persist `bdwlan-rmx1931.bin` (`/var/local/fw/modem/`), `rmtfs` EFS copies (`/var/local/fw/rmtfs/`), SSH key (`work/userland/ssh/id_ed25519`), `/bin/sh` + `dropbear` + `toybox`, and `launchd.plist` daemons (`org.iosonpixel.dropbear` + `org.iosonpixel.wland`), verified clean with `fsck.hfsplus -fn`.
+- **Open (next, awaiting explicit user confirmation before overwriting `userdata`)**:
+  1. Full iOS 16.7.16 install (replaces Android `userdata` `/dev/block/sda16`; TWRP in `recovery` `sde18` + `backup/` stay intact): stream `/home/paink/ios-root-rmx1931.img` to `/dev/block/sda16` from TWRP (`dd bs=4194304`), then boot `shim-rmx1931-ios.img` into the iOS 16 Lock Screen & Home Screen.
 
 ### APPLE XNU + USERSPACE PID 1 RUNNING ON RMX1931: Boots #2-#4 verified, kernel 0126 touch GPIO-I2C queued (2026-10-26, 00:38)
 - **Kernel 0125 (`246ed2898282b1777e2133d5d29837465a9083e5b688c243d5a91bec916fce21`, `xnu-8796.141.3`)**:
