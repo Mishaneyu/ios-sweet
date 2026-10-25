@@ -33,7 +33,7 @@ jobs:
           echo "DEVELOPER_DIR=$DEV_DIR" >> "$GITHUB_ENV"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
-          brew install llvm bison flex ninja gnu-sed pkg-config autoconf automake
+          brew install llvm bison flex ninja gnu-sed pkg-config autoconf automake glslang spirv-tools
           if [ ! -x /opt/homebrew/opt/llvm/bin/llvm-as ]; then
             sudo mkdir -p /opt/homebrew/opt/llvm/bin
             sudo ln -sf "$(brew --prefix llvm)/bin/llvm-as" /opt/homebrew/opt/llvm/bin/llvm-as
