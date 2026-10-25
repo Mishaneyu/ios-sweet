@@ -8,3 +8,8 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+gpufw/
+*.mdt
+*.b0[0-9]
+a6*_gmu.bin
+a630_sqe.fw

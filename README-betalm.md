@@ -66,6 +66,7 @@ Everything that depends on the real hardware is listed under
 | 0087 | Console log strip (`sweetfb_logrows=N`): the log keeps the bottom N text rows, the GUI (boot logo, home screen) shows above it; a panic takes the whole screen |
 | 0088 | `sweet_log_sync()`: write the log out now and wait; the GPI touch code logs each step through it, so a SoC reset without a panic still leaves the last step on disk |
 | 0089 | Touch: the outer 120 px of the panel stretch to the edges of the presented 1125×2436 display, so the bottom edge (home gesture) is reachable despite the 94-row crop |
+| 0090 | **Adreno 640 GPU from [ios-flame](https://github.com/NWylynko/ios-flame)** (Pixel 4, same SM8150; MIT, its XNU patches APSL 2.0): GPU bring-up (GPUCC, Adreno SMMU, GMU + HFI, SQE, zap shader through TrustZone), `/dev/pmem`, GPU present (scale-to-fit), `IOAcceleratorES` + Metal user client, AMFI trust query, `-mcpu=cortex-a55` (no EOR3). G8S changes: zap region 0x98715000, panel VIG0 only, GPU buffer pool 0xb0000000+1 GB, bring-up log synced step by step. Off unless `sweetgpu=1` |
 
 `tools/mkadt.py`: Kryo 485 topology and clocks, 1080×2248, `lge,betalm`
 compatible, 3 GiB RAM default. `tools/sweet-log-pull.sh -p NAME`: read the
@@ -209,6 +210,9 @@ Lines to look for: `SWEET: boot-args` (has the shim's `shim.*` report),
 | `ufsroot=NAME` | GPT partition on LUN 0 holding the root (default `userdata`) |
 | `shim.noautoref` | Shim leaves the MDP alone (debug only: the screen will not update) |
 | `sweetfb_logrows=N` | From the first GUI frame, kernel log only in the bottom N text rows (16 px each); GUI above |
+| `sweetgpu=1` | Power up the Adreno 640 and use it for presenting frames (firmware: `mkpayload.py --gpufw DIR` with the phone's own a640_gmu.bin, a630_sqe.fw, a640_zap.mdt/.b02) |
+| `sweetgpufb=0` | With `sweetgpu=1`: bring the GPU up but keep the CPU copy for frames |
+| `sweetmtl=1/2` | Publish the Metal accelerator (2: ios-flame's SweetMetal2, metal2vulkan + Turnip; needs the bundle in the root) |
 | `sweettouch=0` | Touch driver off |
 | `sweettouchi2cus=N` | Bit-banged I²C half clock period in µs (default 2, about 200 kHz) |
 | `sweettouchfingers=N` | Object slots read per report when bit-banging (default 2; up to 10) |

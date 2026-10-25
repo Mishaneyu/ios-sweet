@@ -140,7 +140,23 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+# Adreno 640 firmware for bsd/dev/sweet_gpu.c (ios-flame): from the phone's own
+# /vendor/firmware (the zap shader is signed for the phone maker). Never commit it.
+GPU_FW = ('a640_gmu.bin', 'a630_sqe.fw', 'a640_zap.mdt', 'a640_zap.b02')
+
+
+def add_gpufw_to_adt(adt_blob, fw_dir):
+    """Return the ADT with /chosen/gpufw,<file> = the Adreno firmware (bsd/dev/sweet_gpu.c)."""
+    root, _ = adt.parse(adt_blob)
+    chosen = next(c for c in root.children if c.name == 'chosen')
+    chosen.props = [p for p in chosen.props if not p[0].startswith('gpufw,')]
+    for name in GPU_FW:
+        with open(os.path.join(fw_dir, name), 'rb') as f:
+            chosen.props.append(('gpufw,' + name, 0, f.read()))
+    return adt.serialize(root)
+
+
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, gpufw_dir=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -167,6 +183,8 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
         pieces.append((rd_va, rd_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
+    if gpufw_dir:
+        adt_blob = add_gpufw_to_adt(adt_blob, gpufw_dir)
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -198,8 +216,10 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--gpufw', help='Adreno firmware directory (a640_gmu.bin, a630_sqe.fw, a640_zap.mdt/.b02) '
+                    'for bsd/dev/sweet_gpu.c, put in the ADT as /chosen/gpufw,*')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.gpufw)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
