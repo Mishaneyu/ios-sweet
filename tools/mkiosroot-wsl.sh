@@ -26,8 +26,19 @@ os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3")
 out=$(realpath -m "$4") size=${5:-16G}
 stage=$(realpath -m "${6:-$HOME/iosroot-stage}")
 here=$(dirname "$(realpath "$0")")
-[[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
-[[ ! -e $stage ]] || { echo "refusing to reuse $stage (remove it first: sudo rm -rf $stage)" >&2; exit 1; }
+[[ ! -e $out ]] || { echo "refusing to overwrite $out (rm it first)" >&2; exit 1; }
+# A stage finished by an earlier run (marker $stage.done) is reused: only the
+# image is rebuilt. An unfinished one is refused.
+resume=0
+if [[ -e $stage ]]; then
+	if [[ -e $stage.done ]]; then
+		resume=1
+		echo "== reusing the finished stage $stage (sudo rm -rf $stage $stage.done to rebuild it)"
+	else
+		echo "refusing to reuse unfinished $stage (remove it first: sudo rm -rf $stage)" >&2
+		exit 1
+	fi
+fi
 case $stage in /mnt/*) echo "warning: $stage is on a Windows drive: slow, and links/owners may not survive" >&2 ;; esac
 
 missing=()
@@ -41,6 +52,7 @@ if [[ ${#missing[@]} -gt 0 ]]; then
 	exit 1
 fi
 
+if [[ $resume == 0 ]]; then
 work=$(mktemp -d)
 mounts=()
 cleanup() {
@@ -121,6 +133,8 @@ sudo chmod 0600 "$stage/private/var/keybags/systembag.kb"
 echo "== bring-up tweaks"
 sudo python3 -I "$here/sweet-root-tweaks.py" "$stage"
 sudo du -sh "$stage"
+touch "$stage.done"
+fi # resume
 
 # ---- 2. format the image and fill it inside the libguestfs appliance ----
 truncate -s "$size" "$out"
