@@ -11,6 +11,8 @@
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#include "adtfix.h"
+#include "sde.h"
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -76,7 +78,43 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
-const char *loader_boot(uintptr_t dtb)
+/* Append " text" to the boot-args if it fits (the kernel logs them). */
+static void cmdline_append(volatile char *cl, const char *text)
+{
+	int n = 0;
+	while (n < BOOT_LINE_LENGTH && cl[n])
+		n++;
+	int t = 0;
+	while (text[t])
+		t++;
+	if (n + 1 + t >= BOOT_LINE_LENGTH)
+		return;
+	cl[n++] = ' ';
+	for (int i = 0; i <= t; i++)
+		cl[n + i] = text[i];
+}
+
+static char *put_hex(char *o, uint64_t v)
+{
+	static const char hex[] = "0123456789abcdef";
+	int d = 1;
+	while (d < 16 && (v >> (4 * d)))
+		d++;
+	*o++ = '0';
+	*o++ = 'x';
+	for (int i = d - 1; i >= 0; i--)
+		*o++ = hex[(v >> (4 * i)) & 0xf];
+	return o;
+}
+
+static char *put_str(char *o, const char *s)
+{
+	while (*s)
+		*o++ = *s++;
+	return o;
+}
+
+const char *loader_boot(uintptr_t dtb, const struct sde_fb *fb)
 {
 	uint64_t rd_start, rd_end;
 
@@ -92,12 +130,21 @@ const char *loader_boot(uintptr_t dtb)
 		return "bad payload header";
 
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
+	/*
+	 * RAM: everything from phys_base to the end of the /memory range ABL
+	 * reports (mkadt's dram-size is only the fallback). The panic log stays
+	 * carved off the top, as mkadt.py does.
+	 */
+	uint64_t mem_size = p->mem_size;
+	uint64_t avail = fdt_mem_from(dtb, p->phys_base);
+	con_hex2("FDTMEM", "hi=", avail >> 32, "lo=", (uint32_t)avail);
 	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
 	con_hex("VIRT", p->virt_base);
 	con_hex("ENTRY", p->entry_va);
 
 	/* The payload must not overlap where the kernel goes. */
-	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
+	uint64_t span = avail > p->mem_size ? avail : p->mem_size;
+	if (rd_end > p->phys_base && rd_start < p->phys_base + span)
 		return "ramdisk overlaps kernel memory";
 
 	for (uint32_t i = 0; i < p->nsegs; i++) {
@@ -112,6 +159,20 @@ const char *loader_boot(uintptr_t dtb)
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+
+	uint64_t plog = adt_get_reg_size(adt_pa, "pram");
+	if (avail > plog + (512UL << 20) && plog) {
+		mem_size = avail - plog;
+		adt_set_u64(adt_pa, "chosen", "dram-size", mem_size);
+		adt_set_reg(adt_pa, "pram", p->phys_base + mem_size, plog);
+	}
+	con_hex2("DRAM", "hi=", mem_size >> 32, "lo=", (uint32_t)mem_size);
+
+	/* The framebuffer sde.c found (or the board fallback). */
+	adt_set_reg(adt_pa, "sweet-fbcon", fb->base, (uint64_t)fb->stride * fb->height);
+	adt_set_u32(adt_pa, "sweet-fbcon", "width", fb->width);
+	adt_set_u32(adt_pa, "sweet-fbcon", "height", fb->height);
+	adt_set_u32(adt_pa, "sweet-fbcon", "stride", fb->stride);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 
@@ -121,19 +182,44 @@ const char *loader_boot(uintptr_t dtb)
 	ba->Version = 2;
 	ba->virtBase = p->virt_base;
 	ba->physBase = p->phys_base;
-	ba->memSize = p->mem_size;
+	ba->memSize = mem_size;
 	ba->topOfKernelData = top;
-	ba->Video.v_baseAddr = FB_BASE;
+	ba->Video.v_baseAddr = fb->base;
 	ba->Video.v_display = 1;
-	ba->Video.v_rowBytes = FB_STRIDE;
-	ba->Video.v_width = FB_W;
-	ba->Video.v_height = FB_H;
-	ba->Video.v_depth = 32;
+	ba->Video.v_rowBytes = fb->stride;
+	ba->Video.v_width = fb->width;
+	ba->Video.v_height = fb->height;
+	ba->Video.v_depth = fb->bpp * 8;
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
-	ba->memSizeActual = p->mem_size;
+	ba->memSizeActual = mem_size;
+	/* What the shim saw, for the persistent log (no serial port here). */
+	char info[160], *o = info;
+	o = put_str(o, "shim.fb=");
+	o = put_hex(o, fb->base);
+	o = put_str(o, ",");
+	o = put_hex(o, fb->width);
+	o = put_str(o, "x");
+	o = put_hex(o, fb->height);
+	o = put_str(o, ",");
+	o = put_hex(o, fb->stride);
+	o = put_str(o, ",fmt");
+	o = put_hex(o, fb->format);
+	o = put_str(o, " shim.sde=sspp");
+	o = put_hex(o, (uint32_t)fb->sspp);
+	o = put_str(o, ",ctl");
+	o = put_hex(o, (uint32_t)fb->ctl);
+	o = put_str(o, ",pp");
+	o = put_hex(o, (uint32_t)fb->pp);
+	o = put_str(o, fb->cmd_mode ? ",cmd" : ",video");
+	o = put_str(o, fb->autorefresh ? ",autoref" : ",noautoref");
+	o = put_str(o, fb->refreshing ? ",live" : ",still");
+	o = put_str(o, " shim.dram=");
+	o = put_hex(o, mem_size);
+	*o = 0;
+	cmdline_append(ba->CommandLine, info);
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;

@@ -1,13 +1,14 @@
 #!/bin/sh
 # Read the SWEET console log (kernel patch 0047) from a phone booted into
 # OrangeFox recovery (fastboot boot recovery/recovery.img; adb root shell).
-#   tools/sweet-log-pull.sh [-s SERIAL] OUT.txt
-# Only reads: the last 1025 blocks (4 KiB) of the userdata partition.
+#   tools/sweet-log-pull.sh [-s SERIAL] [-p PARTITION] OUT.txt
+# Only reads: the last 1025 blocks (4 KiB) of the root partition: userdata,
+# or the one given with -p (betalm dual boot: -p iosroot, boot-arg ufsroot=iosroot).
 set -eu
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-	echo "Usage: $(basename "$0") [-s SERIAL] OUT.txt"
-	echo "Pull the 4 MiB kernel log ring from userdata via recovery ADB."
+	echo "Usage: $(basename "$0") [-s SERIAL] [-p PARTITION] OUT.txt"
+	echo "Pull the 4 MiB kernel log ring from the iOS root partition via recovery ADB."
 	exit 0
 fi
 
@@ -19,11 +20,18 @@ if [ "${1:-}" = "-s" ]; then
 	ADB="adb -s $SERIAL"
 fi
 
-out=${1:?usage: sweet-log-pull.sh [-s SERIAL] OUT.txt}
+PART=userdata
+if [ "${1:-}" = "-p" ]; then
+	shift
+	PART=${1:?Error: -p requires a partition name}
+	shift
+fi
+
+out=${1:?usage: sweet-log-pull.sh [-s SERIAL] [-p PARTITION] OUT.txt}
 command -v adb >/dev/null 2>&1 || { echo "Error: adb not found in PATH" >&2; exit 1; }
 
-dev=$($ADB shell 'for d in /dev/block/by-name/userdata /dev/block/bootdevice/by-name/userdata; do [ -e $d ] && readlink -f $d && break; done' 2>/dev/null | tr -d '\r')
-[ -n "$dev" ] || { echo "userdata block device not found on connected device" >&2; exit 1; }
+dev=$($ADB shell "for d in /dev/block/by-name/$PART /dev/block/bootdevice/by-name/$PART; do [ -e \$d ] && readlink -f \$d && break; done" 2>/dev/null | tr -d '\r')
+[ -n "$dev" ] || { echo "$PART block device not found on connected device" >&2; exit 1; }
 bytes=$($ADB shell blockdev --getsize64 "$dev" | tr -d '\r')
 skip=$((bytes / 4096 - 1025))
 $ADB exec-out "dd if=$dev bs=4096 skip=$skip count=1025 2>/dev/null" > "$out.bin"

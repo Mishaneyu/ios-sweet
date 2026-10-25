@@ -1,10 +1,15 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_BASE		0x9c000000UL	/* reserved-memory cont_splash_region */
-#define FB_W		1080
-#define FB_H		2400
-#define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
+/*
+ * The framebuffer geometry is detected at runtime (sde.c); until then it is
+ * board.h's splash fallback. a8r8g8b8 only: con_init() with any other depth
+ * disables drawing.
+ */
+extern uint32_t con_w, con_h, con_stride;
+void con_init(uintptr_t base, uint32_t w, uint32_t h, uint32_t stride, uint32_t bpp);
+/* Called after every screen (sde.c: one frame on command mode without autorefresh). */
+extern void (*con_flush)(void);
 
 #define RED	0xffff0000U
 #define BLUE	0xff0000a0U

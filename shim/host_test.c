@@ -1,23 +1,24 @@
 /* Render the console layout on the host: ./out/host_test && view out/host.ppm */
 #include <stdio.h>
 #include "console.h"
+#include "board.h"
 
-static uint32_t host_fb[FB_H * FB_STRIDE / 4];
+static uint32_t host_fb[PANEL_W * PANEL_H];
 
 int main(void)
 {
-	con_fb = host_fb;
+	con_init((uintptr_t)host_fb, PANEL_W, PANEL_H, PANEL_W * 4, 4);
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 2");
-	con_hex("MMFR0", 0x0000000000101122ULL);
-	con_hex2("PSCI", "ver=", 0x10001, "smccc=", 0x10002);
-	con_hex2("CPU7", "ret=", 0, "mpidr=", 0x81000700);
+	con_str("SHIM", BOARD_NAME);
+	con_hex2("FB", "base=", 0x9c000000, "sspp=", 4);
+	con_hex2("FB", "w=", PANEL_W, "h=", PANEL_H);
+	con_hex2("SDE", "cmd=", 1, "autoref=", 1);
 	con_clear(BLUE);
 	con_str("PANIC", "sync exception");
 	con_hex("ESR", 0x96000010);
 	FILE *f = fopen("out/host.ppm", "wb");
-	fprintf(f, "P6 %d %d 255\n", FB_W, FB_H);
-	for (int i = 0; i < FB_W * FB_H; i++) {
+	fprintf(f, "P6 %d %d 255\n", PANEL_W, PANEL_H);
+	for (int i = 0; i < PANEL_W * PANEL_H; i++) {
 		unsigned char px[3] = { host_fb[i] >> 16, host_fb[i] >> 8, host_fb[i] };
 		fwrite(px, 1, 3, f);
 	}

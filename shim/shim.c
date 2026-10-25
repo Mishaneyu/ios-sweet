@@ -11,13 +11,10 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "board.h"
+#include "sde.h"
+#include "fdt.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
-#define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
-
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -370,16 +367,63 @@ static uint32_t to_us(uint64_t ticks)
 	return ticks * 10 / 192;	/* 19.2 MHz */
 }
 
+static struct sde_fb fb;
+
+static void fb_kick(void)
+{
+	sde_kick(&fb);
+}
+
+/* "shim.noautoref" in the payload's boot-args: leave the MDP alone. */
+static int want_autorefresh(uint64_t dtb)
+{
+	uint64_t rd;
+	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd) || (rd & 7))
+		return 1;
+	const char *m = (const char *)rd;
+	static const char magic[] = "SWEETXNU", key[] = "shim.noautoref";
+	for (int i = 0; i < 8; i++)
+		if (m[i] != magic[i])
+			return 1;
+	const char *cl = m + 0x48;	/* struct payload: cmdline */
+	for (int i = 0; i < 608 && cl[i]; i++) {
+		int k = 0;
+		while (key[k] && cl[i + k] == key[k])
+			k++;
+		if (!key[k])
+			return 0;
+	}
+	return 1;
+}
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
-	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
+	/*
+	 * Display first: on the G8S's command-mode panel nothing drawn shows
+	 * until the MDP refreshes it (sde.c). Then a status screen, then XNU.
+	 */
+	stage = "sde";
+	sde_handoff(&fb, want_autorefresh(dtb));
+	con_init(fb.base, fb.width, fb.height, fb.stride, fb.bpp);
+	if (fb.cmd_mode && !fb.autorefresh)
+		con_flush = fb_kick;
+
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
+	con_str("SHIM", BOARD_NAME);
+	con_hex2("FB", "base=", fb.base, "sspp=", (uint32_t)fb.sspp);
+	con_hex2("FB", "w=", fb.width, "h=", fb.height);
+	con_hex2("FB", "stride=", fb.stride, "fmt=", fb.format);
+	con_hex2("SDE", "cmd=", fb.cmd_mode, "pp=", (uint32_t)fb.pp);
+	con_hex2("SDE", "ctl=", (uint32_t)fb.ctl, "autoref=", fb.autorefresh);
+	con_hex2("SDE", "live=", fb.refreshing, 0, 0);
+	con_hex2("CPU", "midr=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
+	con_hex2("MMFR0", "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf, "el=", (uint32_t)(rsr("CurrentEL") >> 2));
 	con_skip();
-	const char *why = loader_boot(dtb);
+	delay_ms(3000);	/* readable on a phone camera */
+	const char *why = loader_boot(dtb, &fb);
 	con_str("LOADER", why);
 	con_skip();
 

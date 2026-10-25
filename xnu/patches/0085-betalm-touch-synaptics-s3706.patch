@@ -1,0 +1,515 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..4e6a52a 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1,5 +1,6 @@
+ /*
+- * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
++ * SWEET GENI FIFO I2C touch: GT9896 Yellowstone / Focaltech 54:52 (sweet),
++ * Synaptics S3706 RMI4 (betalm, LG G8S) bring-up.
+  * Call once after the scheduler is running; all work runs on one thread.
+  * Requires ABL-loaded GENI I2C firmware; votes L11C through sweet_rpmh.c.
+  * No firmware/config upload or direct PMIC writes. Only IC data write:
+@@ -14,6 +15,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>  /* SWEET_BOARD_* */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -22,16 +24,49 @@ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+-#define TOUCH_SE_PA      0x00a84000u
+ #define TOUCH_GCC_PA     0x00100000u
+-#define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
++#if defined(SWEET_BOARD_BETALM)
++/*
++ * LG G8S (SM8150, LGE kernel sm8150-beta DT): the touch IC sits on
++ * qupv3_se17_i2c = QUP wrapper 2 SE0 at 0xc80000, SDA/SCL gpio55/56
++ * (function 1 = qup17). Synaptics S3706 at 0x20 (SiW SW42000 at 0x28 on
++ * other panels, not supported). Power is two TLMM enables, no regulator:
++ * vdd-gpio 152, vcl-gpio 59; reset 54; ATTN 122 (active low). All of them
++ * are in the SOUTH tile (TLMM 0x3000000 + 0xd00000).
++ */
++#define TOUCH_SE_PA      0x00c80000u
++#define TOUCH_TLMM_PA    0x03d00000u /* DT TLMM + SOUTH (0xd00000) */
++#define TOUCH_TLMM_SIZE  0x99000u    /* through gpio152 */
++#define TOUCH_GCC_VOTE   0x52014u    /* APCS_CLOCK_BRANCH_ENA_VOTE_2 */
++/* wrap2 core (0), s_ahb (1), m_ahb (2), core_2x (3), s0 (4) */
++#define TOUCH_VOTE_MASK  0x1fu
++#define TOUCH_RCG        0x1e148u    /* gcc_qupv3_wrap2_s0_clk_src */
++#define TOUCH_BRANCHES   {0x1e004u, 0x1e008u, 0x1e144u}
++#define TOUCH_PIN_SDA    55u
++#define TOUCH_PIN_SCL    56u
++#define TOUCH_I2C_FUNC   1u
++#define TOUCH_PIN_RESET  54u
++#define TOUCH_PIN_IRQ    122u
++#define TOUCH_PIN_VDD    152u
++#define TOUCH_PIN_VCL    59u
++#else
++#define TOUCH_SE_PA      0x00a84000u
++#define TOUCH_TLMM_PA    0x03900000u /* DT TLMM + NORTH (0x500000) */
++#define TOUCH_TLMM_SIZE  0x5b000u
+ #define TOUCH_GCC_VOTE   0x5200cu
++/* Vote on only wrapper1 and SE7, preserving other clock users. */
++#define TOUCH_VOTE_MASK  ((0x0fu << 18) | (1u << 23))
+ #define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
++#define TOUCH_BRANCHES   {0x18004u, 0x18008u, 0x1800cu, 0x18010u, 0x18144u}
++#define TOUCH_PIN_IRQ    9u
++#endif
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+ #define TOUCH_MAX        10u
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
++#define TOUCH_SYNAPTICS  3
++#define TOUCH_RX_MAX     255u
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+ #define GOODIX_PID_REG   0x4022u
+ #define GOODIX_EVENT_REG 0x4180u
+@@ -136,8 +171,7 @@ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out,
+ static bool
+ touch_clocks(void)
+ {
+-	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
++	uint32_t mask = TOUCH_VOTE_MASK;
+ 	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
+ 	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+ 	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+@@ -160,7 +194,7 @@ touch_clocks(void)
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
++	const uint32_t branches[] = TOUCH_BRANCHES;
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+ 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+@@ -209,16 +243,16 @@ touch_irq(void)
+ 	return st.irq_last;
+ }
+ 
+-/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
++/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most TOUCH_RX_MAX. */
+ static int
+ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++	if (st.dead || nt > 3 || nr > TOUCH_RX_MAX || (nt && nr) || (!nt && !nr)) {
+ 		return EIO;
+ 	}
+ 	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true; /* no other SE7 owner is supported */
++		st.dead = true; /* no other owner of the touch SE is supported */
+ 		return EBUSY;
+ 	}
+ 	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+@@ -317,7 +351,7 @@ touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
+ 	return touch_msg(addr, NULL, 0, buf, len, false);
+ }
+ 
+-static int
++static __attribute__((unused)) int
+ touch_goodix_ack(void)
+ {
+ 	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
+@@ -327,7 +361,7 @@ touch_goodix_ack(void)
+ /* Raw read only: 0x8240 is the vendor's generic/older VERSION candidate,
+  * not a second accepted GT9896 identity. Never try a four-byte Berlin pointer:
+  * on this 16-bit IC the extra bytes would be register data writes. */
+-static int
++static __attribute__((unused)) int
+ touch_probe_info(uint16_t reg, uint8_t *buf)
+ {
+ 	memset(buf, 0xa5, 32);
+@@ -346,13 +380,13 @@ touch_probe_info(uint16_t reg, uint8_t *buf)
+ 	return err;
+ }
+ 
+-static unsigned
++static __attribute__((unused)) unsigned
+ touch_be16(const uint8_t *p)
+ {
+ 	return ((unsigned)p[0] << 8) | p[1];
+ }
+ 
+-static bool
++static __attribute__((unused)) bool
+ touch_checksum(const uint8_t *buf, unsigned len)
+ {
+ 	if (len < 2) {
+@@ -383,7 +417,7 @@ touch_report(uint32_t mask, const int *x, const int *y)
+ 	st.active = mask;
+ }
+ 
+-static int
++static __attribute__((unused)) int
+ touch_goodix(void)
+ {
+ 	uint8_t buf[90];
+@@ -440,7 +474,7 @@ touch_goodix(void)
+ 	return err;
+ }
+ 
+-static int
++static __attribute__((unused)) int
+ touch_focaltech(void)
+ {
+ 	uint8_t buf[63];
+@@ -487,6 +521,311 @@ touch_focaltech(void)
+ 	return 0;
+ }
+ 
++
++#if defined(SWEET_BOARD_BETALM)
++/*
++ * Synaptics RMI4 over I2C (S3706 on the LG G8S). The register space is
++ * paged: register 0xff selects the page, then one-byte addresses. Functions
++ * are found through the Page Description Table at 0xe9 downwards in each
++ * page. F01 is device control, F12 the 2D sensor; F12's data registers are
++ * described by register descriptors (query 7-9) whose layout follows
++ * Linux drivers/input/rmi4/rmi_driver.c (rmi_read_register_desc). Touch is
++ * polled: the F12 data block is read every 10 ms and F01's interrupt status
++ * is read to release ATTN. Only writes: page select, F01 control 0 (normal
++ * mode, configured, no sleep) and F01 interrupt enable.
++ */
++#define RMI_ADDR         0x20u
++#define RMI_PAGE_REG     0xffu
++#define RMI_PDT_START    0xe9u
++#define RMI_PDT_END      0x0au
++#define RMI_PAGES        5u
++
++static struct {
++	int page;
++	uint16_t f01_query, f01_ctrl, f01_data;
++	uint16_t f12_query, f12_ctrl, f12_data;
++	unsigned irq_count;
++	unsigned data_len, data1_off, data1_len, fingers;
++	int flip; /* sweettouchflip: bit0 mirror x, bit1 mirror y, bit2 swap */
++} rmi = { .page = -1 };
++
++static int
++rmi_set_page(unsigned page)
++{
++	if (rmi.page == (int)page) {
++		return 0;
++	}
++	const uint8_t w[2] = {RMI_PAGE_REG, (uint8_t)page};
++	int err = touch_msg(RMI_ADDR, w, 2, NULL, 0, false);
++	rmi.page = err ? -1 : (int)page;
++	return err;
++}
++
++static int
++rmi_read(uint16_t addr, uint8_t *buf, unsigned len)
++{
++	int err = rmi_set_page(addr >> 8);
++	if (err) {
++		return err;
++	}
++	return touch_read(RMI_ADDR, addr & 0xffu, false, buf, len);
++}
++
++static int
++rmi_write(uint16_t addr, uint8_t val)
++{
++	int err = rmi_set_page(addr >> 8);
++	if (err) {
++		return err;
++	}
++	const uint8_t w[2] = {(uint8_t)addr, val};
++	return touch_msg(RMI_ADDR, w, 2, NULL, 0, false);
++}
++
++static bool
++rmi_scan_pdt(void)
++{
++	bool any = false;
++	for (unsigned page = 0; page < RMI_PAGES; ++page) {
++		bool page_has = false;
++		for (unsigned a = RMI_PDT_START; a >= RMI_PDT_END; a -= 6u) {
++			uint8_t e[6];
++			uint16_t at = (uint16_t)((page << 8) | a);
++			if (rmi_read(at, e, sizeof(e))) {
++				return any;
++			}
++			if (e[5] == 0 || e[5] == 0xff) {
++				break; /* end of this page's table */
++			}
++			page_has = any = true;
++			uint16_t base = (uint16_t)(page << 8);
++			printf("SWEET TOUCH: rmi F%02x page %u query=%#x ctrl=%#x data=%#x irqs=%u ver=%u\n",
++			    e[5], page, base | e[0], base | e[2], base | e[3], e[4] & 7u, (e[4] >> 5) & 3u);
++			if (e[5] == 0x01) {
++				rmi.f01_query = base | e[0];
++				rmi.f01_ctrl = base | e[2];
++				rmi.f01_data = base | e[3];
++			} else if (e[5] == 0x12) {
++				rmi.f12_query = base | e[0];
++				rmi.f12_ctrl = base | e[2];
++				rmi.f12_data = base | e[3];
++			}
++			rmi.irq_count += e[4] & 7u;
++		}
++		if (!page_has && page > 0) {
++			break;
++		}
++	}
++	return any;
++}
++
++/*
++ * Register descriptor at query address 'addr' (presence size, presence map,
++ * structure). Returns the byte offset and size of register 'want' within the
++ * function's data block, and the total size of all present registers.
++ */
++static bool
++rmi_reg_desc(uint16_t addr, unsigned want, unsigned *off, unsigned *len,
++    unsigned *subpackets, unsigned *total)
++{
++	uint8_t psize = 0, pres[36], sbuf[128];
++	*off = *len = *subpackets = *total = 0;
++	if (rmi_read(addr, &psize, 1) || psize == 0 || psize > sizeof(pres)) {
++		return false;
++	}
++	if (rmi_read(addr + 1u, pres, psize)) {
++		return false;
++	}
++	unsigned map_start = 1, ssize = pres[0];
++	if (ssize == 0) {
++		if (psize < 3) {
++			return false;
++		}
++		ssize = pres[1] | ((unsigned)pres[2] << 8);
++		map_start = 3;
++	}
++	if (ssize == 0 || ssize > sizeof(sbuf) || rmi_read(addr + 2u, sbuf, ssize)) {
++		printf("SWEET TOUCH: rmi descriptor %#x struct size %u unsupported\n", addr, ssize);
++		return false;
++	}
++	unsigned at = 0;
++	bool found = false;
++	for (unsigned i = map_start; i < psize; ++i) {
++		for (unsigned b = 0; b < 8; ++b) {
++			if (!(pres[i] & (1u << b))) {
++				continue;
++			}
++			unsigned reg = (i - map_start) * 8u + b;
++			if (at >= ssize) {
++				return false;
++			}
++			unsigned size = sbuf[at++];
++			if (size == 0 && at + 2 <= ssize) {
++				size = sbuf[at] | ((unsigned)sbuf[at + 1] << 8);
++				at += 2;
++			}
++			if (size == 0 && at + 4 <= ssize) {
++				size = sbuf[at] | ((unsigned)sbuf[at + 1] << 8) |
++				    ((unsigned)sbuf[at + 2] << 16) | ((unsigned)sbuf[at + 3] << 24);
++				at += 4;
++			}
++			unsigned subs = 0;
++			do {
++				if (at >= ssize) {
++					return false;
++				}
++				subs += __builtin_popcount(sbuf[at] & 0x7fu);
++			} while (sbuf[at++] & 0x80u);
++			if (reg == want) {
++				*off = *total;
++				*len = size;
++				*subpackets = subs;
++				found = true;
++			}
++			*total += size;
++		}
++	}
++	return found;
++}
++
++static bool
++rmi_setup(void)
++{
++	rmi.page = -1;
++	(void)PE_parse_boot_argn("sweettouchflip", &rmi.flip, sizeof(rmi.flip));
++	if (!rmi_scan_pdt() || !rmi.f01_ctrl || !rmi.f12_data) {
++		printf("SWEET TOUCH: rmi PDT has no F01/F12 (bootloader mode?)\n");
++		return false;
++	}
++	uint8_t status = 0, ctrl0 = 0, prod[11] = {0};
++	(void)rmi_read(rmi.f01_data, &status, 1);
++	(void)rmi_read(rmi.f01_query + 11u, prod, 10);
++	printf("SWEET TOUCH: rmi F01 status=%#x product=\"%s\"\n", status, (const char *)prod);
++	if (status & 0x40u) {
++		printf("SWEET TOUCH: rmi device is in its bootloader; no firmware to report touches\n");
++		return false;
++	}
++	/* F01 control 0: sleep mode normal (bits 1:0 = 0), nosleep (bit 2),
++	 * configured (bit 7). Then enable every function's interrupt source. */
++	if (!rmi_read(rmi.f01_ctrl, &ctrl0, 1)) {
++		(void)rmi_write(rmi.f01_ctrl, (uint8_t)((ctrl0 & ~3u) | 0x84u));
++	}
++	(void)rmi_write(rmi.f01_ctrl + 1u, 0xff);
++	unsigned subs = 0;
++	if (!rmi_reg_desc(rmi.f12_query + 7u, 1, &rmi.data1_off, &rmi.data1_len,
++	    &subs, &rmi.data_len)) {
++		printf("SWEET TOUCH: rmi F12 data descriptor has no data1; assuming data1 at 0\n");
++		rmi.data1_off = 0;
++		rmi.data1_len = TOUCH_MAX * 8u;
++		subs = TOUCH_MAX;
++	}
++	rmi.fingers = subs ? subs : rmi.data1_len / 8u;
++	if (rmi.fingers > TOUCH_MAX) {
++		rmi.fingers = TOUCH_MAX;
++	}
++	if (rmi.data1_off + rmi.fingers * 8u > TOUCH_RX_MAX) {
++		printf("SWEET TOUCH: rmi F12 data1 at %u+%u does not fit one read\n",
++		    rmi.data1_off, rmi.fingers * 8u);
++		return false;
++	}
++	printf("SWEET TOUCH: rmi F12 ctrl0=%#x data block %u bytes, data1 at %u len %u, %u objects, irqs=%u flip=%d\n",
++	    ctrl0, rmi.data_len, rmi.data1_off, rmi.data1_len, rmi.fingers, rmi.irq_count, rmi.flip);
++	return true;
++}
++
++static int
++touch_synaptics(void)
++{
++	uint8_t buf[TOUCH_RX_MAX], irq[2];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	/* Reading F01's interrupt status releases ATTN; the value is not needed. */
++	(void)rmi_read(rmi.f01_data + 1u, irq, (rmi.irq_count + 7u) / 8u ? (rmi.irq_count + 7u) / 8u : 1u);
++	unsigned n = rmi.data1_off + rmi.fingers * 8u;
++	int err = rmi_read(rmi.f12_data, buf, n);
++	if (err) {
++		rmi.page = -1; /* re-select the page after any bus error */
++		return err;
++	}
++	for (unsigned i = 0; i < rmi.fingers; ++i) {
++		const uint8_t *o = buf + rmi.data1_off + 8u * i;
++		/* Object type: 1 finger, 2 stylus, 6 glove, 7 narrow, 0x0d small. */
++		if (o[0] != 1 && o[0] != 2 && o[0] != 6 && o[0] != 7 && o[0] != 0x0d) {
++			continue;
++		}
++		int px = (int)(o[1] | ((unsigned)o[2] << 8));
++		int py = (int)(o[3] | ((unsigned)o[4] << 8));
++		if (rmi.flip & 4) {
++			int t = px; px = py; py = t;
++		}
++		if (rmi.flip & 1) {
++			px = SWEET_PANEL_W - 1 - px;
++		}
++		if (rmi.flip & 2) {
++			py = SWEET_PANEL_H - 1 - py;
++		}
++		if (px < 0 || py < 0 || px >= SWEET_PANEL_W || py >= SWEET_PANEL_H) {
++			continue;
++		}
++		mask |= 1u << i;
++		x[i] = px;
++		y[i] = py;
++	}
++	if (mask && !st.active) {
++		/* Log the first point of each touch to verify orientation. */
++		unsigned i = (unsigned)__builtin_ctz(mask);
++		printf("SWEET TOUCH: down x=%d y=%d\n", x[i], y[i]);
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++#endif /* SWEET_BOARD_BETALM: RMI4 */
++
++#if defined(SWEET_BOARD_BETALM)
++/* LG G8S: power, reset and probe the Synaptics S3706 (LGE sm8150-beta DT). */
++static bool
++touch_betalm_bringup(void)
++{
++	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd152=%#x vcl59=%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_RESET)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_VDD)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_VCL)));
++	/* Hold reset while the rails come up; ATTN stays an input with pull-up. */
++	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 0, false, false);   /* 2 mA, pull-up */
++	touch_gpio(TOUCH_PIN_RESET, 0, 3, 2, true, false);  /* 6 mA, pull-up */
++	touch_gpio(TOUCH_PIN_VDD, 0, 0, 0, true, true);
++	touch_gpio(TOUCH_PIN_VCL, 0, 0, 0, true, true);
++	touch_wait(10);
++	/* qupv3_se17_i2c_active: function qup17, 2 mA, bias-disable */
++	touch_gpio(TOUCH_PIN_SDA, TOUCH_I2C_FUNC, 0, 0, false, false);
++	touch_gpio(TOUCH_PIN_SCL, TOUCH_I2C_FUNC, 0, 0, false, false);
++	touch_gpio(TOUCH_PIN_RESET, 0, 3, 2, true, true);
++	touch_wait(150); /* DT hw_reset_delay = 100 ms */
++	st.probing = true;
++	uint8_t pdt = 0, siw = 0;
++	int se = rmi_read(RMI_PDT_START + 5u, &pdt, 1); /* page 0 PDT: function id */
++	int we = touch_read(0x28, 0x00, false, &siw, 1);
++	st.probing = false;
++	printf("SWEET TOUCH: probe synaptics@0x20 err=%d first-fn=%#x, siw@0x28 err=%d\n",
++	    se, pdt, we);
++	if (se || st.dead) {
++		if (!we) {
++			printf("SWEET TOUCH: this G8S has the SiW SW42000 panel touch; not supported yet\n");
++		}
++		return false;
++	}
++	if (!rmi_setup()) {
++		return false;
++	}
++	st.kind = TOUCH_SYNAPTICS;
++	printf("SWEET TOUCH: selected Synaptics S3706, %ux%u, poll=10ms irq-hint=%d\n",
++	    SWEET_PANEL_W, SWEET_PANEL_H, st.irq_hint);
++	return true;
++}
++#endif /* SWEET_BOARD_BETALM */
++
+ static bool
+ touch_se_init(void)
+ {
+@@ -560,7 +899,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	touch_wait(delay_s * 1000u);
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
++	st.gpio = ml_io_map(TOUCH_TLMM_PA, TOUCH_TLMM_SIZE);
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+ 	if (!st.gcc || !st.gpio || !st.se) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+@@ -569,6 +908,11 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
++#if defined(SWEET_BOARD_BETALM)
++	if (!touch_betalm_bringup()) {
++		goto out;
++	}
++#else
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+@@ -610,12 +954,17 @@ touch_thread(void *arg, wait_result_t result)
+ 	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+ 	printf("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+ 	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
++#endif
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+-		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) ||
++		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u) ||
+ 		    (++ticks % 10u) == 0) {
++#if defined(SWEET_BOARD_BETALM)
++			int err = touch_synaptics();
++#else
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
++#endif
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+ 					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);

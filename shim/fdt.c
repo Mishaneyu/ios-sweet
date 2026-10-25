@@ -82,3 +82,77 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
 		}
 	}
 }
+
+static int starts_with(const char *s, const char *prefix)
+{
+	while (*prefix)
+		if (*s++ != *prefix++)
+			return 0;
+	return 1;
+}
+
+static uint64_t cells(uintptr_t p, uint32_t n)
+{
+	uint64_t v = 0;
+	for (uint32_t i = 0; i < n; i++)
+		v = v << 32 | be32(p + 4 * i);
+	return v;
+}
+
+/*
+ * The memory range (from ABL's /memory reg, all memory@ nodes) that contains
+ * 'base': returns the bytes from base to the end of that range, 0 if none.
+ */
+uint64_t fdt_mem_from(uintptr_t fdt, uint64_t base)
+{
+	if (!fdt || be32(fdt) != FDT_MAGIC)
+		return 0;
+	uintptr_t p = fdt + be32(fdt + 8);
+	uintptr_t strings = fdt + be32(fdt + 12);
+	uint32_t ac = 2, sc = 2;
+	int depth = 0, in_mem = 0;
+
+	for (;;) {
+		uint32_t tok = be32(p);
+		p += 4;
+		switch (tok) {
+		case FDT_BEGIN_NODE: {
+			const char *name = (const char *)p;
+			depth++;
+			in_mem = depth == 2 && starts_with(name, "memory");
+			p = align4(skip_str(p));
+			break;
+		}
+		case FDT_END_NODE:
+			depth--;
+			in_mem = 0;
+			if (depth == 0)
+				return 0;
+			break;
+		case FDT_PROP: {
+			uint32_t len = be32(p), nameoff = be32(p + 4);
+			uintptr_t val = p + 8;
+			const char *pn = (const char *)(strings + nameoff);
+			if (depth == 1 && streq(pn, "#address-cells") && len == 4)
+				ac = be32(val);
+			else if (depth == 1 && streq(pn, "#size-cells") && len == 4)
+				sc = be32(val);
+			else if (in_mem && streq(pn, "reg") && ac && sc && ac <= 2 && sc <= 2) {
+				uint32_t step = 4 * (ac + sc);
+				for (uint32_t off = 0; off + step <= len; off += step) {
+					uint64_t a = cells(val + off, ac);
+					uint64_t s = cells(val + off + 4 * ac, sc);
+					if (base >= a && base < a + s)
+						return a + s - base;
+				}
+			}
+			p = align4(val + len);
+			break;
+		}
+		case FDT_NOP:
+			break;
+		default:
+			return 0;
+		}
+	}
+}
