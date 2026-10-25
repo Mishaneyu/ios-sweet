@@ -36,8 +36,10 @@ SOC_BASE = 0x01000000
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
-# splash_region 0x9c000000 + 0x2400000; RM69299 1080x2248 command-mode panel
-FB, FB_SIZE = 0x9c000000, 0x2400000
+# ABL's framebuffer inside splash_region (0x9c000000 + 0x2400000): VIG0 scans
+# out of 0x9d200000, 1080x2248 a8r8g8b8 (seen by the shim on the phone). The
+# shim rewrites this node with what it reads from the MDP at boot.
+FB, FB_SIZE = 0x9d200000, 1080 * 4 * 2248
 SWEET_ECID = 0x4245544c4d000001  # 'BETLM' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2248, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none

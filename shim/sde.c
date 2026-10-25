@@ -61,7 +61,7 @@ static void wait_us(unsigned us)
 
 void sde_handoff(struct sde_fb *fb, int allow_autorefresh)
 {
-	fb->base = SPLASH_BASE;
+	fb->base = FB_FALLBACK;
 	fb->width = PANEL_W;
 	fb->height = PANEL_H;
 	fb->stride = PANEL_W * 4;

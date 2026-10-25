@@ -7,7 +7,11 @@ Hardware facts come from LineageOS `android_kernel_lge_sm8150` (lineage-22.2,
 `sm8150.dtsi`, `sm8150-sde.dtsi`, `lge/sm8150-beta/*`) and
 `android_device_lge_sm8150-common`.
 
-**Status: written and build-checked, not yet run on a phone.** The shim
+**Status:** shim tested on the phone (2026-10-25). It takes over from ABL,
+draws on the panel, sees the framebuffer at `0x9d200000` (VIG0, 1080×2248,
+stride 4320, 32-bit) with no tear check active (so ABL keeps the panel
+refreshing and autorefresh is not needed), and reads the UFS GPT (userdata
+on LUN 0). The XNU kernel is **not yet run on the phone**. The shim
 builds, its boot image round-trips through `tools/unpack_bootv2.py`, the ADT
 and FDT code was tested on the host, the new kernel code compiles with
 `-Wall -Wextra -Werror`, and the patch series applies cleanly in CI order.
@@ -23,7 +27,7 @@ Everything that depends on the real hardware is listed under
 | UFS | 0x1d84000 | identical | none |
 | SPMI arbiter v5 | 0xc440000 | identical | none |
 | PSHOLD | 0xc264000 | identical | none |
-| Splash | 0x9c000000, 1080×2400 **video mode** | 0x9c000000, 1080×2248 **command mode** | shim (see below) |
+| Splash | 0x9c000000, 1080×2400, video mode | region 0x9c000000, buffer **0x9d200000**, 1080×2248; DT says command mode, but ABL leaves it refreshing continuously | shim reads it from the MDP |
 | Touch | Goodix GT9896 on SE7, RPMh rail | **Synaptics S3706** at 0x20 on **SE17** (0xc80000), GPIO rails | new driver code |
 | Vol-up | PM6150L GPIO2 | PM8150 GPIO6 | constants |
 | Boot image | header v2, base 0, page 4096, DTB 0x1f00000 | identical | none |

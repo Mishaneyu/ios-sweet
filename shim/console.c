@@ -12,7 +12,7 @@
 #define MARGIN		24
 #define LABEL_COLS	8
 
-volatile uint32_t *con_fb = (volatile uint32_t *)SPLASH_BASE;
+volatile uint32_t *con_fb = (volatile uint32_t *)FB_FALLBACK;
 uint32_t con_w = PANEL_W, con_h = PANEL_H, con_stride = PANEL_W * 4;
 void (*con_flush)(void);
 static uint32_t con_bg;

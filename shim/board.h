@@ -17,9 +17,12 @@
 
 #define UFS_BASE		0x01d84000UL	/* ufshc@1d84000 "ufs_mem" */
 
-/* Splash: reserved-memory splash_region 0x9c000000 + 0x2400000. */
+/* Splash: reserved-memory splash_region 0x9c000000 + 0x2400000. ABL's pipe
+ * (VIG0) scans out of FB_FALLBACK inside it, a 1080x2248 a8r8g8b8 buffer
+ * (shim photo, 2026-10-25); sde.c reads it from the MDP, this is the fallback. */
 #define SPLASH_BASE		0x9c000000UL
 #define SPLASH_SIZE		0x02400000UL
+#define FB_FALLBACK		0x9d200000UL
 #define PANEL_W			1080
 #define PANEL_H			2248
 
