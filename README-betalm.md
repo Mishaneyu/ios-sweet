@@ -68,6 +68,7 @@ Everything that depends on the real hardware is listed under
 | 0089 | Touch: the outer 120 px of the panel stretch to the edges of the presented 1125×2436 display, so the bottom edge (home gesture) is reachable despite the 94-row crop |
 | 0090 | **Adreno 640 GPU from [ios-flame](https://github.com/NWylynko/ios-flame)** (Pixel 4, same SM8150; MIT, its XNU patches APSL 2.0): GPU bring-up (GPUCC, Adreno SMMU, GMU + HFI, SQE, zap shader through TrustZone), `/dev/pmem`, GPU present (scale-to-fit), `IOAcceleratorES` + Metal user client, AMFI trust query, `-mcpu=cortex-a55` (no EOR3). G8S changes: zap region 0x98715000, GPU-visible panel memory 0x9d200000, panel VIG0 only, GPU buffer pool 0xb0000000+1 GB, bring-up log synced step by step. Off unless `sweetgpu=1` |
 | 0091 | `sweet_inject`: files packed into the boot payload (`mkpayload.py --inject DIR`, `DIR/.owners` for owners) are written into the iOS root after it mounts, before launchd: how the Metal bundle and its settings get onto the phone without SSH (`sweetinject=0` skips) |
+| 0092 | CPU clusters to full speed through the OSM hardware DCVS (ios-flame's `sweet_cpufreq.c`; ABL leaves them slow). `sweetcpufreq=0` keeps ABL's speed, `=N` caps at N MHz |
 
 `tools/mkadt.py`: Kryo 485 topology and clocks, 1080×2248, `lge,betalm`
 compatible, 3 GiB RAM default. `tools/sweet-log-pull.sh -p NAME`: read the
@@ -215,6 +216,7 @@ Lines to look for: `SWEET: boot-args` (has the shim's `shim.*` report),
 | `sweetgpufb=0` | With `sweetgpu=1`: bring the GPU up but keep the CPU copy for frames |
 | `sweetmtl=1/2` | Publish the Metal accelerator (2: ios-flame's SweetMetal2, metal2vulkan + Turnip; needs the bundle in the root) |
 | `sweetfb_hz=60` | Present up to 60 frames/s (the old images used 30) |
+| `sweetcpufreq=N` | 1 (default) full speed, 0 leave ABL's speed, N: at most N MHz |
 | `sweettouch=0` | Touch driver off |
 | `sweettouchi2cus=N` | Bit-banged I²C half clock period in µs (default 2, about 200 kHz) |
 | `sweettouchfingers=N` | Object slots read per report when bit-banging (default 2; up to 10) |
