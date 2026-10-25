@@ -65,6 +65,7 @@ Everything that depends on the real hardware is listed under
 | 0086 | Log the boot-args (with the shim report) to the persistent log |
 | 0087 | Console log strip (`sweetfb_logrows=N`): the log keeps the bottom N text rows, the GUI (boot logo, home screen) shows above it; a panic takes the whole screen |
 | 0088 | `sweet_log_sync()`: write the log out now and wait; the GPI touch code logs each step through it, so a SoC reset without a panic still leaves the last step on disk |
+| 0089 | Touch: the outer 120 px of the panel stretch to the edges of the presented 1125×2436 display, so the bottom edge (home gesture) is reachable despite the 94-row crop |
 
 `tools/mkadt.py`: Kryo 485 topology and clocks, 1080×2248, `lge,betalm`
 compatible, 3 GiB RAM default. `tools/sweet-log-pull.sh -p NAME`: read the
