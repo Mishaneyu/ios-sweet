@@ -214,6 +214,7 @@ Lines to look for: `SWEET: boot-args` (has the shim's `shim.*` report),
 | `sweetgpu=1` | Power up the Adreno 640 and use it for presenting frames (firmware: `mkpayload.py --gpufw DIR` with the phone's own a640_gmu.bin, a630_sqe.fw, a640_zap.mdt/.b02) |
 | `sweetgpufb=0` | With `sweetgpu=1`: bring the GPU up but keep the CPU copy for frames |
 | `sweetmtl=1/2` | Publish the Metal accelerator (2: ios-flame's SweetMetal2, metal2vulkan + Turnip; needs the bundle in the root) |
+| `sweetfb_hz=60` | Present up to 60 frames/s (the old images used 30) |
 | `sweettouch=0` | Touch driver off |
 | `sweettouchi2cus=N` | Bit-banged I²C half clock period in µs (default 2, about 200 kHz) |
 | `sweettouchfingers=N` | Object slots read per report when bit-banging (default 2; up to 10) |
@@ -252,3 +253,20 @@ at about 20–30 fps) or SEP. You can't leave an app with the home gesture yet.
 Security is mostly off: don't put anything personal on it. The Wi-Fi and
 Adreno work from ios-topaz/HackiOS is the next layer to port (G8S: WCN3998,
 Adreno 640).
+
+## GPU and Metal (2026-10-25)
+
+Working on the G8S: the Adreno 640 comes up (GMU with LG's firmware, zap shader through
+TrustZone, 545 ms), frames are scaled onto the panel by the GPU, and backboardd and
+SpringBoard draw through Metal (metal2vulkan + Turnip, ios-flame's SweetMetal2) with every
+blur and transparency. Recipe:
+
+1. Firmware from the phone's own `/vendor/firmware` (`adb root`): a640_gmu.bin, a630_sqe.fw,
+   a640_zap.mdt, a640_zap.b02 (keep them out of git).
+2. The "sweetmetal2" artifact of `.github/workflows/metal.yml`; stage it with
+   `tools/mkmetal-inject.sh SweetMetal2.bundle.tar.gz inj [CLIENTS]`.
+3. `tools/mkpayload.py KERNEL ADT payload.bin --gpufw FWDIR --inject inj --cmdline "... sweetgpu=1 sweetmtl=2 sweetfb_hz=60 sweetfb_noconsole=1"`,
+   then `shim/build.sh`.
+
+The on-screen kernel log must stay off with the GPU (`sweetfb_noconsole=1`): the panel's
+row stride changes to 4352 bytes. The persistent log is unaffected.
