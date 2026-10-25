@@ -55,12 +55,11 @@ jobs:
       - name: Deps
         run: |
           brew install jq gum bash cmake ninja
-          # build.sh checks command -v xcodes; put stub in both Homebrew prefix (/opt/homebrew/bin on macos-15) and /usr/local/bin
-          printf '#!/bin/sh\nexit 0\n' > "$(brew --prefix)/bin/xcodes"
-          chmod +x "$(brew --prefix)/bin/xcodes"
-          sudo mkdir -p /usr/local/bin
-          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
-          sudo chmod +x /usr/local/bin/xcodes
+          # build.sh checks command -v xcodes; only install stub if xcodes is not already preinstalled
+          if ! command -v xcodes >/dev/null 2>&1; then
+            printf '#!/bin/sh\nexit 0\n' | sudo tee "$(brew --prefix)/bin/xcodes" >/dev/null
+            sudo chmod +x "$(brew --prefix)/bin/xcodes"
+          fi
           # SWEET links no closed KDK archives (tools/build-xnu.sh); skip 1.2 GB KDK dmg download
           mkdir -p "$PWD/fake-kdk"
           echo "KDKROOT=$PWD/fake-kdk" >> "$GITHUB_ENV"
@@ -111,6 +110,7 @@ jobs:
         run: |
           mkdir -p out/kdk-libs
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            [ -f "$lib" ] || continue
             b=$(basename "$lib" .a)
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
