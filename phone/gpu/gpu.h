@@ -19,7 +19,7 @@
 #define GPU_FW_DIR	"/var/local/gpu/fw"
 
 #define FB_W		1080
-#define FB_H		2280
+#define FB_H		2400
 #define FB_STRIDE	4320		/* as ABL set up the panel */
 #define FB_STRIDE_GPU	4352		/* 64-byte multiple: what the GPU can write */
 

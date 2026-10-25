@@ -122,3 +122,4 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
   RMI4 touch over GENI I2C SE0 (`rmxtouch`), and `sweetprobe=1` read-only driver bring-up under `rd=md0`.
 - 0126 RMX1931 touch: fall back to open-drain TLMM GPIO I2C (`GPIO 55/56` with SCL clock stretching) when SE0
   `GENI_IF_DISABLE_RO` (`0x64`) reports `FIFO_IF_DISABLE` (`rmxtouchgpio=1` forces it).
+- 0127 RMX1931 GPU: set Adreno 640 `ZAP_REGION` to `0x99515000` (`pil_gpu_region` in `RMX1931` FDT).

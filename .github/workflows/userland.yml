@@ -1,0 +1,161 @@
+name: userland
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "phone/**"
+      - "tools/build-turnip-ios.sh"
+      - "tools/build-m2v-bridge.sh"
+      - ".github/workflows/userland.yml"
+
+concurrency:
+  group: userland-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Xcode and Homebrew tools
+        run: |
+          DEV_DIR=$(xcode-select -p 2>/dev/null || true)
+          if [ -z "$DEV_DIR" ] || [ ! -d "$DEV_DIR" ]; then
+            XC=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)
+            [ -n "$XC" ] || XC=/Applications/Xcode.app
+            sudo xcode-select -s "$XC"
+            DEV_DIR="$XC/Contents/Developer"
+          fi
+          echo "DEVELOPER_DIR=$DEV_DIR" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          brew install llvm bison flex ninja gnu-sed pkg-config autoconf automake
+          if [ ! -x /opt/homebrew/opt/llvm/bin/llvm-as ]; then
+            sudo mkdir -p /opt/homebrew/opt/llvm/bin
+            sudo ln -sf "$(brew --prefix llvm)/bin/llvm-as" /opt/homebrew/opt/llvm/bin/llvm-as
+          fi
+          chmod +x work/userland/bin/ios-cc tools/*.sh phone/*/*.sh
+
+      - name: Reconstruct shared sweet_a6xx.{c,h} from patches
+        run: |
+          git init -q work/dxb/xnu
+          for p in xnu/patches/0095-*.patch xnu/patches/0105-*.patch xnu/patches/0106-*.patch \
+                   xnu/patches/0107-*.patch xnu/patches/0108-*.patch xnu/patches/0109-*.patch \
+                   xnu/patches/0111-*.patch xnu/patches/0112-*.patch xnu/patches/0115-*.patch \
+                   xnu/patches/0118-*.patch xnu/patches/0125-*.patch xnu/patches/0127-*.patch; do
+            git -C work/dxb/xnu apply --include='bsd/dev/sweet_a6xx*' "$PWD/$p"
+          done
+          ls -la work/dxb/xnu/bsd/dev/
+
+      - name: Build wland, gpu/pmem, and phone/tools
+        run: |
+          sh phone/wifi/build.sh
+          sh phone/gpu/build.sh
+          bash phone/tools/build.sh
+
+      - name: Build Mesa Turnip (libvulkan_freedreno.dylib) for iOS 16 arm64
+        run: |
+          git clone --depth 1 https://github.com/UniXNU/UniXNU.git reference-repos/UniXNU
+          mkdir -p work/turnip
+          git init -q work/turnip/mesa
+          git -C work/turnip/mesa fetch --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git 85fda3b36405bcaea8bffc64aa4f2651dc90770d || \
+            git -C work/turnip/mesa fetch --depth 1 https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+          git -C work/turnip/mesa checkout -q FETCH_HEAD
+          python3 - <<'PY'
+          import json, subprocess
+          cfg = json.load(open("reference-repos/UniXNU/scripts/data/adreno-compiler-inputs.json"))
+          for rel in cfg["patches"]:
+              p = "reference-repos/UniXNU/" + rel
+              r = subprocess.run(["git", "-C", "work/turnip/mesa", "apply", "--check", "../../" + p], capture_output=True)
+              if r.returncode == 0:
+                  subprocess.run(["git", "-C", "work/turnip/mesa", "apply", "../../" + p], check=True)
+                  print("Applied:", rel)
+              else:
+                  print("Skipped (not needed for runtime dylib):", rel)
+          PY
+          for p in phone/turnip/patches/*.patch; do
+            git -C work/turnip/mesa apply "$PWD/$p"
+          done
+          python3 -m venv work/turnip/venv
+          work/turnip/venv/bin/pip install -q meson mako pyyaml packaging
+          sh tools/build-turnip-ios.sh ios
+
+      - name: Build metal2vulkan bridge + SweetMetal2.bundle
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
+          git init -q work/metal2vulkan
+          git -C work/metal2vulkan fetch --depth 1 https://github.com/steelbrain/metal2vulkan.git 720ef1ce9ae2a2068999a8675717418b9416283e
+          git -C work/metal2vulkan checkout -q FETCH_HEAD
+          for p in phone/metal2/bridge/patches/*.patch; do
+            git -C work/metal2vulkan apply "$PWD/$p"
+          done
+          sh tools/build-m2v-bridge.sh ios
+          sh phone/metal2/build.sh
+
+      - name: Build dash + dropbearmulti for iOS 16 arm64 SSH shell
+        continue-on-error: true
+        run: |
+          mkdir -p work/userland/stage work/userland/src
+          CC_IOS="$PWD/work/userland/bin/ios-cc"
+          # 1. dash (/bin/sh)
+          curl -sfL https://git.kernel.org/pub/scm/utils/dash/dash.git/snapshot/dash-0.5.12.tar.gz | tar xzf - -C work/userland/src
+          (
+            cd work/userland/src/dash-0.5.12
+            ./autogen.sh
+            CC="$CC_IOS" CC_FOR_BUILD=/usr/bin/clang ac_cv_func_strchrnul=no ac_cv_func_stat64=no ac_cv_func_open64=no \
+              ./configure --host=aarch64-apple-darwin --enable-static
+            make -j4
+            strip -x src/dash
+            codesign -f -s - src/dash
+            cp src/dash ../../stage/dash
+          )
+          # 2. dropbearmulti (root pubkey SSH server)
+          curl -sfL https://matt.ucc.asn.au/dropbear/releases/dropbear-2024.86.tar.bz2 | tar xjf - -C work/userland/src
+          (
+            cd work/userland/src/dropbear-2024.86
+            cat > localoptions.h <<'EOF'
+          #define DROPBEAR_SVR_PASSWORD_AUTH 0
+          #define DROPBEAR_SVR_PAM_AUTH 0
+          #define DROPBEAR_SVR_PUBKEY_AUTH 1
+          #define DROPBEAR_SVR_MULTIUSER 0
+          #define DROPBEAR_PATH_SSH_PROGRAM "/var/local/bin/dbclient"
+          #define DEFAULT_PATH "/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          EOF
+            # Allow uid 0 single-user login on iOS without getspnam/crypt
+            python3 - <<'PY'
+          for fn in ("src/svr-auth.c", "svr-auth.c"):
+              import os
+              if os.path.exists(fn):
+                  s = open(fn).read()
+                  s = s.replace("svr_opts.multiauthmethod", "0 && svr_opts.multiauthmethod")
+                  open(fn, "w").write(s)
+          PY
+            CC="$CC_IOS" ac_cv_func_strchrnul=no ac_cv_func_getpass=yes ac_cv_func_utmpname=no ac_cv_func_utmpxname=no \
+              ./configure --host=aarch64-apple-darwin --disable-zlib --disable-syslog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx --disable-pututline --disable-pututxline --disable-lastlog
+            make -j4 PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1
+            strip -x dropbearmulti
+            codesign -f -s - dropbearmulti
+            cp dropbearmulti ../../stage/dropbearmulti
+          )
+          ls -la work/userland/stage
+
+      - name: Package userland bundle
+        run: |
+          mkdir -p dist-userland/bin dist-userland/Extensions
+          cp -R phone/metal2/out/SweetMetal2.bundle dist-userland/Extensions/
+          cp phone/metal2/out/m2vtest dist-userland/bin/ || true
+          cp phone/wifi/out/wland dist-userland/bin/
+          cp phone/gpu/out/gpu phone/gpu/out/pmem dist-userland/bin/
+          cp phone/tools/out/* dist-userland/bin/
+          cp work/userland/stage/* dist-userland/bin/ 2>/dev/null || true
+          tar czf ios-userland.tar.gz -C dist-userland .
+          ls -lh ios-userland.tar.gz dist-userland/bin dist-userland/Extensions
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-userland
+          path: ios-userland.tar.gz

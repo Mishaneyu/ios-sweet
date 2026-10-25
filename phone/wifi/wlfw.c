@@ -31,10 +31,11 @@
 #define FW_INIT_DONE_IND 0x38
 
 #define CLIENT_ID	0x4b4e454c	/* ath10k's */
-#define MSA_PA		0x8bc00000ull	/* pil_wlan_fw_region */
+#define MSA_PA		0x9b000000ull	/* RMX1931 pil_wlan_fw_region */
 #define MSA_SIZE	0x100000u	/* qcom,wlan-msa-memory */
-#define BDF_PATH	"/var/local/fw/modem/bdwlan-flame.bin"
-#define BDF_PATH2	"/var/local/fw/modem/bdwlan-flame-PROTO1.1.bin"
+#define BDF_PATH	"/var/local/fw/modem/bdwlan-rmx1931.bin"
+#define BDF_PATH2	"/var/local/fw/modem/bdwlan.bin"
+#define BDF_PATH3	"/var/local/fw/modem/bdwlan-flame.bin"
 
 static uint32_t srv_node, srv_port;
 static int srv_up, started;
@@ -311,14 +312,21 @@ int wlfw_start(void)
 		/* ath10k waits for the MSA ready indication before the board data */
 		for (int t = 0; t < 5000 && !msa_ready; t++)
 			link_poll(1);
-		/* which request shape this firmware takes is not known yet: try them in turn */
-		static const struct { const char *path; int file_id, type; unsigned seg; } v[] = {
-			{ BDF_PATH, 0, -1, 6144 },
-		};
+		/* Try factory persist BDF first, then board_id-matched BDF, then generic bdwlan.bin */
+		char bdf_id_path[128] = "";
+		if (wlfw.board_id != 0xff && wlfw.board_id != 0) {
+			if (wlfw.board_id >= 0x100)
+				snprintf(bdf_id_path, sizeof(bdf_id_path), "/var/local/fw/modem/bdwlan.%03x", wlfw.board_id);
+			else
+				snprintf(bdf_id_path, sizeof(bdf_id_path), "/var/local/fw/modem/bdwlan.b%02x", wlfw.board_id);
+		}
+		const char *cands[] = { BDF_PATH, bdf_id_path[0] ? bdf_id_path : NULL, BDF_PATH2, BDF_PATH3 };
 		int ok = 0;
-		for (unsigned i = 0; i < sizeof(v) / sizeof(v[0]) && !ok; i++) {
-			printf("wlfw: BDF try %u: file_id %d type %d seg %u %s\n", i, v[i].file_id, v[i].type, v[i].seg, v[i].path);
-			ok = !bdf_download(v[i].path, v[i].file_id, v[i].type, v[i].seg);
+		for (unsigned i = 0; i < sizeof(cands) / sizeof(cands[0]) && !ok; i++) {
+			if (!cands[i])
+				continue;
+			printf("wlfw: BDF try %u: file_id 0 type -1 seg 6144 %s\n", i, cands[i]);
+			ok = !bdf_download(cands[i], 0, -1, 6144);
 		}
 		if (!ok)
 			return -1;
