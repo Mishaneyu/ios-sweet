@@ -368,6 +368,19 @@ static uint32_t to_us(uint64_t ticks)
 }
 
 static struct sde_fb fb;
+struct shim_wdt shim_wdt;
+
+/* Stop ABL's APSS watchdog: pet it once, then disable (as Linux does). */
+static void wdt_stop(void)
+{
+	shim_wdt.en_before = rd32(APSS_WDT_BASE + WDT0_EN);
+	shim_wdt.bark = rd32(APSS_WDT_BASE + WDT0_BARK_TIME);
+	shim_wdt.bite = rd32(APSS_WDT_BASE + WDT0_BITE_TIME);
+	wr32(APSS_WDT_BASE + WDT0_RST, 1);
+	wr32(APSS_WDT_BASE + WDT0_EN, 0);
+	__asm__ volatile("dsb sy" ::: "memory");
+	shim_wdt.en_after = rd32(APSS_WDT_BASE + WDT0_EN);
+}
 
 static void fb_kick(void)
 {
@@ -404,6 +417,8 @@ void shim_main(uint64_t dtb)
 	 * Display first: on the G8S's command-mode panel nothing drawn shows
 	 * until the MDP refreshes it (sde.c). Then a status screen, then XNU.
 	 */
+	stage = "wdt";
+	wdt_stop();
 	stage = "sde";
 	sde_handoff(&fb, want_autorefresh(dtb));
 	con_init(fb.base, fb.width, fb.height, fb.stride, fb.bpp);
@@ -420,6 +435,8 @@ void shim_main(uint64_t dtb)
 	con_hex2("SDE", "ctl=", (uint32_t)fb.ctl, "autoref=", fb.autorefresh);
 	con_hex2("SDE", "live=", fb.refreshing, 0, 0);
 	con_hex2("CPU", "midr=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
+	con_hex2("WDT", "en=", shim_wdt.en_before, "now=", shim_wdt.en_after);
+	con_hex2("WDT", "bark=", shim_wdt.bark, "bite=", shim_wdt.bite);
 	con_hex2("MMFR0", "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf, "el=", (uint32_t)(rsr("CurrentEL") >> 2));
 	con_skip();
 	delay_ms(3000);	/* readable on a phone camera */

@@ -17,6 +17,19 @@
 
 #define UFS_BASE		0x01d84000UL	/* ufshc@1d84000 "ufs_mem" */
 
+/*
+ * APSS watchdog (qcom,wdt@17c10000, bark 11 s, pet 9.36 s; registers from
+ * drivers/soc/qcom/watchdog_v2.c). ABL leaves it running for Linux to pet;
+ * nothing pets it here, so the first XNU test reset after ~10 s. The shim
+ * disables it the way Linux's msm_watchdog_disable does: WDT0_EN = 0.
+ */
+#define APSS_WDT_BASE		0x17c10000UL
+#define WDT0_RST		0x04
+#define WDT0_EN			0x08
+#define WDT0_STS		0x0c
+#define WDT0_BARK_TIME		0x10
+#define WDT0_BITE_TIME		0x14
+
 /* Splash: reserved-memory splash_region 0x9c000000 + 0x2400000. ABL's pipe
  * (VIG0) scans out of FB_FALLBACK inside it, a 1080x2248 a8r8g8b8 buffer
  * (shim photo, 2026-10-25); sde.c reads it from the MDP, this is the fallback. */

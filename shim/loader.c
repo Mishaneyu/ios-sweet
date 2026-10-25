@@ -196,7 +196,7 @@ const char *loader_boot(uintptr_t dtb, const struct sde_fb *fb)
 		ba->CommandLine[i] = p->cmdline[i];
 	ba->memSizeActual = mem_size;
 	/* What the shim saw, for the persistent log (no serial port here). */
-	char info[160], *o = info;
+	char info[256], *o = info;
 	o = put_str(o, "shim.fb=");
 	o = put_hex(o, fb->base);
 	o = put_str(o, ",");
@@ -216,6 +216,12 @@ const char *loader_boot(uintptr_t dtb, const struct sde_fb *fb)
 	o = put_str(o, fb->cmd_mode ? ",cmd" : ",video");
 	o = put_str(o, fb->autorefresh ? ",autoref" : ",noautoref");
 	o = put_str(o, fb->refreshing ? ",live" : ",still");
+	o = put_str(o, " shim.wdt=");
+	o = put_hex(o, shim_wdt.en_before);
+	o = put_str(o, ",");
+	o = put_hex(o, shim_wdt.en_after);
+	o = put_str(o, ",bark");
+	o = put_hex(o, shim_wdt.bark);
 	o = put_str(o, " shim.dram=");
 	o = put_hex(o, mem_size);
 	*o = 0;
