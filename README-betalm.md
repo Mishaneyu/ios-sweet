@@ -209,6 +209,8 @@ Lines to look for: `SWEET: boot-args` (has the shim's `shim.*` report),
 | `shim.noautoref` | Shim leaves the MDP alone (debug only: the screen will not update) |
 | `sweetfb_logrows=N` | From the first GUI frame, kernel log only in the bottom N text rows (16 px each); GUI above |
 | `sweettouch=0` | Touch driver off |
+| `sweettouchi2cus=N` | Bit-banged I²C half clock period in µs (default 2, about 200 kHz) |
+| `sweettouchfingers=N` | Object slots read per report when bit-banging (default 2; up to 10) |
 | `sweettouchgsi=1` | Touch I²C through GPI DMA instead of bit-banging (experimental: reset the phone once) |
 | `sweettouchdelay=N` | Start touch N s after boot (default 45) |
 | `sweettouchflip=N` | Touch orientation: bit0 mirror X, bit1 mirror Y, bit2 swap X/Y |
