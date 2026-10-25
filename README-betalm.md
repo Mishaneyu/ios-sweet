@@ -61,7 +61,7 @@ Everything that depends on the real hardware is listed under
 | 0082 | `SWEET_BOARD_BETALM`, panel constants for the early consoles (`start.s`, `sweet_early.c`, `arm_vm_init.c`) |
 | 0083 | Touch HID takes the panel size from `boot_args.Video` instead of 1080×2400 |
 | 0084 | Keys: PM8150 GPIO6 (vol-up) + PON KPDPWR/RESIN. sweet's SM7150 USB probe off by default (`sweetusb=1` to force) |
-| 0085 | Touch: GENI I²C on QUP2 SE0 (= SE17) through **GPI DMA** (LG's QUP firmware disables the FIFO interface: GSI only), SM8150 GCC clocks (HW-gated branches, DFS level scan), SOUTH-tile TLMM pins, GPIO power (vdd 152, vcl 59, reset 54, ATTN 122), **Synaptics RMI4**: PDT scan, F01 setup, F12 register-descriptor parsing, polled reports |
+| 0085 | Touch: LG's QUP firmware runs SE17 GSI-only (FIFO interface disabled), so I²C is **bit-banged on its pins** (GPIO 55/56), as the Poco F1 port (Bergamota) does; a polled **GPI DMA** path is kept behind `sweettouchgsi=1` (its first try reset the SoC), SM8150 GCC clocks (HW-gated branches, DFS level scan), SOUTH-tile TLMM pins, GPIO power (vdd 152, vcl 59, reset 54, ATTN 122), **Synaptics RMI4**: PDT scan, F01 setup, F12 register-descriptor parsing, polled reports |
 | 0086 | Log the boot-args (with the shim report) to the persistent log |
 | 0087 | Console log strip (`sweetfb_logrows=N`): the log keeps the bottom N text rows, the GUI (boot logo, home screen) shows above it; a panic takes the whole screen |
 | 0088 | `sweet_log_sync()`: write the log out now and wait; the GPI touch code logs each step through it, so a SoC reset without a panic still leaves the last step on disk |
@@ -209,6 +209,7 @@ Lines to look for: `SWEET: boot-args` (has the shim's `shim.*` report),
 | `shim.noautoref` | Shim leaves the MDP alone (debug only: the screen will not update) |
 | `sweetfb_logrows=N` | From the first GUI frame, kernel log only in the bottom N text rows (16 px each); GUI above |
 | `sweettouch=0` | Touch driver off |
+| `sweettouchgsi=1` | Touch I²C through GPI DMA instead of bit-banging (experimental: reset the phone once) |
 | `sweettouchdelay=N` | Start touch N s after boot (default 45) |
 | `sweettouchflip=N` | Touch orientation: bit0 mirror X, bit1 mirror Y, bit2 swap X/Y |
 | `sweettouchirq=1` | Read the IC only when ATTN is low (plus every 100 ms) |
