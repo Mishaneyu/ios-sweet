@@ -61,8 +61,9 @@ Everything that depends on the real hardware is listed under
 | 0082 | `SWEET_BOARD_BETALM`, panel constants for the early consoles (`start.s`, `sweet_early.c`, `arm_vm_init.c`) |
 | 0083 | Touch HID takes the panel size from `boot_args.Video` instead of 1080×2400 |
 | 0084 | Keys: PM8150 GPIO6 (vol-up) + PON KPDPWR/RESIN. sweet's SM7150 USB probe off by default (`sweetusb=1` to force) |
-| 0085 | Touch: GENI I²C on QUP2 SE0 (= SE17), SM8150 GCC clocks, SOUTH-tile TLMM pins, GPIO power (vdd 152, vcl 59, reset 54, ATTN 122), **Synaptics RMI4**: PDT scan, F01 setup, F12 register-descriptor parsing, polled reports |
+| 0085 | Touch: GENI I²C on QUP2 SE0 (= SE17) through **GPI DMA** (LG's QUP firmware disables the FIFO interface: GSI only), SM8150 GCC clocks (HW-gated branches, DFS level scan), SOUTH-tile TLMM pins, GPIO power (vdd 152, vcl 59, reset 54, ATTN 122), **Synaptics RMI4**: PDT scan, F01 setup, F12 register-descriptor parsing, polled reports |
 | 0086 | Log the boot-args (with the shim report) to the persistent log |
+| 0087 | Console log strip (`sweetfb_logrows=N`): the log keeps the bottom N text rows, the GUI (boot logo, home screen) shows above it; a panic takes the whole screen |
 
 `tools/mkadt.py`: Kryo 485 topology and clocks, 1080×2248, `lge,betalm`
 compatible, 3 GiB RAM default. `tools/sweet-log-pull.sh -p NAME`: read the
@@ -205,6 +206,7 @@ Lines to look for: `SWEET: boot-args` (has the shim's `shim.*` report),
 | `cpus=1/4/8` | 1 core / the four A55s / all eight |
 | `ufsroot=NAME` | GPT partition on LUN 0 holding the root (default `userdata`) |
 | `shim.noautoref` | Shim leaves the MDP alone (debug only: the screen will not update) |
+| `sweetfb_logrows=N` | From the first GUI frame, kernel log only in the bottom N text rows (16 px each); GUI above |
 | `sweettouch=0` | Touch driver off |
 | `sweettouchdelay=N` | Start touch N s after boot (default 45) |
 | `sweettouchflip=N` | Touch orientation: bit0 mirror X, bit1 mirror Y, bit2 swap X/Y |

@@ -1,0 +1,194 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..d27323c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -33,10 +33,14 @@
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+  * the first swap on (it still reaches the persistent log; panics draw).
++ * Boot-arg sweetfb_logrows=N instead keeps the log in the bottom N text rows
++ * (16 px each) from the first swap on and shows the GUI above it: the boot
++ * logo and the log at the same time. A panic takes the whole screen again.
+  */
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" unsigned int sweet_console_strip(unsigned int rows); /* video_console.c */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -111,6 +115,7 @@ public:
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
++	uint32_t      fStripTop;        /* log strip from this panel row, 0 = none */
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+@@ -322,7 +327,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 			 * writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
+ 		}
++		uint32_t logrows = 0;
++		if (!quiet && PE_parse_boot_argn("sweetfb_logrows", &logrows, sizeof(logrows)) && logrows != 0) {
++			fStripTop = sweet_console_strip(logrows);
++			IOLog("SWEET FB: log strip of %u rows from panel row %u\n", logrows, fStripTop);
++		}
+ 	}
++	/* GUI rows end where the log strip starts. */
++	uint32_t guiH = fStripTop ? fStripTop : fHeight;
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+@@ -381,8 +393,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (w > (int32_t)fWidth - dx) {
+ 			w = (int32_t)fWidth - dx;
+ 		}
+-		if (h > (int32_t)fHeight - dy) {
+-			h = (int32_t)fHeight - dy;
++		if (h > (int32_t)guiH - dy) {
++			h = (int32_t)guiH - dy;
+ 		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index c86b9e7..fdc11d9 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -268,6 +268,7 @@ _cnputc(char c, bool poll)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
++extern void sweet_console_strip_panic(void);            /* video_console.c */
+ /*
+  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+  * console text still goes to the persistent log, but is not drawn over
+@@ -283,7 +284,9 @@ _cnputs(char *c, int size, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
+-	if (sweet_console_muted && !panic_active()) {
++	if (panic_active()) {
++		sweet_console_strip_panic();    /* log strip: whole screen again */
++	} else if (sweet_console_muted) {
+ 		return;
+ 	}
+ #endif
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 384118e..5a13281 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -3296,3 +3296,113 @@ vc_set_progressmeter(int new_value)
+ }
+ 
+ #endif /* defined(XNU_TARGET_OS_OSX) */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Log strip (boot-arg sweetfb_logrows=N, iokit/Kernel/arm/SweetFramebuffer.cpp):
++ * when the GUI first presents, the text console shrinks to the bottom N text
++ * rows of the panel and the GUI is not copied there, so the boot logo (and
++ * later the GUI) stays visible above a live log. The last N lines written so
++ * far move down into the strip. Only the console's view of the screen
++ * changes (base, height, rows); the mapping stays.
++ *
++ * Returns the first panel pixel row of the strip, or 0 if nothing changed.
++ */
++static struct {
++	boolean_t    active;
++	vm_offset_t  baseaddr;
++	unsigned int height, rows, buffer_rows, top_rows;
++} sweet_strip;
++
++unsigned int sweet_console_strip(unsigned int rows);
++void sweet_console_strip_panic(void);
++
++unsigned int
++sweet_console_strip(unsigned int rows)
++{
++	unsigned int total, n, src, top;
++
++	if (!gc_initialized) {
++		return 0;
++	}
++	VCPUTC_LOCK_LOCK();
++	total = vinfo.v_rows;
++	if (sweet_strip.active || rows == 0 || rows + 8 > total || vinfo.v_depth != 32 ||
++	    vinfo.v_baseaddr == 0) {
++		VCPUTC_LOCK_UNLOCK();
++		return 0;
++	}
++	top = total - rows;                     /* first text row of the strip */
++	n = rows < gc_y + 1 ? rows : gc_y + 1;               /* lines to keep: up to the cursor */
++	src = gc_y + 1 - n;
++
++	/* Pixels: whole text lines are contiguous (stride = v_rowbytes). */
++	size_t line = (size_t)ISO_CHAR_HEIGHT * vinfo.v_rowbytes;
++	unsigned char *fb = (unsigned char *)vinfo.v_baseaddr;
++	memmove(fb + (size_t)(total - n) * line, fb + (size_t)src * line, (size_t)n * line);
++	bzero(fb + (size_t)top * line, (size_t)(rows - n) * line);
++
++	/* Character buffer, so the strip scrolls with the right contents. */
++	if (gc_buffer_size && total <= gc_buffer_rows) {
++		size_t cols = gc_buffer_columns;
++		memmove(gc_buffer_attributes + (rows - n) * cols, gc_buffer_attributes + src * cols, n * cols);
++		memmove(gc_buffer_characters + (rows - n) * cols, gc_buffer_characters + src * cols, n * cols);
++		memmove(gc_buffer_colorcodes + (rows - n) * cols, gc_buffer_colorcodes + src * cols, n * cols);
++		memset(gc_buffer_attributes, ATTR_NONE, (rows - n) * cols);
++		memset(gc_buffer_characters, ' ', (rows - n) * cols);
++		memset(gc_buffer_colorcodes, COLOR_CODE_SET(0, COLOR_FOREGROUND, TRUE), (rows - n) * cols);
++	}
++
++	sweet_strip.baseaddr = vinfo.v_baseaddr;
++	sweet_strip.height = vinfo.v_height;
++	sweet_strip.rows = vinfo.v_rows;
++	sweet_strip.buffer_rows = gc_buffer_rows;
++	sweet_strip.top_rows = top;
++	sweet_strip.active = TRUE;
++
++	vinfo.v_baseaddr += (vm_offset_t)top * line;
++	vinfo.v_height = rows * ISO_CHAR_HEIGHT;
++	vinfo.v_rows = rows;
++	if (gc_buffer_size && gc_buffer_rows > rows) {
++		gc_buffer_rows = rows;
++	}
++	gc_y = rows - 1;
++	if (gc_savey > rows - 1) {
++		gc_savey = rows - 1;
++	}
++	gc_scrreg_top = 0;
++	gc_scrreg_bottom = rows;
++	VCPUTC_LOCK_UNLOCK();
++	return top * ISO_CHAR_HEIGHT;
++}
++
++/* A panic gets the whole screen back (no lock: the other CPUs are stopped). */
++void
++sweet_console_strip_panic(void)
++{
++	if (!sweet_strip.active) {
++		return;
++	}
++	sweet_strip.active = FALSE;
++	unsigned int rows = vinfo.v_rows, top = sweet_strip.top_rows;
++	/* The GUI part goes black, the strip's lines stay where they are. */
++	bzero((void *)sweet_strip.baseaddr, (size_t)top * ISO_CHAR_HEIGHT * vinfo.v_rowbytes);
++	vinfo.v_baseaddr = sweet_strip.baseaddr;
++	vinfo.v_height = sweet_strip.height;
++	vinfo.v_rows = sweet_strip.rows;
++	if (gc_buffer_size && sweet_strip.buffer_rows >= top + rows) {
++		size_t cols = gc_buffer_columns;
++		memmove(gc_buffer_attributes + top * cols, gc_buffer_attributes, rows * cols);
++		memmove(gc_buffer_characters + top * cols, gc_buffer_characters, rows * cols);
++		memmove(gc_buffer_colorcodes + top * cols, gc_buffer_colorcodes, rows * cols);
++		memset(gc_buffer_attributes, ATTR_NONE, top * cols);
++		memset(gc_buffer_characters, ' ', top * cols);
++		memset(gc_buffer_colorcodes, COLOR_CODE_SET(0, COLOR_FOREGROUND, TRUE), top * cols);
++	}
++	gc_buffer_rows = sweet_strip.buffer_rows;
++	gc_y += sweet_strip.top_rows;
++	gc_savey += sweet_strip.top_rows;
++	gc_scrreg_top = 0;
++	gc_scrreg_bottom = vinfo.v_rows;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
