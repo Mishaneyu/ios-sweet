@@ -27,6 +27,13 @@ out=$(realpath -m "$4") size=${5:-16G}
 stage=$(realpath -m "${6:-$HOME/iosroot-stage}")
 here=$(dirname "$(realpath "$0")")
 [[ ! -e $out ]] || { echo "refusing to overwrite $out (rm it first)" >&2; exit 1; }
+# libguestfs builds its appliance from the host kernel, which it must read as
+# this user (Ubuntu installs it mode 0600).
+for k in /boot/vmlinuz-*; do
+	[[ -r $k ]] || { echo "Error: $k is not readable: sudo chmod 0644 /boot/vmlinuz-*" >&2; exit 1; }
+done
+export LIBGUESTFS_BACKEND=${LIBGUESTFS_BACKEND:-direct}
+
 # A stage finished by an earlier run (marker $stage.done) is reused: only the
 # image is rebuilt. An unfinished one is refused.
 resume=0
