@@ -156,7 +156,63 @@ def add_gpufw_to_adt(adt_blob, fw_dir):
     return adt.serialize(root)
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, gpufw_dir=None):
+def add_mmap_to_adt(adt_blob, name, phys, size):
+    """Return the ADT with /chosen/memory-map NAME = <phys, size>."""
+    root, _ = adt.parse(adt_blob)
+    chosen = next(c for c in root.children if c.name == 'chosen')
+    mmap = next(c for c in chosen.children if c.name == 'memory-map')
+    mmap.props = [p for p in mmap.props if p[0] != name]
+    mmap.props.append((name, 0, struct.pack('<2Q', phys, size)))
+    return adt.serialize(root)
+
+
+def inject_archive(src):
+    """Pack the tree under src for bsd/dev/sweet_inject.c: every path is
+    installed at '/' + its path below src. Owners root:wheel unless a file
+    src/.owners has 'PATH UID GID' lines; modes as on disk."""
+    owners = {}
+    op = os.path.join(src, '.owners')
+    if os.path.exists(op):
+        for line in open(op):
+            parts = line.split()
+            if len(parts) == 3 and not line.startswith('#'):
+                owners[parts[0]] = (int(parts[1]), int(parts[2]))
+    out = bytearray(b'SWINJ1\0\0')
+
+    def entry(kind, mode, path, data):
+        uid, gid = owners.get(path, (0, 0))
+        name = path.encode() + b'\0'
+        out.extend(struct.pack('<6IQ', kind, mode, uid, gid, len(name), 0, len(data)))
+        out.extend(name)
+        out.extend(data)
+        out.extend(b'\0' * (-len(out) & 7))
+
+    for dirpath, dirnames, filenames in os.walk(src):
+        dirnames.sort()
+        rel = os.path.relpath(dirpath, src)
+        if rel != '.':
+            st = os.lstat(dirpath)
+            entry(1, st.st_mode & 0o7777, '/' + rel, b'')
+        for f in sorted(filenames):
+            full = os.path.join(dirpath, f)
+            path = '/' + os.path.relpath(full, src)
+            if path == '/.owners':
+                continue
+            st = os.lstat(full)
+            if os.path.islink(full):
+                entry(3, 0o755, path, os.readlink(full).encode())
+            else:
+                entry(2, st.st_mode & 0o7777, path, open(full, 'rb').read())
+        for d in list(dirnames):
+            full = os.path.join(dirpath, d)
+            if os.path.islink(full):
+                entry(3, 0o755, '/' + os.path.relpath(full, src), os.readlink(full).encode())
+                dirnames.remove(d)
+    out.extend(struct.pack('<6IQ', 0, 0, 0, 0, 0, 0, 0))
+    return bytes(out)
+
+
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, gpufw_dir=None, inject_dir=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -185,6 +241,13 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, gpufw_dir=None):
         ramdisk = (hex(rd_pa), hex(rd_size))
     if gpufw_dir:
         adt_blob = add_gpufw_to_adt(adt_blob, gpufw_dir)
+    if inject_dir:
+        arc = inject_archive(inject_dir)
+        inj_size = (len(arc) + PAGE - 1) & ~(PAGE - 1)
+        inj_va = kernel_end
+        kernel_end = inj_va + inj_size
+        pieces.append((inj_va, inj_size, arc))
+        adt_blob = add_mmap_to_adt(adt_blob, 'SweetInject', inj_va - virt_base + PHYS_BASE, len(arc))
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -216,10 +279,12 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--inject', help='directory tree to install into the iOS root at boot (bsd/dev/sweet_inject.c); '
+                    'DIR/.owners: "PATH UID GID" lines')
     ap.add_argument('--gpufw', help='Adreno firmware directory (a640_gmu.bin, a630_sqe.fw, a640_zap.mdt/.b02) '
                     'for bsd/dev/sweet_gpu.c, put in the ADT as /chosen/gpufw,*')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.gpufw)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.gpufw, a.inject)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

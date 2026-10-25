@@ -1,0 +1,248 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 319a475..efec033 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_pmem.c			standard
+ bsd/dev/sweet_a6xx.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_inject.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_inject.c b/bsd/dev/sweet_inject.c
+new file mode 100644
+index 0000000..cee6920
+--- /dev/null
++++ b/bsd/dev/sweet_inject.c
+@@ -0,0 +1,169 @@
++/*
++ * SWEET: install files into the root volume at boot, from the payload.
++ *
++ * There is no other way to put files on the iOS root of a running port
++ * without SSH: the HFS+ volume cannot be mounted from recovery, and
++ * rewriting the whole partition for one bundle is a 20 GB copy. So
++ * tools/mkpayload.py --inject DIR packs a directory tree into the boot
++ * payload, next to the kernel (/chosen/memory-map "SweetInject" = <pa, size>,
++ * like the RAMDisk), and this writes it out once the root is mounted and
++ * before launchd starts (bsd_init.c). Boot-arg sweetinject=0 skips it.
++ *
++ * Archive ("SWINJ1\0\0", then entries, each 8-byte aligned):
++ *   u32 kind (1 = directory, 2 = file, 3 = symlink), u32 mode, u32 uid,
++ *   u32 gid, u32 name length (with NUL), u32 0, u64 data size, name, data.
++ * Directories come before their contents. Existing directories are kept
++ * as they are; files and symlinks are replaced.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/fcntl.h>
++#include <sys/kauth.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++extern int sweet_kern_mkdir(const char *path, int mode);         /* bsd/vfs/vfs_syscalls.c */
++extern int sweet_kern_symlink(const char *target, const char *path);    /* bsd/vfs/vfs_syscalls.c */
++extern int sweet_kern_unlink(const char *path);                  /* bsd/vfs/vfs_syscalls.c */
++
++void sweet_inject_run(void);
++
++struct sweet_inject_entry {
++	uint32_t kind, mode, uid, gid, namelen, zero;
++	uint64_t size;
++};
++
++static int
++inject_attrs(const char *path, uint32_t mode, uint32_t uid, uint32_t gid, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & 07777);
++	VATTR_SET(&va, va_uid, uid);
++	VATTR_SET(&va, va_gid, gid);
++	error = vnode_setattr(vp, &va, ctx);
++	vnode_put(vp);
++	return error;
++}
++
++static int
++inject_file(const char *path, const uint8_t *data, uint64_t size, uint32_t mode, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	(void)sweet_kern_unlink(path);  /* a fresh inode: running processes keep the old one */
++	int error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, (int)(mode & 07777), 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	for (uint64_t off = 0; off < size && !error;) {
++		int n = (int)MIN(size - off, (uint64_t)(16u << 20));
++		int resid = 0;
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)(data + off), n, (off_t)off, UIO_SYSSPACE,
++		    IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!error && resid) {
++			error = EIO;
++		}
++		off += (uint64_t)n;
++	}
++	int cerr = vnode_close(vp, FWRITE, ctx);
++	return error ? error : cerr;
++}
++
++void
++sweet_inject_run(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("sweetinject", &on, sizeof(on));
++	DTEntry node;
++	const uint64_t *prop = NULL;
++	unsigned int psize = 0;
++	if (!on || SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "SweetInject", (void const **)&prop, &psize) != kSuccess || psize < 16) {
++		return;
++	}
++	uint64_t pa = prop[0], len = prop[1];
++	const uint8_t *base = (const uint8_t *)ml_static_ptovirt((vm_offset_t)pa);
++	if (base == NULL || len < 8 || memcmp(base, "SWINJ1\0\0", 8) != 0) {
++		printf("SWEET INJECT: bad archive at 0x%llx (%llu bytes)\n", pa, len);
++		return;
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	unsigned dirs = 0, files = 0, links = 0, errors = 0;
++	uint64_t bytes = 0, off = 8;
++	while (off + sizeof(struct sweet_inject_entry) <= len) {
++		struct sweet_inject_entry e;
++		memcpy(&e, base + off, sizeof(e));
++		uint64_t name_off = off + sizeof(e), data_off = name_off + e.namelen;
++		if (e.kind == 0 && e.namelen == 0) {
++			break;  /* end marker */
++		}
++		if (e.namelen < 2 || e.namelen > MAXPATHLEN || data_off + e.size > len ||
++		    base[data_off - 1] != '\0' || base[name_off] != '/') {
++			printf("SWEET INJECT: bad entry at offset %llu; stopping\n", off);
++			errors++;
++			break;
++		}
++		const char *name = (const char *)(base + name_off);
++		const uint8_t *data = base + data_off;
++		int error = 0;
++		switch (e.kind) {
++		case 1:
++			/* Existing directories (/System, /private/var, ...) keep their owner and mode. */
++			error = sweet_kern_mkdir(name, (int)(e.mode & 07777));
++			if (error == EEXIST) {
++				error = 0;
++			} else if (!error) {
++				error = inject_attrs(name, e.mode, e.uid, e.gid, ctx);
++				dirs++;
++			}
++			break;
++		case 2:
++			error = inject_file(name, data, e.size, e.mode, ctx);
++			if (!error) {
++				error = inject_attrs(name, e.mode, e.uid, e.gid, ctx);
++				files++;
++				bytes += e.size;
++			}
++			break;
++		case 3: {
++			char target[MAXPATHLEN];
++			if (e.size == 0 || e.size >= sizeof(target)) {
++				error = EINVAL;
++				break;
++			}
++			memcpy(target, data, (size_t)e.size);
++			target[e.size] = '\0';
++			(void)sweet_kern_unlink(name);
++			error = sweet_kern_symlink(target, name);
++			if (!error) {
++				links++;
++			}
++			break;
++		}
++		default:
++			error = EINVAL;
++			break;
++		}
++		if (error) {
++			errors++;
++			printf("SWEET INJECT: %s: error %d\n", name, error);
++		}
++		off = (data_off + e.size + 7) & ~7ULL;
++	}
++	printf("SWEET INJECT: %u directories, %u files (%llu KB), %u symlinks installed, %u errors\n",
++	    dirs, files, bytes >> 10, links, errors);
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..63faeae 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1002,6 +1002,14 @@ bsd_init(void)
+ 	}
+ #endif /* DEVFS */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		/* SWEET: files from the boot payload into the root (bsd/dev/sweet_inject.c) */
++		extern void sweet_inject_run(void);
++		sweet_inject_run();
++	}
++#endif
++
+ #if CONFIG_BASESYSTEMROOT
+ #if CONFIG_IMAGEBOOT
+ 	if (bsdmgroot_bootable()) {
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 90e68bb..35bac68 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14579,3 +14579,37 @@ fs_snapshot(__unused proc_t p, struct fs_snapshot_args *uap,
+ 
+ 	return error;
+ }
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: kernel-path mkdir/symlink/unlink for bsd/dev/sweet_inject.c,
++ * which installs payload files into the root volume before launchd.
++ */
++int sweet_kern_mkdir(const char *path, int mode);
++int sweet_kern_symlink(const char *target, const char *path);
++int sweet_kern_unlink(const char *path);
++
++int
++sweet_kern_mkdir(const char *path, int mode)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++
++int
++sweet_kern_symlink(const char *target, const char *path)
++{
++	return symlinkat_internal(vfs_context_kernel(), CAST_USER_ADDR_T(target), AT_FDCWD,
++	           CAST_USER_ADDR_T(path), UIO_SYSSPACE);
++}
++
++int
++sweet_kern_unlink(const char *path)
++{
++	return unlinkat_internal(vfs_context_kernel(), AT_FDCWD, NULLVP, CAST_USER_ADDR_T(path),
++	           UIO_SYSSPACE, 0);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
