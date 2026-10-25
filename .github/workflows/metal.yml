@@ -51,7 +51,7 @@ jobs:
           set -eux
           for p in phone/patches/*/*.patch; do echo "== $p"; git -C flame apply --whitespace=nowarn "$PWD/$p"; done
 
-      - name: wland (Wi-Fi daemon: modem, WLAN firmware, radio)
+      - name: "wland (Wi-Fi daemon - modem, WLAN firmware, radio)"
         run: |
           set -eux
           sh flame/phone/wifi/build.sh
