@@ -1185,10 +1185,10 @@ index 0000000..451bb8d
 +#endif
 diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
 new file mode 100644
-index 0000000..d9d7860
+index 0000000..f82c136
 --- /dev/null
 +++ b/bsd/dev/sweet_a6xx.h
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,177 @@
 +/*
 + * Adreno 640 core shared by the kernel (bsd/dev/sweet_gpu.c) and the
 + * userland bring-up tool (phone/gpu/gpu.c, built from this same file): power
@@ -1239,7 +1239,14 @@ index 0000000..d9d7860
 +#define A6_RING_SIZE		0x8000u
 +#define A6_RING_DW		(A6_RING_SIZE / 4)
 +
++#if defined(KERNEL)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if defined(SWEET_BOARD_BETALM)
++#define A6_FB_PA		0x9d200000ull	/* LG G8S: the panel memory ABL scans out (SWEET_SPLASH_PA) */
++#else
 +#define A6_FB_PA		0x9c400000ull
++#endif
 +#define A6_FB_SIZE		0xa00000ull	/* mapped for the GPU: 5 x 2 MB */
 +
 +#define A6_GPU_ID		640
