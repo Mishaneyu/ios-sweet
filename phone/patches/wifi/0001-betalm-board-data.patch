@@ -1,0 +1,25 @@
+--- a/phone/wifi/wlfw.c
++++ b/phone/wifi/wlfw.c
+@@ -312,7 +312,21 @@
+ 		for (int t = 0; t < 5000 && !msa_ready; t++)
+ 			link_poll(1);
+ 		/* which request shape this firmware takes is not known yet: try them in turn */
+-		static const struct { const char *path; int file_id, type; unsigned seg; } v[] = {
++		/*
++		 * LG G8S: the board data comes from the phone's own firmware partition,
++		 * named after the board id the firmware reports, as Linux icnss names it
++		 * ("bdwlan.bXX" below 0x100, "bdwlan.XXX" above), else the generic
++		 * bdwlan.bin; ios-flame's Pixel file as the last resort.
++		 */
++		static char bdf_board[96];
++		if (wlfw.board_id < 0x100)
++			snprintf(bdf_board, sizeof(bdf_board), "/var/local/fw/modem/bdwlan.b%02x", wlfw.board_id);
++		else
++			snprintf(bdf_board, sizeof(bdf_board), "/var/local/fw/modem/bdwlan.%03x", wlfw.board_id & 0xfff);
++		if (access(bdf_board, R_OK) != 0)
++			snprintf(bdf_board, sizeof(bdf_board), "/var/local/fw/modem/bdwlan.bin");
++		const struct { const char *path; int file_id, type; unsigned seg; } v[] = {
++			{ bdf_board, 0, -1, 6144 },
+ 			{ BDF_PATH, 0, -1, 6144 },
+ 		};
+ 		int ok = 0;

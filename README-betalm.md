@@ -69,6 +69,7 @@ Everything that depends on the real hardware is listed under
 | 0090 | **Adreno 640 GPU from [ios-flame](https://github.com/NWylynko/ios-flame)** (Pixel 4, same SM8150; MIT, its XNU patches APSL 2.0): GPU bring-up (GPUCC, Adreno SMMU, GMU + HFI, SQE, zap shader through TrustZone), `/dev/pmem`, GPU present (scale-to-fit), `IOAcceleratorES` + Metal user client, AMFI trust query, `-mcpu=cortex-a55` (no EOR3). G8S changes: zap region 0x98715000, GPU-visible panel memory 0x9d200000, panel VIG0 only, GPU buffer pool 0xb0000000+1 GB, bring-up log synced step by step. Off unless `sweetgpu=1` |
 | 0091 | `sweet_inject`: files packed into the boot payload (`mkpayload.py --inject DIR`, `DIR/.owners` for owners) are written into the iOS root after it mounts, before launchd: how the Metal bundle and its settings get onto the phone without SSH (`sweetinject=0` skips) |
 | 0092 | CPU clusters to full speed through the OSM hardware DCVS (ios-flame's `sweet_cpufreq.c`; ABL leaves them slow). `sweetcpufreq=0` keeps ABL's speed, `=N` caps at N MHz |
+| 0093 | **Wi-Fi from ios-flame** (Pixel 4, same SM8150 + WCN3990; ios-topaz/HackiOS code inside, APSL 2.0): `/dev/wlan` to the userland radio (wland), `en0` + Apple80211 ioctls for wifid, IO80211Controller/IONetworkInterface registry entries, IOKit quiesce, keystore wrap; 10-bit surfaces as BGRA for WebKit's content process. With `mkadt.py`'s `wlan` node launchd starts wifid |
 
 `tools/mkadt.py`: Kryo 485 topology and clocks, 1080×2248, `lge,betalm`
 compatible, 3 GiB RAM default. `tools/sweet-log-pull.sh -p NAME`: read the
@@ -272,3 +273,13 @@ blur and transparency. Recipe:
 
 The on-screen kernel log must stay off with the GPU (`sweetfb_noconsole=1`): the panel's
 row stride changes to 4352 bytes. The persistent log is unaffected.
+
+## Wi-Fi (in progress)
+
+The radio runs in userland (`wland`, ios-flame's phone/wifi, built by `.github/workflows/metal.yml`
+with `phone/patches/wifi/`): it boots the modem from the phone's own firmware, serves rmtfs/TFTP/
+pd-mapper, brings the WCN3990 up and hands frames to the kernel's en0 over /dev/wlan. The G8S has
+the same Wi-Fi supplies (L1A, L7A, L2C, L11C) and MSA region (0x8bc00000) as the Pixel 4.
+Files it needs on the phone (from Android, kept out of git): /var/local/fw/modem = modem.mdt/bNN,
+modemr.jsn, modemuw.jsn, wlanmdsp.mbn, bdwlan.* from /vendor/firmware_mnt/image;
+/var/local/fw/rmtfs = modemst1/modemst2/fsg/fsc images (IMEI and calibration: this phone only).

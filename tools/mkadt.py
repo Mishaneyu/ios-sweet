@@ -198,6 +198,14 @@ def build(seed=None, qemu=False, highmem=False):
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
         # the kernel's AppleCLCD matches the compatible string.
+        # launchd starts wifid only when the device tree has a "wlan" node
+        # (com.apple.wifid _LimitLoadToDeviceTree = wlan, marconi-wifi); the
+        # kernel's en0 + Apple80211 (bsd/dev/flame_wlan.c, ios-flame) answer it.
+        node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr('betalm,wcn3990')),
+        ]),
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),

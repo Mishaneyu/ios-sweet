@@ -14,6 +14,7 @@ on:
     paths:
       - ".github/workflows/metal.yml"
       - "gpu/**"
+      - "phone/**"
 
 concurrency:
   group: metal-${{ github.ref }}
@@ -44,6 +45,23 @@ jobs:
           git init -q flame && git -C flame fetch -q --depth 1 "$FLAME_REPO" "$FLAME_SHA" && git -C flame checkout -q FETCH_HEAD
           git init -q unixnu && git -C unixnu fetch -q --depth 1 "$UNIXNU_REPO" "$UNIXNU_SHA" && git -C unixnu checkout -q FETCH_HEAD
           ls flame/phone/metal2 flame/phone/turnip unixnu/patches/mesa
+
+      - name: G8S patches to ios-flame's phone code
+        run: |
+          set -eux
+          for p in phone/patches/*/*.patch; do echo "== $p"; git -C flame apply --whitespace=nowarn "$PWD/$p"; done
+
+      - name: wland (Wi-Fi daemon: modem, WLAN firmware, radio)
+        run: |
+          set -eux
+          sh flame/phone/wifi/build.sh
+          mkdir -p wland-out && cp flame/phone/wifi/out/wland wland-out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wland
+          path: wland-out/wland
+          if-no-files-found: error
 
       - name: Host tools
         run: |
