@@ -64,6 +64,7 @@ Everything that depends on the real hardware is listed under
 | 0085 | Touch: GENI I²C on QUP2 SE0 (= SE17) through **GPI DMA** (LG's QUP firmware disables the FIFO interface: GSI only), SM8150 GCC clocks (HW-gated branches, DFS level scan), SOUTH-tile TLMM pins, GPIO power (vdd 152, vcl 59, reset 54, ATTN 122), **Synaptics RMI4**: PDT scan, F01 setup, F12 register-descriptor parsing, polled reports |
 | 0086 | Log the boot-args (with the shim report) to the persistent log |
 | 0087 | Console log strip (`sweetfb_logrows=N`): the log keeps the bottom N text rows, the GUI (boot logo, home screen) shows above it; a panic takes the whole screen |
+| 0088 | `sweet_log_sync()`: write the log out now and wait; the GPI touch code logs each step through it, so a SoC reset without a panic still leaves the last step on disk |
 
 `tools/mkadt.py`: Kryo 485 topology and clocks, 1080×2248, `lge,betalm`
 compatible, 3 GiB RAM default. `tools/sweet-log-pull.sh -p NAME`: read the
