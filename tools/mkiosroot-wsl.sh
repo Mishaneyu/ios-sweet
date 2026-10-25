@@ -96,18 +96,27 @@ for c in OS App; do
 	done
 done
 
+# mkdir/chown/chmod rather than install -o: uutils install (Ubuntu 26.04)
+# rejects numeric ids that have no passwd entry, such as iOS's _logd (272).
 db="$stage/private/var/db"
-sudo install -d -o 272 -g 272 -m 0751 "$db/diagnostics"
-sudo install -d -o 272 -g 272 -m 0755 "$db/uuidtext" "$db/diagnostics/timesync"
+sudo mkdir -p "$db/diagnostics/timesync" "$db/uuidtext"
 for d in diagnostics uuidtext diagnostics/timesync; do
-	sudo install -o 272 -g 272 -m 0644 /dev/null "$db/$d/.migrated"
+	sudo touch "$db/$d/.migrated"
+	sudo chown 272:272 "$db/$d" "$db/$d/.migrated"
+	sudo chmod 0644 "$db/$d/.migrated"
 done
+sudo chmod 0751 "$db/diagnostics"
+sudo chmod 0755 "$db/uuidtext" "$db/diagnostics/timesync"
 
-sudo install -d -m 0700 -o 0 -g 0 "$stage/private/var/keybags"
+sudo mkdir -p "$stage/private/var/keybags"
+sudo chown 0:0 "$stage/private/var/keybags"
+sudo chmod 0700 "$stage/private/var/keybags"
 printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
 	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
-	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$stage/private/var/keybags/systembag.kb"
+	sudo tee "$stage/private/var/keybags/systembag.kb" >/dev/null
+sudo chown 0:0 "$stage/private/var/keybags/systembag.kb"
+sudo chmod 0600 "$stage/private/var/keybags/systembag.kb"
 
 echo "== bring-up tweaks"
 sudo python3 -I "$here/sweet-root-tweaks.py" "$stage"
