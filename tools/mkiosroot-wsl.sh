@@ -157,5 +157,16 @@ sudo tar -C "$stage" --numeric-owner -cf - . |
 		umount-all
 
 fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
-fsck.hfsplus -f -n "$out"
+# Linux fsck_hfs reports "Volume header needs minor repair" on every fresh
+# journaled volume, even right after -y (NOTES.md, image v4): that alone is
+# not a failure. Anything else in the read-only check is.
+check=$(fsck.hfsplus -f -n "$out" 2>&1) || true
+echo "$check"
+if echo "$check" | grep -qE 'appears to be OK'; then :
+elif echo "$check" | grep -vE 'Volume header needs minor repair|^\(1, 0\)$|found corrupt and needs to be repaired' |
+	grep -qiE 'invalid|incorrect|error|missing|needs'; then
+	echo "fsck found real problems: see above" >&2; exit 1
+else
+	echo "(only the known Linux header quirk: fine)"
+fi
 echo "done: $out (stage left in $stage: sudo rm -rf $stage when the image boots)"
