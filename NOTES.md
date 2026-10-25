@@ -32,6 +32,26 @@ stock `dtb` (two SM8150 base DTBs; ABL picks v2 and applies dtbo idx 11).
 ABL loads the kernel at 0x80080000, the DTB at 0x84500000, the ramdisk at 0x84700000
 (TWRP's 30 MB ramdisk went to 0xc0000000). max-download-size 256 MiB.
 
+## Realme X2 Pro (`RMX1931` / `samurai`) ABL & hardware differences vs `flame`
+
+- `fastboot boot` is disabled in Realme's ABL (`unknown command`); use `tools/rmx1931-run.ps1`, which
+  temporarily flashes `boot` (non-A/B, 96 MiB = `100663296` B; TWRP lives separately in `recovery` on `sde18`),
+  waits for the PM8150 PON warm-reset back to Fastboot, and restores `backup/boot.img`.
+- Realme ABL boot image format (`shim/build-rmx1931.sh`, `tools/mkbootimg_rmx1931.py`): **Header v1**, page 4096,
+  kernel `0x8000`, ramdisk `0x1000000`, tags `0x100`, `os_version 0x1c000181`, **`gzip -9` ARM64 `Image`
+  (`text_offset 0x80000`) + appended `stock/dtb`** (`Image.gz-dtb`), unsigned AVB v1.0 hash footer padded to
+  `100663296` B.
+- RAM: 8 GB (`<0x80000000 0x3bb00000>`, `<0xc0000000 0x1c0000000>`). Fixed TZ/PIL carve-outs extend to
+  `0x9d000000` (`0x9b200000..0x9d000000` is `[no-map]` `pil_adsp_region`) and `ramoops` is at
+  `0xb7e00000..0xb8200000` (`pmsg-ramoops-0` at `0xb7fc0000`, 2 MiB); `0xc0000000..0x280000000` (7 GiB) is
+  unreserved HLOS DRAM.
+- Display: Samsung `SOFEF03F-M` `1080x2400` 90 Hz DSC cmd-mode panel; `cont_splash_region` at **`0x9d000000`**
+  (`0x2400000` = 36 MiB), stride 4320, `a8r8g8b8`, SDE v5.0 (`0xae00000`) INTF1.
+- Touch: **Synaptics S3706** (RMI4, self-booting internal flash) on GENI I2C `/soc/i2c@c80000` (QUPv3 wrap2 SE0 =
+  `qup17`, `GPIO 55/56`, addr `0x20`), `reset-gpio` `GPIO 54` (active-low), `irq-gpio` `GPIO 122` (active-low),
+  `vdd_2v8` = `ldoa17` 3000 mV, `enable1v8_gpio` = `PM8150L` (SID 4) `GPIO5` (`0xc400`, PPID `0x4c4`, LV/MV output).
+- UFS / GIC / Timer / Keys / Watchdog / USB / Wi-Fi: same as `flame` (`userdata` is GPT `sda16`, 109.76 GiB).
+
 ## Hardware facts (live FDT `dtb/live.dtb` + shim probe)
 
 | | flame | (sweet) |
@@ -98,3 +118,5 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 - 0123 en0 + Apple80211 for wifid (ios-topaz 0900 + 0128, from HackiOS), the station over /dev/wlan to
   wland in userland.
 - 0124 10-bit surfaces as BGRA only for WebContent (`sweetsurf10`); the joined network keeps its scan record.
+- 0125 RMX1931 board: 1080x2400 @ 0x9d000000 framebuffer/GPU/HID, `sweet_fts` off by default, Synaptics S3706
+  RMI4 touch over GENI I2C SE0 (`rmxtouch`), and `sweetprobe=1` read-only driver bring-up under `rd=md0`.

@@ -243,19 +243,33 @@ static int write_lba(uint64_t lba, uint32_t count, const void *buf);
 /* Write count blocks to the scratch area, then flush the device cache. */
 int ufs_scratch_write(uint32_t idx, uint32_t count, const void *buf)
 {
+#ifdef SHIM_READONLY
+	(void)idx;
+	(void)count;
+	(void)buf;
+	return 0;
+#else
 	if (!ready || count == 0 || count > XFER_BLOCKS || idx >= UFS_SCRATCH_BLOCKS ||
 	    count > UFS_SCRATCH_BLOCKS - idx)
 		return -1;
 	return write_lba(scratch_first + idx, count, buf);
+#endif
 }
 
 /* Write count blocks to the rescue area just below the scratch area. */
 int ufs_rescue_write(uint32_t idx, uint32_t count, const void *buf)
 {
+#ifdef SHIM_READONLY
+	(void)idx;
+	(void)count;
+	(void)buf;
+	return 0;
+#else
 	if (!ready || count == 0 || count > XFER_BLOCKS || idx >= UFS_RESCUE_BLOCKS ||
 	    count > UFS_RESCUE_BLOCKS - idx)
 		return -1;
 	return write_lba(scratch_first - UFS_RESCUE_BLOCKS + idx, count, buf);
+#endif
 }
 
 static int write_lba(uint64_t lba, uint32_t count, const void *buf)

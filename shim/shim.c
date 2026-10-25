@@ -49,12 +49,33 @@
 static int ufs_ok;
 static volatile int in_exception;
 
+#define PSTORE_PMSG_BASE	0xb7fc0000UL	/* RMX1931 ramoops pmsg-ramoops-0 (2 MiB) */
+#define PSTORE_PMSG_CAP		(0x200000UL - 12UL)
+#define PSTORE_MAGIC		0x43474244U	/* PERSISTENT_RAM_SIG */
+
+static void pstore_save_log(void)
+{
+	volatile uint32_t *hdr = (volatile uint32_t *)PSTORE_PMSG_BASE;
+	volatile uint8_t *dst = (volatile uint8_t *)(PSTORE_PMSG_BASE + 12UL);
+	uint32_t n = log_len < PSTORE_PMSG_CAP ? log_len : PSTORE_PMSG_CAP;
+	for (uint32_t i = 0; i < n; i++)
+		dst[i] = (uint8_t)log_buf[i];
+	hdr[0] = PSTORE_MAGIC;
+	hdr[1] = n;
+	hdr[2] = n;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
 /* Header line, then the text; zero-padded to whole blocks. */
 static void save_log(const char *why)
 {
+	log_printf("--- saved (%s) at %lu ms\n", why, ticks_now() / 19200);
+	pstore_save_log();
+#ifdef SHIM_READONLY
+	return;
+#endif
 	if (!ufs_ok)
 		return;
-	log_printf("--- saved (%s) at %lu ms\n", why, ticks_now() / 19200);
 	uint32_t blocks = (log_len + 4095) / 4096;
 	if (blocks > UFS_SCRATCH_BLOCKS)
 		blocks = UFS_SCRATCH_BLOCKS;
@@ -203,16 +224,133 @@ static void log_gic(void)
 /* Plain RAM where XNU will live: is it there and writable with the MMU off? */
 static void log_ram(void)
 {
-	static const uint64_t probe[] = { 0x100000000ULL, 0x180000000ULL, 0x1fff00000ULL };
+	static const uint64_t probe[] = { 0x100000000ULL, 0x180000000ULL, 0x1fff00000ULL, 0x27ff00000ULL };
 	for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
 		volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)probe[i];
 		uint64_t old = p[0];
-		p[0] = 0x464c414d45000000ULL | i;
+		p[0] = 0x524d583100000000ULL | i;
 		uint64_t back = p[0];
 		p[0] = old;
 		log_printf("ram %lx: was %lx readback %lx\n", probe[i], old, back);
 	}
 }
+
+#ifdef SHIM_READONLY
+#define XNU_MIRROR_PA	0x1fe000000UL
+#define XNU_RING_SIZE	(4u << 20)
+
+static void ramlog_rescue_readonly(void)
+{
+	volatile const char *mh = (volatile const char *)XNU_MIRROR_PA;
+	static const char want[8] = { 'S','W','E','E','T','M','I','R' };
+	for (int i = 0; i < 8; i++)
+		if (mh[i] != want[i])
+			return;
+	if (*(volatile const uint32_t *)(XNU_MIRROR_PA + 16) != XNU_RING_SIZE)
+		return;
+	uint64_t total = *(volatile const uint64_t *)(XNU_MIRROR_PA + 8);
+	*(volatile char *)XNU_MIRROR_PA = 0;
+	uint32_t max_copy = LOG_SIZE > log_len + 8192 ? (LOG_SIZE - log_len - 8192) : 0;
+	uint32_t n = total < max_copy ? (uint32_t)total : max_copy;
+	uint64_t start = total - n;
+	log_printf("\n=== RESCUED XNU CONSOLE (%u of %lu bytes from SWEETMIR) ===\n", n, total);
+	volatile const char *ring = (volatile const char *)(XNU_MIRROR_PA + 0x1000UL);
+	for (uint32_t i = 0; i < n && log_len + 1 < LOG_SIZE; i++)
+		log_buf[log_len++] = ring[(start + i) % XNU_RING_SIZE];
+	log_printf("\n=== END RESCUED XNU CONSOLE ===\n");
+}
+
+static int read_keys(int spmi_ok)
+{
+	if (!spmi_ok)
+		return 0;
+	uint8_t pon = 0, g6 = 1, g7 = 1;
+	spmi_read(0, 0x810, &pon);	/* bit0 = kpdpwr, bit1 = resin */
+	spmi_read(0, 0xc508, &g6);	/* PM8150 GPIO6 = vol_up (active low) */
+	spmi_read(0, 0xc608, &g7);	/* PM8150 GPIO7 = vol_down (active low) */
+	int mask = 0;
+	if (pon & 1)
+		mask |= 1;		/* PWR */
+	if (!(g6 & 1))
+		mask |= 2;		/* VOL+ */
+	if ((pon & 2) || !(g7 & 1))
+		mask |= 4;		/* VOL- */
+	return mask;
+}
+
+static void readonly_viewer(int spmi_ok)
+{
+	unsigned starts[64], pages = 0, pos = 0, len = log_len;
+	while (pos < len && pages < 64) {
+		starts[pages++] = pos;
+		con_home();
+		con_skip();
+		con_skip();
+		unsigned step = con_text(log_buf + pos, len - pos, 0);
+		if (!step)
+			break;
+		pos += step;
+	}
+	if (!pages)
+		starts[pages++] = 0;
+
+	unsigned cur = 0;
+	int prev_keys = read_keys(spmi_ok);
+	uint64_t t0 = ticks_now(), hz = rsr("cntfrq_el0");
+	if (!hz)
+		hz = 19200000UL;
+	const unsigned timeout_s = 25;
+	unsigned last_rem = 999;
+	int redraw = 1;
+
+	for (;;) {
+		uint64_t elapsed = (ticks_now() - t0) / hz;
+		if (elapsed >= timeout_s)
+			break;
+		unsigned rem = timeout_s - (unsigned)elapsed;
+		int keys = read_keys(spmi_ok);
+		int edge = keys & ~prev_keys;
+		prev_keys = keys;
+
+		if (edge & 1) {
+			log_printf("viewer: power pressed, exiting\n");
+			break;
+		}
+		if (edge & 2) {
+			cur = (cur + 1) % pages;
+			t0 = ticks_now();
+			redraw = 1;
+		}
+		if (edge & 4) {
+			cur = (cur + pages - 1) % pages;
+			t0 = ticks_now();
+			redraw = 1;
+		}
+		if (rem != last_rem)
+			redraw = 1;
+
+		if (redraw) {
+			last_rem = rem;
+			redraw = 0;
+			char hdr1[80], hdr2[80];
+			unsigned n1 = fmt_snprintf(hdr1, sizeof(hdr1),
+				"RMX1931 XNU SHIM PROBE (ZERO-WRITE)  p%u/%u  keys=%x",
+				cur + 1, pages, keys);
+			unsigned n2 = fmt_snprintf(hdr2, sizeof(hdr2),
+				"Fastboot in %us | VOL+/VOL-: page | PWR: exit now", rem);
+			con_clear(0xff102438);
+			con_text(hdr1, n1, GREEN);
+			con_text(hdr2, n2, YELLOW);
+			unsigned end = (cur + 1 < pages) ? starts[cur + 1] : len;
+			if (end > starts[cur])
+				con_text(log_buf + starts[cur], end - starts[cur], WHITE);
+			if (!sde.tear_en)
+				sde_kick();
+		}
+		delay_ms(40);
+	}
+}
+#endif
 
 static void save_before_jump(void)
 {
@@ -221,13 +359,15 @@ static void save_before_jump(void)
 
 void shim_main(uintptr_t dtb)
 {
-	log_printf("FLAMESHIM probe v1 t=%lu\n", ticks_now());
+	log_printf("RMX1931 SHIM probe v1 t=%lu\n", ticks_now());
 	log_cpu(dtb);
 	int spmi_ok = !spmi_init();
 	if (spmi_ok) {
 		log_pmic();
 		set_reboot_bootloader();
+#ifndef SHIM_READONLY
 		set_hard_reset();
+#endif
 	}
 	/* Probe runs reset themselves; only an XNU boot arms the watchdog. */
 	wdt_off();
@@ -242,8 +382,12 @@ void shim_main(uintptr_t dtb)
 	reset();
 #endif
 	ufs_ok = !ufs_init();
+#ifdef SHIM_READONLY
+	ramlog_rescue_readonly();
+#else
 	if (ufs_ok)
 		ramlog_rescue();
+#endif
 #ifdef SHIM_SHOWLOG
 	/* Read-only: the shim log on UFS is the previous run's, keep it. */
 	sde_probe();
@@ -278,15 +422,23 @@ void shim_main(uintptr_t dtb)
 
 	sde_probe();
 	save_log("sde probe");
-	sde_sample("before", 8, 20);
-	uintptr_t fb = sde.pipe ? rd32(sde.pipe + 0x14) : 0;
-	uint32_t stride = sde.pipe ? rd32(sde.pipe + 0x24) & 0xffff : 0;
-	if (!con_init(fb, stride)) {
-		con_clear(0xff203040);
-		con_str("FLAME", "shim probe v1");
+	sde_sample("before", 4, 20);
+	uintptr_t fb = sde.pipe ? rd32(sde.pipe + 0x14) : FB_SPLASH_BASE;
+	uint32_t stride = sde.pipe ? (rd32(sde.pipe + 0x24) & 0xffff) : (FB_W * 4);
+	int con_ok = !con_init(fb, stride);
+	if (!con_ok) {
+		fb = FB_SPLASH_BASE;
+		stride = FB_W * 4;
+		con_ok = !con_init(fb, stride);
+	}
+	if (con_ok) {
+		con_clear(0xff102438);
+		con_str("RMX1931", "shim probe v1");
 	}
 	sde_autorefresh(1);
-	sde_sample("autorefresh", 16, 20);
+	if (!sde.tear_en)
+		sde_kick();
+	sde_sample("autorefresh", 4, 20);
 	save_log("display");
 
 	/* An XNU payload in the ramdisk means: boot it. */
@@ -298,6 +450,11 @@ void shim_main(uintptr_t dtb)
 
 	log_gic();
 	log_ram();
+	save_log("probe complete");
+#ifdef SHIM_READONLY
+	if (con_ok)
+		readonly_viewer(spmi_ok);
+#endif
 	log_printf("done, resetting\n");
 	save_log("done");
 	reset();

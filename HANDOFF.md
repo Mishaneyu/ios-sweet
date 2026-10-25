@@ -1,9 +1,46 @@
-# Handoff: iOS on Pixel 4 (flame)
+# Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-22, 09:40 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-25, 23:00 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
+
+### RMX1931 BRING-UP: hardware backups, Boot #1 shim probe on screen, kernel 0125 staged (2026-10-25, 23:00)
+Target device: **Realme X2 Pro (`RMX1931` / `RMX1931L1`, codename `samurai`, `oppo,prjname=19781`, `SM8150-AC`, 8 GB RAM)**.
+- **Backups (`backup/`, local only, verified with `backup/SHA256SUMS.txt`)**: dumped all 15 critical partitions
+  from TWRP (`boot`, `recovery`, `dtbo`, `vbmeta` with `flags=0x3` AVB verification disabled, `devinfo`, `persist`,
+  `modemst1`, `modemst2`, `fsg`, `fsc`, `oppodycnvbk`, `oppostanvbk`, `oppo_sec`, `opporeserve1`, `opporeserve2`),
+  live FDT `dtb/live.dtb` (706,384 B) and `stock/dtb` (503,353 B extracted from `backup/boot.img`).
+- **Observed on Boot #1 (`shim/out/shim-rmx1931-probe.img`, `-DSHIM_READONLY`, zero UFS writes)**:
+  - Realme's ABL rejects `fastboot boot` (`FAILED (remote: 'unknown command')`) and ignores the `recovery` argument
+    in `fastboot reboot recovery`, but accepts temporary `fastboot flash boot` (Header v1 `Image.gz-dtb` + unsigned
+    AVB v1.0 hash footer padded to `100663296` B = 96 MiB). `tools/rmx1931-run.ps1` flashes `boot`, waits for the
+    run to warm-reset back to Fastboot, and automatically flashes `backup/boot.img` back (`userdata` and `recovery`
+    stay untouched).
+  - Bare-metal EL1 shim booted on hardware, mapped `cont_splash_region` (`0x9d000000`, `1080x2400` Samsung
+    `SOFEF03F-M` DSC cmd-mode panel; avoiding `0x9b200000..0x9d000000` `[no-map]` `pil_adsp_region`), enabled SDE
+    INTF1 autorefresh / manual kick, rendered live refreshing text on the AMOLED display, wrote `PM8150`
+    `PON_SOFT_RB_SPARE (0x88f)` = bootloader, warm-reset cleanly into Fastboot at +30 s, restored stock `boot.img`,
+    and booted back into the user's custom ROM intact.
+- **Kernel 0125 (`xnu/patches/0125-rmx1931-board.patch`)**:
+  - Early console (`SWEET.h`), Adreno 640 present (`sweet_a6xx.h`, `sweet_gpu.c`) and `SweetHIDTouch` (`SweetHID.cpp`)
+    updated to `0x9d000000` / `1080x2400` (`SWEET_EARLY_FB_BLOCK_PA` stays `0x9c000000` Device-GRE).
+  - Pixel 4 `sweet_fts` SPI touch driver disabled by default (`flametouch=1` forces it) so it does not mux `GPIO 54`
+    to `qup4` SPI.
+  - Added `bsd/dev/rmx1931_touch.c`: Synaptics S3706 RMI4 touch driver over GENI I2C (`0x00c80000`, QUPv3 wrapper 2
+    SE0 `qup17`, `GPIO 55/56`, 7-bit addr `0x20`, `reset-gpio` `GPIO 54` active-low, `irq-gpio` `GPIO 122` active-low,
+    `ldoa17` 3000 mV via RPMh, `PM8150L` SID 4 `GPIO5` `0xc400` 1.8 V digital rail via guarded single-APID SPMI
+    channel write; boot-args `rmxtouch`, `rmxtouchdelay`, `rmxtouchlog`, `rmxtouch100k`).
+  - Added opt-in `sweetprobe=1` in `IOKitBSDInit.cpp` so `rd=md0` RAM-disk boots can exercise read-only UFS GPT
+    discovery, PM8150 keys, Synaptics S3706 touch, cpufreq and USB DWC3 live log without touching `userdata`.
+- **Open (next)**:
+  1. Build `kernel.development.sweet` with patch `0125` via `.github/workflows/xnu.yml` (`macos-15`).
+  2. Boot #2: pack `kernel.development.sweet` + `work/boot/rmx1931-hi.adt` + `work/boot/sweet-init.macho` (`rd=md0
+     sweetprobe=1 debug=0xc serial=3 cpus=8 keepsyms=1 flamereboot=35`) into `shim-rmx1931-xnu-rd.img` and verify
+     8-core XNU boot, `PID 1` exec on `mockfs`, read-only UFS `sda16`, keys, Synaptics S3706 RMI4 PDT/F12 touch, and
+     USB DWC3 ECM on real hardware (still zero writes to `userdata`).
+  3. Only if/when the user confirms replacing `userdata`: stage iOS 16.7.16 (`20H392`) HFS+ root image + `RMX1931`
+     `a640_*` / `WCN3990` firmware (`rd=ufsroot0`).
 
 ### WiFi IN SETTINGS: wifid, en0, iOS's own DHCP (2026-10-22, 11:15) - kernels 0123/0124
 Settings -> Wi-Fi: switch on, the home network ticked, nearby networks listed (from a

@@ -12,9 +12,9 @@ import hashlib, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
-# Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
-PHYS_BASE = 0xb0000000
-MEM_SIZE = 0x4d000000
+# Kernel-managed RAM: above every Qualcomm/OPPO XPU carve-out (RMX1931 carve-outs end at 0xbbb00000)
+PHYS_BASE = 0xc0000000
+MEM_SIZE = 0x3d000000
 # --highmem (phone only): above 4G. The flame live FDT memory node is
 # <0x80000000 0x3cc00000>, <0xc0000000 0x140000000>; every fixed
 # reserved-memory carve-out ends below 0xac800000 and the dynamic pools are
@@ -27,10 +27,10 @@ SOC_BASE = 0x01000000
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
-# cont_splash_region; ABL scans it out (autorefreshed command-mode panel)
-FB, FB_SIZE = 0x9c400000, 0x2400000
+# cont_splash_region on RMX1931 (Realme X2 Pro, Samsung SOFEF03F-M 1080x2400 cmd-mode panel)
+FB, FB_SIZE = 0x9d000000, 0x2400000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
-FB_W, FB_H, FB_STRIDE = 1080, 2280, 1080 * 4
+FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -251,7 +251,7 @@ def build(seed=None, qemu=False, highmem=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('google,flame') + cstr('qcom,sm8150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('google,flame') + cstr('realme,rmx1931') + cstr('qcom,sm8150') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
