@@ -112,29 +112,59 @@ def activation(root):
     print('data ark', d)
 
 
-def audio(root):
+def audio(root, with_hackios=False):
+    has_hakios_audio = with_hackios or os.path.exists(
+        os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/HakiosAudio'))
+    has_media_dylib = with_hackios or os.path.exists(
+        os.path.join(root, 'usr/local/lib/libsweet_media.dylib'))
+    has_sysfix_dylib = with_hackios or os.path.exists(
+        os.path.join(root, 'usr/local/lib/libsweet_sysfix.dylib'))
+
     src = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
     dst_dir = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
-    if os.path.exists(src):
+    disabled = os.path.join(dst_dir, 'VirtualAudio.plugin')
+    if has_hakios_audio:
+        if os.path.exists(disabled) and not os.path.exists(src):
+            os.makedirs(os.path.dirname(src), exist_ok=True)
+            shutil.move(disabled, src)
+            print('VirtualAudio.plugin restored for HakiosAudio.driver')
+    elif os.path.exists(src):
         os.makedirs(dst_dir, exist_ok=True)
         shutil.move(src, dst_dir)
         print('VirtualAudio.plugin disabled')
+
+    want_recorder = bool(has_media_dylib)
     for conf in glob.glob(os.path.join(root, 'System/Library/Frameworks/MediaToolbox.framework/*/SubServerConfiguration.plist')):
         st = os.stat(conf)
         data = load(conf)
-        data['StartRecorderServer'] = False
+        data['StartRecorderServer'] = want_recorder
         save(conf, data, st.st_uid, st.st_gid, st.st_mode & 0o7777, plistlib.FMT_XML)
-        print('StartRecorderServer off', os.path.relpath(conf, root))
+        print('StartRecorderServer', 'on' if want_recorder else 'off', os.path.relpath(conf, root))
+
+    if has_media_dylib or has_sysfix_dylib:
+        lines = []
+        if has_media_dylib:
+            lines.append('/usr/local/lib/libsweet_media.dylib mediaserverd')
+        if has_sysfix_dylib:
+            lines.append('/usr/local/lib/libsweet_sysfix.dylib containermanagerd containermanagerd_system SpringBoard')
+        conf_path = os.path.join(root, 'private/var/local/inject.conf')
+        with open(conf_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+        os.chown(conf_path, 0, 0)
+        os.chmod(conf_path, 0o644)
+        print('inject.conf', lines)
 
 
 def main():
-    if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
+    args = [a for a in sys.argv[1:] if a != '--with-hackios']
+    with_hackios = '--with-hackios' in sys.argv[1:]
+    if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
-    root = sys.argv[1]
+    root = args[0]
     launchd(root)
     containers(root)
     activation(root)
-    audio(root)
+    audio(root, with_hackios=with_hackios)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})

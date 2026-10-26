@@ -1,0 +1,2912 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 96a8aa8..1dc0334 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,10 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_fts.c			standard
+ bsd/dev/rmx1931_touch.c			standard
++bsd/dev/rmx1931_battery.c		standard
++bsd/dev/rmx1931_audio.c			standard
++bsd/dev/rmx1931_torch.c			standard
++bsd/dev/rmx1931_haptic.c		standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_poke.c			standard
+ bsd/dev/sweet_files.c			standard
+diff --git a/bsd/dev/rmx1931_audio.c b/bsd/dev/rmx1931_audio.c
+new file mode 100644
+index 0000000..4f780c7
+--- /dev/null
++++ b/bsd/dev/rmx1931_audio.c
+@@ -0,0 +1,193 @@
++/*
++ * /dev/hakios-audio: non-blocking 48 kHz 16-bit stereo PCM audio sink and
++ * volume ioctl endpoint for HakiosAudio.driver (CoreAudio HAL plug-in).
++ *
++ * Accepts real-time mixed audio writes from mediaserverd without blocking so
++ * CoreAudio, AVFoundation, and AVPlayer run with a steady 48 kHz clock even
++ * before ADSP/speaker amplifier playback is wired up, and logs non-silent
++ * playback stretches for bring-up verification.
++ *
++ * Boot-args:
++ *   rmxaudio=0   disable /dev/hakios-audio (default 1)
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++void rmx1931_audio_init(void);
++
++#define HAKIOS_AUDIO_RATE       48000u
++#define HAKIOS_AUDIO_CHANNELS   2u
++#define HAKIOS_AUDIO_FRAME      4u      /* bytes: 2x int16_t */
++#define AUDIO_CHUNK_FRAMES      1024u
++#define AUDIO_QUIET_MS          500u
++#define AUDIO_SILENCE           8u
++
++struct hakios_audio_volume {
++	uint32_t below;         /* eighths of a dB below max */
++	uint32_t muted;
++};
++#define HAKIOS_AUDIO_SET_VOLUME _IOW('r', 1, struct hakios_audio_volume)
++
++static LCK_GRP_DECLARE(rmx_audio_grp, "rmx-audio");
++static LCK_MTX_DECLARE(rmx_audio_lock, &rmx_audio_grp);
++
++static uint64_t stretch_last;
++static uint64_t stretch_frames, stretch_sound;
++static uint32_t stretch_peak;
++static thread_call_t audio_report_call;
++static bool audio_report_armed;
++static int sys_audio_vol_below = 0;
++static int sys_audio_muted = 0;
++
++SYSCTL_DECL(_kern_rmx1931);
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, audio_volume_below_eighth_db, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_audio_vol_below, 0, "Speaker volume attenuation in 1/8 dB steps");
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, audio_muted, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_audio_muted, 0, "Speaker muted flag from CoreAudio HAL");
++
++static void
++rmx_audio_report(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	uint64_t frames, sound, deadline, since = 0;
++	uint32_t peak;
++
++	lck_mtx_lock(&rmx_audio_lock);
++	absolutetime_to_nanoseconds(mach_absolute_time() - stretch_last, &since);
++	if (since < (uint64_t)AUDIO_QUIET_MS * NSEC_PER_MSEC) {
++		clock_interval_to_deadline(2u * AUDIO_QUIET_MS, NSEC_PER_MSEC, &deadline);
++		thread_call_enter_delayed(audio_report_call, deadline);
++		lck_mtx_unlock(&rmx_audio_lock);
++		return;
++	}
++	frames = stretch_frames;
++	sound = stretch_sound;
++	peak = stretch_peak;
++	stretch_frames = stretch_sound = 0;
++	stretch_peak = 0;
++	audio_report_armed = false;
++	lck_mtx_unlock(&rmx_audio_lock);
++
++	printf("RMX AUDIO: %llu.%02llus written, %llu.%02llus non-silent, peak %u%% (vol -%d.%ddB mute=%d)\n",
++	    (unsigned long long)(frames / HAKIOS_AUDIO_RATE),
++	    (unsigned long long)((frames % HAKIOS_AUDIO_RATE) * 100u / HAKIOS_AUDIO_RATE),
++	    (unsigned long long)(sound / HAKIOS_AUDIO_RATE),
++	    (unsigned long long)((sound % HAKIOS_AUDIO_RATE) * 100u / HAKIOS_AUDIO_RATE),
++	    peak * 100u / 32768u, sys_audio_vol_below / 8, (sys_audio_vol_below % 8) * 10 / 8,
++	    sys_audio_muted);
++}
++
++static int
++rmx_audio_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++rmx_audio_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t buf[AUDIO_CHUNK_FRAMES * HAKIOS_AUDIO_CHANNELS];
++	int err = 0;
++
++	while (uio_resid(uio) >= (user_ssize_t)HAKIOS_AUDIO_FRAME) {
++		user_ssize_t bytes = uio_resid(uio);
++		if (bytes > (user_ssize_t)sizeof(buf)) {
++			bytes = (user_ssize_t)sizeof(buf);
++		}
++		bytes -= bytes % (user_ssize_t)HAKIOS_AUDIO_FRAME;
++		err = uiomove((caddr_t)buf, (int)bytes, uio);
++		if (err) {
++			break;
++		}
++		uint32_t count = (uint32_t)(bytes / (user_ssize_t)HAKIOS_AUDIO_FRAME);
++		uint32_t peak = 0;
++		for (uint32_t i = 0; i < count * HAKIOS_AUDIO_CHANNELS; ++i) {
++			uint32_t v = buf[i] < 0 ? (uint32_t)(-(int32_t)buf[i]) : (uint32_t)buf[i];
++			if (v > peak) {
++				peak = v;
++			}
++		}
++		uint64_t deadline;
++		lck_mtx_lock(&rmx_audio_lock);
++		stretch_last = mach_absolute_time();
++		stretch_frames += count;
++		if (peak > AUDIO_SILENCE) {
++			stretch_sound += count;
++		}
++		if (peak > stretch_peak) {
++			stretch_peak = peak;
++		}
++		if (!audio_report_armed && audio_report_call != NULL) {
++			audio_report_armed = true;
++			clock_interval_to_deadline(2u * AUDIO_QUIET_MS, NSEC_PER_MSEC, &deadline);
++			thread_call_enter_delayed(audio_report_call, deadline);
++		}
++		lck_mtx_unlock(&rmx_audio_lock);
++	}
++	if (!err && uio_resid(uio) > 0) {
++		uio_setresid(uio, 0);
++	}
++	return err;
++}
++
++static int
++rmx_audio_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	if (cmd == HAKIOS_AUDIO_SET_VOLUME) {
++		struct hakios_audio_volume v;
++		memcpy(&v, data, sizeof(v));
++		sys_audio_vol_below = (int)v.below;
++		sys_audio_muted = v.muted ? 1 : 0;
++		return 0;
++	}
++	return ENOTTY;
++}
++
++static const struct cdevsw rmx_audio_cdevsw = {
++	.d_open       = rmx_audio_open,
++	.d_close      = rmx_audio_open,
++	.d_read       = eno_rdwrt,
++	.d_write      = rmx_audio_write,
++	.d_ioctl      = rmx_audio_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++void
++rmx1931_audio_init(void)
++{
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("rmxaudio", &on, sizeof(on));
++	if (!on) {
++		printf("RMX AUDIO: disabled (rmxaudio=0)\n");
++		return;
++	}
++	int major = cdevsw_add(-1, &rmx_audio_cdevsw);
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT,
++	    GID_WHEEL, 0666, "hakios-audio") == NULL) {
++		printf("RMX AUDIO: failed to create /dev/hakios-audio\n");
++		return;
++	}
++	audio_report_call = thread_call_allocate(rmx_audio_report, NULL);
++	printf("RMX AUDIO: /dev/hakios-audio ready (48 kHz stereo sink)\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/rmx1931_battery.c b/bsd/dev/rmx1931_battery.c
+new file mode 100644
+index 0000000..5b13720
+--- /dev/null
++++ b/bsd/dev/rmx1931_battery.c
+@@ -0,0 +1,463 @@
++/*
++ * Realme X2 Pro (RMX1931 / samurai, SM8150-AC) read-only fuel-gauge & charger
++ * telemetry driver.
++ *
++ * Hardware facts (from RMX1931 live FDT /soc/i2c@0a84000/bq27541-battery@55
++ * and OPLUS oplus_bq27541.{c,h}):
++ *   - Fuel gauge: TI BQ28Z610 / BQ27541 at 7-bit I2C address 0x55 (2S SuperVOOC
++ *                 4000 mAh-eq pack on RMX1931).
++ *   - Pins:       GPIO 27 (SDA) & GPIO 28 (SCL) on SM8150 TLMM EAST tile
++ *                 (PA 0x03500000, offset 0x1000 * pin). No external vdd-supply
++ *                 regulator (powered directly from battery pack + always-on 1.8V).
++ *   - Charger:    PM8150B (SPMI SID 2) SMB5 observer reads only (0x1310 USB,
++ *                 0x1006 CHGR status) via sweet_spmi_read().
++ *
++ * Strictly READ-ONLY: issues only standard SMBus Read Word commands (0x06 TEMP,
++ * 0x08 VOLT, 0x0a FLAGS, 0x10 RM, 0x12 FCC, 0x14 AI, 0x2a CC, 0x2c SOC) and
++ * SPMI observer EXT_READL. Zero writes to gauge control/flash or PMIC registers.
++ *
++ * Boot-args:
++ *   rmxbattery=0   disable driver (default 1)
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++#include "rmx1931_battery.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++
++#define BQ_TLMM_EAST_PA 0x03500000u
++#define BQ_TLMM_SIZE    0x00020000u
++#define BQ_PIN_SDA      27u
++#define BQ_PIN_SCL      28u
++#define BQ_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
++#define BQ_GPIO_IO(n)   (BQ_GPIO_CFG(n) + 4u)
++/* mux=0 (GPIO), pull=3 (pull-up), drive=2 (6 mA); bit 9 = OE */
++#define BQ_OD_HIGH_CFG  (0x003u | (2u << 6))
++#define BQ_OD_LOW_CFG   (0x203u | (2u << 6))
++
++#define BQ_I2C_ADDR     0x55u
++#define BQ_REG_TEMP     0x06u   /* 0.1 K */
++#define BQ_REG_VOLT     0x08u   /* mV */
++#define BQ_REG_FLAGS    0x0au   /* bit 0 DSC, bit 9 FC */
++#define BQ_REG_RM       0x10u   /* mAh */
++#define BQ_REG_FCC      0x12u   /* mAh */
++#define BQ_REG_AI       0x14u   /* signed mA (+chg, -dsg) */
++#define BQ_REG_CC       0x2au   /* cycle count */
++#define BQ_REG_SOC      0x2cu   /* 0..100 % */
++
++#define BQ_DESIGN_MAH   4000u
++
++static vm_offset_t bq_gpio;
++static bool bq_started;
++static volatile bool bq_temp_valid;
++static volatile int bq_temp_cached_deci_c = 250;
++static int bq_sleep_chan;
++
++static int sys_bat_soc = -1;
++static int sys_bat_mv = -1;
++static int sys_bat_pack_mv = -1;
++static int sys_bat_ma = 0;
++static int sys_bat_temp_deci_c = -2730;
++static int sys_bat_charging = 0;
++static int sys_bat_external = 0;
++static int sys_bat_fcc_mah = -1;
++static int sys_bat_cycles = -1;
++
++SYSCTL_NODE(_kern, OID_AUTO, rmx1931, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
++    "Realme X2 Pro (RMX1931) hardware telemetry");
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, battery_soc, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_bat_soc, 0, "RMX1931 fuel-gauge SOC (0..100%)");
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, battery_mv, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_bat_mv, 0, "RMX1931 cell-normalized battery voltage (mV)");
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, battery_pack_mv, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_bat_pack_mv, 0, "RMX1931 raw pack voltage from gauge (mV)");
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, battery_ma, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_bat_ma, 0, "RMX1931 signed battery current (mA, +charging)");
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, battery_temp_deci_c, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_bat_temp_deci_c, 0, "RMX1931 battery temperature (0.1 deg C)");
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, battery_charging, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_bat_charging, 0, "RMX1931 charging flag");
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, battery_external, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_bat_external, 0, "RMX1931 external power connected flag");
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, battery_fcc_mah, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_bat_fcc_mah, 0, "RMX1931 full-charge capacity (mAh eq.)");
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, battery_cycles, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_bat_cycles, 0, "RMX1931 battery cycle count");
++
++bool
++rmx1931_battery_temperature(int *deci_c)
++{
++	if (!bq_temp_valid || !deci_c) {
++		return false;
++	}
++	*deci_c = bq_temp_cached_deci_c;
++	return true;
++}
++
++static uint32_t
++bq_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(bq_gpio + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++bq_wr(uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(bq_gpio + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++bq_wait_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&bq_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++bq_sda(bool high)
++{
++	bq_wr(BQ_GPIO_CFG(BQ_PIN_SDA), high ? BQ_OD_HIGH_CFG : BQ_OD_LOW_CFG);
++}
++
++static bool
++bq_sda_in(void)
++{
++	return (bq_rd(BQ_GPIO_IO(BQ_PIN_SDA)) & 1u) != 0;
++}
++
++static bool
++bq_scl_in(void)
++{
++	return (bq_rd(BQ_GPIO_IO(BQ_PIN_SCL)) & 1u) != 0;
++}
++
++/* TI BQ gauges may clock-stretch SCL up to ~1 ms while preparing SMBus words. */
++static bool
++bq_scl_high(void)
++{
++	bq_wr(BQ_GPIO_CFG(BQ_PIN_SCL), BQ_OD_HIGH_CFG);
++	for (unsigned i = 0; i < 2000; ++i) {
++		if (bq_scl_in()) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++bq_scl_low(void)
++{
++	bq_wr(BQ_GPIO_CFG(BQ_PIN_SCL), BQ_OD_LOW_CFG);
++}
++
++static void
++bq_bus_init(void)
++{
++	bq_wr(BQ_GPIO_IO(BQ_PIN_SDA), 0);
++	bq_wr(BQ_GPIO_IO(BQ_PIN_SCL), 0);
++	bq_sda(true);
++	(void)bq_scl_high();
++	delay(20);
++	if (!bq_sda_in()) {
++		for (unsigned i = 0; i < 9 && !bq_sda_in(); ++i) {
++			bq_scl_low();
++			delay(8);
++			(void)bq_scl_high();
++			delay(8);
++		}
++		bq_sda(false);
++		delay(8);
++		(void)bq_scl_high();
++		delay(8);
++		bq_sda(true);
++		delay(20);
++	}
++}
++
++static bool
++bq_start(void)
++{
++	bq_sda(true);
++	if (!bq_scl_high()) {
++		return false;
++	}
++	delay(8);
++	bq_sda(false);
++	delay(8);
++	bq_scl_low();
++	delay(8);
++	return true;
++}
++
++static void
++bq_stop(void)
++{
++	bq_sda(false);
++	delay(8);
++	(void)bq_scl_high();
++	delay(8);
++	bq_sda(true);
++	delay(8);
++}
++
++static bool
++bq_tx_byte(uint8_t byte)
++{
++	for (int bit = 7; bit >= 0; --bit) {
++		bq_sda(((byte >> bit) & 1u) != 0);
++		delay(6);
++		if (!bq_scl_high()) {
++			return false;
++		}
++		delay(8);
++		bq_scl_low();
++		delay(4);
++	}
++	bq_sda(true);
++	delay(6);
++	if (!bq_scl_high()) {
++		return false;
++	}
++	delay(6);
++	bool ack = !bq_sda_in();
++	bq_scl_low();
++	delay(6);
++	return ack;
++}
++
++static bool
++bq_rx_byte(uint8_t *out, bool ack)
++{
++	uint8_t val = 0;
++	bq_sda(true);
++	for (int bit = 7; bit >= 0; --bit) {
++		delay(6);
++		if (!bq_scl_high()) {
++			return false;
++		}
++		delay(6);
++		if (bq_sda_in()) {
++			val |= (uint8_t)(1u << bit);
++		}
++		bq_scl_low();
++		delay(4);
++	}
++	bq_sda(!ack);
++	delay(6);
++	if (!bq_scl_high()) {
++		bq_sda(true);
++		return false;
++	}
++	delay(8);
++	bq_scl_low();
++	bq_sda(true);
++	delay(6);
++	*out = val;
++	return true;
++}
++
++/* Pure SMBus Read Word (S | addr+W | cmd | Sr | addr+R | lo | hi | P). */
++static bool
++bq_read_word(uint8_t cmd, uint16_t *out)
++{
++	for (unsigned attempt = 0; attempt < 3; ++attempt) {
++		uint8_t lo = 0, hi = 0;
++		bool ok = bq_start() &&
++		          bq_tx_byte((uint8_t)(BQ_I2C_ADDR << 1)) &&
++		          bq_tx_byte(cmd) &&
++		          bq_start() &&
++		          bq_tx_byte((uint8_t)((BQ_I2C_ADDR << 1) | 1u)) &&
++		          bq_rx_byte(&lo, true) &&
++		          bq_rx_byte(&hi, false);
++		bq_stop();
++		delay(150); /* TI BQ t_BUF >= 66 us between SMBus packets */
++		if (ok) {
++			*out = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
++			return true;
++		}
++		bq_bus_init();
++	}
++	return false;
++}
++
++static bool
++bq_poll_once(struct rmx1931_battery_state *st)
++{
++	uint16_t raw_soc = 0, raw_volt = 0, raw_temp = 0, raw_flags = 0;
++	uint16_t raw_ai = 0, raw_rm = 0, raw_fcc = 0, raw_cc = 0;
++
++	if (!bq_read_word(BQ_REG_VOLT, &raw_volt) ||
++	    !bq_read_word(BQ_REG_SOC, &raw_soc) ||
++	    !bq_read_word(BQ_REG_TEMP, &raw_temp) ||
++	    !bq_read_word(BQ_REG_FLAGS, &raw_flags) ||
++	    !bq_read_word(BQ_REG_AI, &raw_ai)) {
++		return false;
++	}
++	/* Plausibility guard: 1S (2800..4600 mV) or 2S SuperVOOC (5600..9200 mV). */
++	bool dual_cell = raw_volt > 5200u;
++	unsigned cell_mv = dual_cell ? ((unsigned)raw_volt / 2u) : (unsigned)raw_volt;
++	if (cell_mv < 2800u || cell_mv > 4600u || raw_soc > 100u) {
++		return false;
++	}
++
++	(void)bq_read_word(BQ_REG_RM, &raw_rm);
++	(void)bq_read_word(BQ_REG_FCC, &raw_fcc);
++	(void)bq_read_word(BQ_REG_CC, &raw_cc);
++
++	int ma = (raw_ai & 0x8000u) ? ((int)raw_ai - 65536) : (int)raw_ai;
++	/* On 2S pack, scale pack current/mAh to single-cell 4000 mAh equivalent if needed. */
++	unsigned scale = (dual_cell && raw_fcc > 0 && raw_fcc <= 2600u) ? 2u : 1u;
++	unsigned fcc_mah = (raw_fcc > 100u && raw_fcc < 10000u) ? ((unsigned)raw_fcc * scale) : BQ_DESIGN_MAH;
++	unsigned rem_mah = (raw_rm <= raw_fcc && raw_fcc > 0) ? ((unsigned)raw_rm * scale) :
++	    ((fcc_mah * (unsigned)raw_soc + 50u) / 100u);
++
++	int temp_deci_c = 250;
++	if (raw_temp >= 2331u && raw_temp <= 3631u) {
++		temp_deci_c = (int)raw_temp - 2731;
++		bq_temp_cached_deci_c = temp_deci_c;
++		bq_temp_valid = true;
++	}
++
++	/* Read-only PM8150B (SID 2) USB/charger status, with gauge fallback for VOOC. */
++	uint8_t usb_rt = 0, chg_stat = 0;
++	bool spmi_usb = sweet_spmi_read(2, 0x1310u, &usb_rt) == 0;
++	bool spmi_chg = sweet_spmi_read(2, 0x1006u, &chg_stat) == 0;
++	unsigned chg_state = spmi_chg ? (chg_stat & 7u) : 0u;
++
++	bool external = (spmi_usb && ((usb_rt & 0x10u) != 0 || (usb_rt & 0x04u) != 0)) || (ma > 60);
++	bool charging = (external && spmi_chg && chg_state >= 1u && chg_state <= 4u) || (ma > 40);
++	bool full = external && !charging &&
++	    ((spmi_chg && chg_state == 5u) || (raw_flags & (1u << 9)) != 0 || raw_soc == 100u);
++	if (full) {
++		raw_soc = 100u;
++	}
++
++	bzero(st, sizeof(*st));
++	st->valid = true;
++	st->present = true;
++	st->external_connected = external;
++	st->charge_capable = external;
++	st->charging = charging;
++	st->full = full;
++	st->soc = (unsigned)raw_soc;
++	st->voltage_mv = cell_mv;
++	st->pack_voltage_mv = (unsigned)raw_volt;
++	st->current_ma = ma * (int)scale;
++	st->rem_mah = rem_mah;
++	st->fcc_mah = fcc_mah;
++	st->design_mah = BQ_DESIGN_MAH;
++	st->temp_deci_c = temp_deci_c;
++	st->cycle_count = (raw_cc < 10000u) ? (unsigned)raw_cc : 0u;
++	return true;
++}
++
++static void
++bq_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	bq_wait_ms(1500);
++	(void)sweet_spmi_init();
++
++	bq_gpio = ml_io_map(BQ_TLMM_EAST_PA, BQ_TLMM_SIZE);
++	if (!bq_gpio) {
++		printf("RMX BATTERY: EAST TLMM map failed\n");
++		goto out;
++	}
++
++	uint32_t orig_sda_cfg = bq_rd(BQ_GPIO_CFG(BQ_PIN_SDA));
++	uint32_t orig_scl_cfg = bq_rd(BQ_GPIO_CFG(BQ_PIN_SCL));
++	uint32_t orig_sda_io = bq_rd(BQ_GPIO_IO(BQ_PIN_SDA));
++	uint32_t orig_scl_io = bq_rd(BQ_GPIO_IO(BQ_PIN_SCL));
++
++	bq_bus_init();
++
++	uint16_t probe_volt = 0;
++	if (!bq_read_word(BQ_REG_VOLT, &probe_volt) || probe_volt < 2500u || probe_volt > 9500u) {
++		/* Restore firmware pin state on non-RMX1931 boards (e.g. Pixel 4). */
++		bq_wr(BQ_GPIO_IO(BQ_PIN_SDA), orig_sda_io);
++		bq_wr(BQ_GPIO_IO(BQ_PIN_SCL), orig_scl_io);
++		bq_wr(BQ_GPIO_CFG(BQ_PIN_SDA), orig_sda_cfg);
++		bq_wr(BQ_GPIO_CFG(BQ_PIN_SCL), orig_scl_cfg);
++		printf("RMX BATTERY: no BQ27541/BQ28Z610 at 0x55 (volt=%u); pins restored\n",
++		    probe_volt);
++		goto out;
++	}
++
++	printf("RMX BATTERY: TI fuel gauge detected at 0x55 (GPIO27/28, pack=%umV)\n", probe_volt);
++
++	unsigned logged = 0, errors = 0;
++	for (;;) {
++		struct rmx1931_battery_state st;
++		if (bq_poll_once(&st)) {
++			errors = 0;
++			sys_bat_soc = (int)st.soc;
++			sys_bat_mv = (int)st.voltage_mv;
++			sys_bat_pack_mv = (int)st.pack_voltage_mv;
++			sys_bat_ma = st.current_ma;
++			sys_bat_temp_deci_c = st.temp_deci_c;
++			sys_bat_charging = st.charging ? 1 : 0;
++			sys_bat_external = st.external_connected ? 1 : 0;
++			sys_bat_fcc_mah = (int)st.fcc_mah;
++			sys_bat_cycles = (int)st.cycle_count;
++
++			SweetBatteryReport(&st);
++
++			if (logged < 4 || (logged % 20u) == 0) {
++				printf("RMX BATTERY: soc=%u%% pack=%umV cell=%umV cur=%dmA temp=%d.%dC "
++				    "fcc=%umAh cyc=%u ext=%d chg=%d full=%d\n",
++				    st.soc, st.pack_voltage_mv, st.voltage_mv, st.current_ma,
++				    st.temp_deci_c / 10,
++				    (st.temp_deci_c < 0 ? -st.temp_deci_c : st.temp_deci_c) % 10,
++				    st.fcc_mah, st.cycle_count, st.external_connected,
++				    st.charging, st.full);
++			}
++			logged++;
++		} else if ((errors++ % 10u) == 0) {
++			printf("RMX BATTERY: poll read error (%u)\n", errors);
++		}
++		bq_wait_ms(15000);
++	}
++
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++rmx1931_battery_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (bq_started) {
++		return;
++	}
++	bq_started = true;
++	(void)PE_parse_boot_argn("rmxbattery", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("RMX BATTERY: disabled (rmxbattery=0)\n");
++		return;
++	}
++	if (kernel_thread_start(bq_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("RMX BATTERY: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/rmx1931_battery.h b/bsd/dev/rmx1931_battery.h
+new file mode 100644
+index 0000000..d46e5e7
+--- /dev/null
++++ b/bsd/dev/rmx1931_battery.h
+@@ -0,0 +1,37 @@
++#ifndef RMX1931_BATTERY_H
++#define RMX1931_BATTERY_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct rmx1931_battery_state {
++	bool valid;
++	bool present;
++	bool external_connected;
++	bool charge_capable;
++	bool charging;
++	bool full;
++	unsigned soc;             /* 0..100 % */
++	unsigned voltage_mv;      /* single-cell normalized mV for IOPMPowerSource */
++	unsigned pack_voltage_mv; /* raw gauge mV (2S ~7400..8800 mV on RMX1931) */
++	int current_ma;           /* signed mA (+charging, -discharging) */
++	unsigned rem_mah;         /* remaining capacity (4000 mAh eq.) */
++	unsigned fcc_mah;         /* full charge capacity (4000 mAh eq.) */
++	unsigned design_mah;      /* design capacity (4000 mAh) */
++	int temp_deci_c;          /* tenths of deg C (e.g. 285 = 28.5 C) */
++	unsigned cycle_count;
++};
++
++void rmx1931_battery_init(void);
++bool rmx1931_battery_temperature(int *deci_c);
++void SweetBatteryReport(const struct rmx1931_battery_state *state);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* RMX1931_BATTERY_H */
+diff --git a/bsd/dev/rmx1931_haptic.c b/bsd/dev/rmx1931_haptic.c
+new file mode 100644
+index 0000000..3b4a2fa
+--- /dev/null
++++ b/bsd/dev/rmx1931_haptic.c
+@@ -0,0 +1,688 @@
++/*
++ * Realme X2 Pro (RMX1931 / samurai, SM8150-AC) linear resonant actuator (LRA)
++ * haptic driver: Awinic AW8697 (/dev/hakios-haptic for Taptic Engine waveforms
++ * via HakiosAudio.driver).
++ *
++ * Hardware facts (from RMX1931 live FDT /soc/i2c@0088c000/aw8697_haptic@5A
++ * and aw8697.{c,h} / aw8697_reg.h):
++ *   - IC:         Awinic AW8697 (REG_ID 0x00 == 0x97) at 7-bit I2C addr 0x5a
++ *   - Pins:       SM8150 TLMM SOUTH tile (PA 0x03d00000, size 0x80000):
++ *                   GPIO 98  = SDA (open-drain TLMM GPIO I2C)
++ *                   GPIO 99  = SCL (open-drain TLMM GPIO I2C)
++ *                   GPIO 116 = reset-gpio (active-high enable, low = reset)
++ *                 Powered directly from VPH_PWR/VBAT + always-on 1.8V.
++ *   - Actuator:   LRA_0619 (f0_pre = 170 Hz -> F_PRE = 2262 = 0x08d6),
++ *                 driven in closed-loop CONT mode with automatic zero-crossing
++ *                 BEMF braking (zero external firmware blobs required!).
++ *
++ * Safety limits:
++ *   - Drive level capped strictly at Android's CONT ceiling (97 = 0x61).
++ *   - Continuous activation capped at 1000 ms followed by 1000 ms cooldown.
++ *   - Fault monitor on SYSINT (0x02 & 0x1e: UVL, OCD, OTS, BSTERR) puts AW8697
++ *     into hardware reset (GPIO 116 low) on any fault.
++ *
++ * Boot-args:
++ *   rmxhaptic=0   disable driver (default 1)
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void rmx1931_haptic_init(void);
++
++#define AW_SOUTH_PA     0x03d00000u
++#define AW_SOUTH_SIZE   0x00080000u
++#define AW_PIN_SDA      98u
++#define AW_PIN_SCL      99u
++#define AW_PIN_RST      116u
++#define AW_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
++#define AW_GPIO_IO(n)   (AW_GPIO_CFG(n) + 4u)
++#define AW_OD_HIGH_CFG  (0x003u | (2u << 6))
++#define AW_OD_LOW_CFG   (0x203u | (2u << 6))
++#define AW_RST_OUT_CFG  (0x200u | (2u << 6))
++
++#define AW_I2C_ADDR     0x5au
++#define AW_CHIP_ID      0x97u
++
++/* AW8697 registers (aw8697_reg.h) */
++#define AW_REG_ID               0x00u
++#define AW_REG_SYSST            0x01u
++#define AW_REG_SYSINT           0x02u
++#define AW_REG_SYSINTM          0x03u
++#define AW_REG_SYSCTRL          0x04u   /* [3:2] play_mode (2=CONT), [0]bst_mode/work_mode (1=standby, 0=active) */
++#define AW_REG_GO               0x05u   /* [0] go */
++#define AW_REG_DATCTRL          0x2bu
++#define AW_REG_DBGCTRL          0x2eu
++#define AW_REG_BSTDBG1          0x31u
++#define AW_REG_BSTDBG2          0x32u
++#define AW_REG_BSTDBG3          0x33u
++#define AW_REG_BSTCFG           0x34u
++#define AW_REG_BST_AUTO         0x47u
++#define AW_REG_CONT_CTRL        0x48u
++#define AW_REG_F_PRE_H          0x49u
++#define AW_REG_F_PRE_L          0x4au
++#define AW_REG_TD_H             0x4bu
++#define AW_REG_TD_L             0x4cu
++#define AW_REG_TSET             0x4du
++#define AW_REG_R_SPARE          0x5du
++#define AW_REG_ZC_THRSH_H       0x72u
++#define AW_REG_ZC_THRSH_L       0x73u
++#define AW_REG_BEMF_VTHH_H      0x74u
++#define AW_REG_BEMF_VTHH_L      0x75u
++#define AW_REG_BEMF_VTHL_H      0x76u
++#define AW_REG_BEMF_VTHL_L      0x77u
++#define AW_REG_BEMF_NUM         0x78u
++#define AW_REG_TIME_NZC         0x7au
++#define AW_REG_DRV_LVL          0x7bu
++#define AW_REG_DRV_LVL_OV       0x7cu
++
++#define AW_SYSINT_FAULTS        0x1eu   /* UVLI | OCDI | OTSI | BSTERRI */
++#define AW_DRV_MAX              97u     /* Android LRA_0619 CONT max */
++#define AW_DRV_MIN              60u     /* 5/8 of max so soft UIKit ticks are crisp */
++#define AW_SILENT_PEAK          64u
++#define AW_ACTIVE_US            28000ull
++#define AW_TAP_US               18000ull
++#define AW_MAX_PLAY_US          1000000ull
++
++static vm_offset_t aw_gpio;
++static bool aw_started, aw_broken;
++static int aw_sleep_chan;
++
++static volatile uint64_t aw_heard_us, aw_quiet_us, aw_onset_us;
++static volatile uint32_t aw_heard_peak;
++static int sys_haptic_events = 0;
++
++SYSCTL_DECL(_kern_rmx1931);
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, haptic_events, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_haptic_events, 0, "Total haptic taps/vibrations played on AW8697");
++
++static uint32_t
++aw_rd32(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(aw_gpio + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++aw_wr32(uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(aw_gpio + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++aw_wait_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&aw_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint64_t
++aw_now_us(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++static void
++aw_rst_set(bool high)
++{
++	aw_wr32(AW_GPIO_IO(AW_PIN_RST), high ? 2u : 0u);
++	aw_wr32(AW_GPIO_CFG(AW_PIN_RST), AW_RST_OUT_CFG);
++}
++
++static void
++aw_sda(bool high)
++{
++	aw_wr32(AW_GPIO_CFG(AW_PIN_SDA), high ? AW_OD_HIGH_CFG : AW_OD_LOW_CFG);
++}
++
++static bool
++aw_sda_in(void)
++{
++	return (aw_rd32(AW_GPIO_IO(AW_PIN_SDA)) & 1u) != 0;
++}
++
++static bool
++aw_scl_high(void)
++{
++	aw_wr32(AW_GPIO_CFG(AW_PIN_SCL), AW_OD_HIGH_CFG);
++	for (unsigned i = 0; i < 1000; ++i) {
++		if (aw_rd32(AW_GPIO_IO(AW_PIN_SCL)) & 1u) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++aw_scl_low(void)
++{
++	aw_wr32(AW_GPIO_CFG(AW_PIN_SCL), AW_OD_LOW_CFG);
++}
++
++static void
++aw_bus_init(void)
++{
++	aw_wr32(AW_GPIO_IO(AW_PIN_SDA), 0);
++	aw_wr32(AW_GPIO_IO(AW_PIN_SCL), 0);
++	aw_sda(true);
++	(void)aw_scl_high();
++	delay(10);
++}
++
++static bool
++aw_i2c_start(void)
++{
++	aw_sda(true);
++	if (!aw_scl_high()) {
++		return false;
++	}
++	delay(4);
++	aw_sda(false);
++	delay(4);
++	aw_scl_low();
++	delay(4);
++	return true;
++}
++
++static void
++aw_i2c_stop(void)
++{
++	aw_sda(false);
++	delay(4);
++	(void)aw_scl_high();
++	delay(4);
++	aw_sda(true);
++	delay(4);
++}
++
++static bool
++aw_i2c_tx(uint8_t byte)
++{
++	for (int bit = 7; bit >= 0; --bit) {
++		aw_sda(((byte >> bit) & 1u) != 0);
++		delay(3);
++		if (!aw_scl_high()) {
++			return false;
++		}
++		delay(4);
++		aw_scl_low();
++		delay(2);
++	}
++	aw_sda(true);
++	delay(3);
++	if (!aw_scl_high()) {
++		return false;
++	}
++	delay(4);
++	bool ack = !aw_sda_in();
++	aw_scl_low();
++	delay(3);
++	return ack;
++}
++
++static bool
++aw_i2c_rx(uint8_t *out, bool ack)
++{
++	uint8_t val = 0;
++	aw_sda(true);
++	for (int bit = 7; bit >= 0; --bit) {
++		delay(3);
++		if (!aw_scl_high()) {
++			return false;
++		}
++		delay(4);
++		if (aw_sda_in()) {
++			val |= (uint8_t)(1u << bit);
++		}
++		aw_scl_low();
++		delay(2);
++	}
++	aw_sda(!ack);
++	delay(3);
++	if (!aw_scl_high()) {
++		aw_sda(true);
++		return false;
++	}
++	delay(4);
++	aw_scl_low();
++	aw_sda(true);
++	delay(3);
++	*out = val;
++	return true;
++}
++
++static bool
++aw_reg_read(uint8_t reg, uint8_t *out)
++{
++	for (unsigned attempt = 0; attempt < 3; ++attempt) {
++		uint8_t val = 0;
++		bool ok = aw_i2c_start() &&
++		          aw_i2c_tx((uint8_t)(AW_I2C_ADDR << 1)) &&
++		          aw_i2c_tx(reg) &&
++		          aw_i2c_start() &&
++		          aw_i2c_tx((uint8_t)((AW_I2C_ADDR << 1) | 1u)) &&
++		          aw_i2c_rx(&val, false);
++		aw_i2c_stop();
++		delay(10);
++		if (ok) {
++			*out = val;
++			return true;
++		}
++		aw_bus_init();
++	}
++	return false;
++}
++
++static bool
++aw_reg_write(uint8_t reg, uint8_t val)
++{
++	if (aw_broken) {
++		return false;
++	}
++	for (unsigned attempt = 0; attempt < 3; ++attempt) {
++		bool ok = aw_i2c_start() &&
++		          aw_i2c_tx((uint8_t)(AW_I2C_ADDR << 1)) &&
++		          aw_i2c_tx(reg) &&
++		          aw_i2c_tx(val);
++		aw_i2c_stop();
++		delay(10);
++		if (ok) {
++			return true;
++		}
++		aw_bus_init();
++	}
++	return false;
++}
++
++static bool
++aw_reg_bits(uint8_t reg, uint8_t clear_mask, uint8_t set_bits)
++{
++	uint8_t cur = 0;
++	if (!aw_reg_read(reg, &cur)) {
++		return false;
++	}
++	return aw_reg_write(reg, (uint8_t)((cur & ~clear_mask) | set_bits));
++}
++
++static void
++aw_give_up(const char *why)
++{
++	if (!aw_broken) {
++		aw_broken = true;
++		if (aw_gpio) {
++			aw_rst_set(false);
++		}
++		printf("RMX HAPTIC: %s -> AW8697 held in reset\n", why);
++	}
++}
++
++static bool
++aw_standby(void)
++{
++	(void)aw_reg_write(AW_REG_GO, 0x00u);
++	return aw_reg_bits(AW_REG_SYSCTRL, 0x01u, 0x01u);
++}
++
++/* Configure AW8697 for closed-loop 170 Hz CONT mode (from aw8697.c LRA_0619). */
++static bool
++aw_configure(void)
++{
++	uint8_t dummy = 0;
++	if (!aw_reg_write(AW_REG_ID, 0xaau)) { /* soft reset */
++		return false;
++	}
++	aw_wait_ms(3);
++
++	if (!aw_standby()) {
++		return false;
++	}
++	/* 24 kHz PWM, LRA_0619 analog trim, boost bypass (safe VPH drive). */
++	if (!aw_reg_bits(AW_REG_DBGCTRL, (uint8_t)(3u << 5), (uint8_t)(1u << 5)) ||
++	    !aw_reg_write(AW_REG_BSTDBG1, 0x30u) ||
++	    !aw_reg_write(AW_REG_BSTDBG2, 0xebu) ||
++	    !aw_reg_write(AW_REG_BSTDBG3, 0xd4u) ||
++	    !aw_reg_write(AW_REG_TSET, 0x12u) ||
++	    !aw_reg_write(AW_REG_R_SPARE, 0x68u) ||
++	    !aw_reg_bits(AW_REG_BSTCFG, 0x07u, 0x07u) ||
++	    !aw_reg_bits(AW_REG_BST_AUTO, 0x04u, 0x00u)) {
++		return false;
++	}
++	/* Closed-loop 170 Hz CONT parameters (f0_pre = 170 Hz -> 2262 = 0x08d6). */
++	if (!aw_reg_write(AW_REG_F_PRE_H, 0x08u) ||
++	    !aw_reg_write(AW_REG_F_PRE_L, 0xd6u) ||
++	    !aw_reg_bits(AW_REG_DATCTRL, 0x3fu, 0x08u) ||
++	    !aw_reg_write(AW_REG_CONT_CTRL, 0x89u) || /* ZC_DETEC | CLOSE_PLAYBACK | AUTO_BRK */
++	    !aw_reg_write(AW_REG_TD_H, 0x00u) ||
++	    !aw_reg_write(AW_REG_TD_L, 0x9au) ||
++	    !aw_reg_write(AW_REG_ZC_THRSH_H, 0x0fu) ||
++	    !aw_reg_write(AW_REG_ZC_THRSH_L, 0xf1u) ||
++	    !aw_reg_write(AW_REG_BEMF_VTHH_H, 0x10u) ||
++	    !aw_reg_write(AW_REG_BEMF_VTHH_L, 0x08u) ||
++	    !aw_reg_write(AW_REG_BEMF_VTHL_H, 0x03u) ||
++	    !aw_reg_write(AW_REG_BEMF_VTHL_L, 0xf8u) ||
++	    !aw_reg_bits(AW_REG_BEMF_NUM, 0x0fu, 0x03u) ||
++	    !aw_reg_write(AW_REG_TIME_NZC, 0x23u) ||
++	    !aw_reg_write(AW_REG_SYSINTM, 0xe1u)) {
++		return false;
++	}
++	(void)aw_reg_read(AW_REG_SYSINT, &dummy); /* clear power-on UVLI */
++	return true;
++}
++
++static uint8_t
++aw_drv_for_peak(uint32_t peak)
++{
++	const uint32_t third = 32767u / 3u;
++	if (peak >= third) {
++		return AW_DRV_MAX;
++	}
++	return (uint8_t)(AW_DRV_MIN + (AW_DRV_MAX - AW_DRV_MIN) * peak / third);
++}
++
++static bool
++aw_start_cont(uint8_t drv)
++{
++	if (drv > AW_DRV_MAX) {
++		drv = AW_DRV_MAX;
++	}
++	/* CONT mode ([3:2]=2), active ([0]=0), set DRV_LVL & DRV_LVL_OV, GO=1. */
++	if (!aw_reg_write(AW_REG_DRV_LVL, drv) ||
++	    !aw_reg_write(AW_REG_DRV_LVL_OV, drv) ||
++	    !aw_reg_bits(AW_REG_SYSCTRL, 0x0du, 0x08u) ||
++	    !aw_reg_write(AW_REG_GO, 0x01u)) {
++		aw_give_up("failed to start CONT vibration");
++		return false;
++	}
++	return true;
++}
++
++static bool
++aw_stop_cont(void)
++{
++	/* Clearing GO triggers AW8697's closed-loop AUTO_BRK zero-crossing brake. */
++	if (!aw_reg_write(AW_REG_GO, 0x00u)) {
++		aw_give_up("failed to clear GO");
++		return false;
++	}
++	delay(2000);
++	if (!aw_standby()) {
++		aw_give_up("failed to enter standby");
++		return false;
++	}
++	return true;
++}
++
++static bool
++aw_check_health(void)
++{
++	uint8_t sysint = 0;
++	if (!aw_reg_read(AW_REG_SYSINT, &sysint)) {
++		aw_give_up("SYSINT read failed");
++		return false;
++	}
++	if (sysint & AW_SYSINT_FAULTS) {
++		printf("RMX HAPTIC: fault SYSINT=%#x\n", sysint);
++		aw_give_up("AW8697 hardware fault flag");
++		return false;
++	}
++	return true;
++}
++
++static void
++aw_record_peak(uint32_t peak)
++{
++	uint64_t now = aw_now_us();
++	if (peak <= AW_SILENT_PEAK) {
++		aw_quiet_us = now;
++		return;
++	}
++	if (aw_heard_us == 0 || aw_quiet_us > aw_heard_us || now - aw_heard_us >= AW_ACTIVE_US) {
++		aw_onset_us = now;
++		aw_heard_peak = 0;
++	}
++	aw_heard_us = now;
++	if (peak > aw_heard_peak) {
++		aw_heard_peak = peak;
++	}
++	wakeup(&aw_sleep_chan);
++}
++
++static int
++haptic_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t samples[1024];
++	int err = 0;
++
++	/* Support short ASCII test strings ("tap\n") from SSH as well as int16 PCM. */
++	if (uio_resid(uio) > 0 && uio_resid(uio) <= 8) {
++		char cmd[8];
++		int len = (int)uio_resid(uio);
++		err = uiomove(cmd, len, uio);
++		if (!err && (cmd[0] == 't' || (cmd[0] >= '1' && cmd[0] <= '9'))) {
++			aw_record_peak(24000u);
++			return 0;
++		}
++		if (!err && len >= 2) {
++			int16_t s0 = 0;
++			memcpy(&s0, cmd, sizeof(s0));
++			uint32_t v = s0 < 0 ? (uint32_t)(-(int32_t)s0) : (uint32_t)s0;
++			aw_record_peak(v);
++		}
++		return err;
++	}
++
++	while (uio_resid(uio) >= 2) {
++		user_ssize_t bytes = uio_resid(uio);
++		if (bytes > (user_ssize_t)sizeof(samples)) {
++			bytes = (user_ssize_t)sizeof(samples);
++		}
++		bytes &= ~(user_ssize_t)1;
++		err = uiomove((caddr_t)samples, (int)bytes, uio);
++		if (err) {
++			break;
++		}
++		uint32_t n = (uint32_t)(bytes / 2);
++		uint32_t peak = 0;
++		for (uint32_t i = 0; i < n; ++i) {
++			uint32_t v = samples[i] < 0 ? (uint32_t)(-(int32_t)samples[i]) : (uint32_t)samples[i];
++			if (v > peak) {
++				peak = v;
++			}
++		}
++		aw_record_peak(peak);
++	}
++	if (!err && uio_resid(uio) > 0) {
++		uio_setresid(uio, 0);
++	}
++	return err;
++}
++
++static const struct cdevsw rmx_haptic_cdevsw = {
++	.d_open       = haptic_open,
++	.d_close      = haptic_open,
++	.d_read       = eno_rdwrt,
++	.d_write      = haptic_write,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++static void
++aw_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	aw_wait_ms(1000);
++	aw_gpio = ml_io_map(AW_SOUTH_PA, AW_SOUTH_SIZE);
++	if (!aw_gpio) {
++		printf("RMX HAPTIC: SOUTH TLMM map failed\n");
++		goto out;
++	}
++
++	uint32_t orig_sda_cfg = aw_rd32(AW_GPIO_CFG(AW_PIN_SDA));
++	uint32_t orig_scl_cfg = aw_rd32(AW_GPIO_CFG(AW_PIN_SCL));
++	uint32_t orig_rst_cfg = aw_rd32(AW_GPIO_CFG(AW_PIN_RST));
++	uint32_t orig_sda_io = aw_rd32(AW_GPIO_IO(AW_PIN_SDA));
++	uint32_t orig_scl_io = aw_rd32(AW_GPIO_IO(AW_PIN_SCL));
++	uint32_t orig_rst_io = aw_rd32(AW_GPIO_IO(AW_PIN_RST));
++
++	aw_bus_init();
++	aw_rst_set(false);
++	aw_wait_ms(3);
++	aw_rst_set(true);
++	aw_wait_ms(5);
++
++	uint8_t chip_id = 0;
++	if (!aw_reg_read(AW_REG_ID, &chip_id) || chip_id != AW_CHIP_ID) {
++		/* Restore firmware pin state on non-RMX1931 boards (e.g. Pixel 4). */
++		aw_wr32(AW_GPIO_IO(AW_PIN_SDA), orig_sda_io);
++		aw_wr32(AW_GPIO_IO(AW_PIN_SCL), orig_scl_io);
++		aw_wr32(AW_GPIO_IO(AW_PIN_RST), orig_rst_io);
++		aw_wr32(AW_GPIO_CFG(AW_PIN_SDA), orig_sda_cfg);
++		aw_wr32(AW_GPIO_CFG(AW_PIN_SCL), orig_scl_cfg);
++		aw_wr32(AW_GPIO_CFG(AW_PIN_RST), orig_rst_cfg);
++		printf("RMX HAPTIC: no AW8697 at 0x5a (id=%#x); pins restored\n", chip_id);
++		goto out;
++	}
++
++	if (!aw_configure()) {
++		aw_give_up("AW8697 init failed");
++		goto out;
++	}
++
++	int major = cdevsw_add(-1, &rmx_haptic_cdevsw);
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT,
++	    GID_WHEEL, 0666, "hakios-haptic") == NULL) {
++		aw_give_up("failed to create /dev/hakios-haptic");
++		goto out;
++	}
++	printf("RMX HAPTIC: AW8697 ready at 0x5a (GPIO98/99 rst=GPIO116, 170 Hz closed-loop)\n");
++
++	enum { H_IDLE, H_PLAYING, H_COOLDOWN } state = H_IDLE;
++	uint64_t play_since = 0, cooldown_until = 0, last_health = 0, played_onset = 0;
++	uint8_t cur_drv = 0;
++
++	while (!aw_broken) {
++		uint64_t now = aw_now_us();
++		uint64_t heard = aw_heard_us, quiet = aw_quiet_us, onset = aw_onset_us;
++		uint32_t peak = aw_heard_peak;
++		bool active = heard != 0 && quiet <= heard && (now - heard) < AW_ACTIVE_US;
++
++		switch (state) {
++		case H_IDLE:
++			if ((active || (onset > played_onset && (now - onset) < 100000ull)) && peak > AW_SILENT_PEAK) {
++				uint8_t drv = aw_drv_for_peak(peak);
++				if (aw_start_cont(drv)) {
++					state = H_PLAYING;
++					play_since = now;
++					played_onset = onset;
++					cur_drv = drv;
++					sys_haptic_events++;
++					if (sys_haptic_events <= 16) {
++						printf("RMX HAPTIC: event #%d start peak=%u drv=%u\n",
++						    sys_haptic_events, peak, drv);
++					}
++				}
++			}
++			break;
++
++		case H_PLAYING: {
++			uint64_t elapsed = now - play_since;
++			if (elapsed >= AW_MAX_PLAY_US) {
++				(void)aw_stop_cont();
++				cooldown_until = now + AW_MAX_PLAY_US;
++				state = H_COOLDOWN;
++				printf("RMX HAPTIC: capped at 1000 ms; cooling down\n");
++				break;
++			}
++			/* Ensure short taps run for at least AW_TAP_US (18 ms) before braking. */
++			if (!active && elapsed >= AW_TAP_US) {
++				(void)aw_stop_cont();
++				state = H_IDLE;
++				break;
++			}
++			if (active && peak > AW_SILENT_PEAK) {
++				uint8_t drv = aw_drv_for_peak(peak);
++				if (drv > cur_drv + 6u || drv + 6u < cur_drv) {
++					(void)aw_reg_write(AW_REG_DRV_LVL, drv);
++					cur_drv = drv;
++				}
++			}
++			if (now - last_health >= 50000ull) {
++				last_health = now;
++				if (!aw_check_health()) {
++					break;
++				}
++			}
++			break;
++		}
++
++		case H_COOLDOWN:
++			if (now >= cooldown_until) {
++				state = H_IDLE;
++			}
++			break;
++		}
++		aw_wait_ms(state == H_PLAYING ? 4u : 12u);
++	}
++
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++rmx1931_haptic_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (aw_started) {
++		return;
++	}
++	aw_started = true;
++	(void)PE_parse_boot_argn("rmxhaptic", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("RMX HAPTIC: disabled (rmxhaptic=0)\n");
++		return;
++	}
++	if (kernel_thread_start(aw_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("RMX HAPTIC: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/rmx1931_torch.c b/bsd/dev/rmx1931_torch.c
+new file mode 100644
+index 0000000..18882d1
+--- /dev/null
++++ b/bsd/dev/rmx1931_torch.c
+@@ -0,0 +1,499 @@
++/*
++ * Realme X2 Pro (RMX1931 / samurai, SM8150-AC) rear flashlight driver
++ * (/dev/hakios-torch for Control Center & AVFlashlight via libsweet_media.dylib).
++ *
++ * Hardware facts (from RMX1931 live FDT /soc/qcom,spmi@c440000/qcom,pm8150l@5/
++ * qcom,leds@d300 and leds-qpnp-flash-v2.c):
++ *   - Peripheral: PM8150L SID 5, base 0xd300 (PPID 0x5d3), qpnp-flash-led-v2
++ *   - Channel 0:  led:torch_0 (qcom,id=0, ires-ua=12500, max-current=200 mA)
++ *                 + led:switch_0 (led-mask=0x1). Capped here at 125 mA and
++ *                 at most 30 s continuous on-time per activation.
++ *   - Thermal:    PM8150L temp-alarm (SID 4, 0x2400) + RMX1931 battery temp
++ *                 cutoff (>= 45.0 C) + VPH droop / fault status checks every 100 ms.
++ *
++ * Strictly whitelisted SPMI writes ONLY to PPID 0x5d3 regs:
++ *   0x40 SAFETY_TMR(0), 0x43 TGR_CURRENT(0), 0x46 MOD_CTRL,
++ *   0x47 IRES, 0x49 STROBE_CTRL(0), 0x4c EN_LED_CTRL.
++ *
++ * Boot-args:
++ *   rmxtorch=0       disable driver
++ *   rmxtorch=3       serve /dev/hakios-torch (default)
++ *   rmxtorch_max_s=N max continuous seconds (default 30, 1..120)
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include "sweet_spmi.h"
++#include "rmx1931_battery.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void rmx1931_torch_init(void);
++
++#define TORCH_SPMI_CORE   0x0c440000u
++#define TORCH_SPMI_CHNLS  0x0c600000u
++#define TORCH_SPMI_OBS    0x0e600000u
++#define TORCH_SPMI_CNFG   0x0c40a000u
++
++#define TORCH_SID         5u
++#define TORCH_BASE        0xd300u
++#define TORCH_PPID        ((TORCH_SID << 8) | (TORCH_BASE >> 8)) /* 0x5d3 */
++
++#define FLASH_REG_TYPE          0x04u   /* 0x18 */
++#define FLASH_REG_SUBTYPE       0x05u   /* >= 0x04 on flash-led-v2 */
++#define FLASH_REG_STATUS1       0x08u
++#define FLASH_REG_STATUS2       0x09u   /* bit 4 VPH droop, [2:0] thermal */
++#define FLASH_REG_INT_RT_STS    0x10u   /* bit 0 fault */
++#define FLASH_REG_SAFETY_TMR0   0x40u   /* 0x13 = safety timer disabled (torch) */
++#define FLASH_REG_TGR_CURRENT0  0x43u   /* [6:0] current code */
++#define FLASH_REG_MOD_CTRL      0x46u   /* bit 7 module enable */
++#define FLASH_REG_IRES          0x47u   /* [1:0] LED1 resolution: 0=12.5mA, 3=5.0mA */
++#define FLASH_REG_STROBE_CTRL0  0x49u   /* [2:0] 0 = SW strobe */
++#define FLASH_REG_EN_LED_CTRL   0x4cu   /* bit 0 LED1 enable */
++
++#define TORCH_MAX_MA            125u    /* conservative continuous torch cap */
++#define TORCH_DEFAULT_MAX_SECS  30u
++
++static LCK_GRP_DECLARE(rmx_torch_grp, "rmx-torch");
++static LCK_MTX_DECLARE(rmx_torch_lock, &rmx_torch_grp);
++
++static vm_offset_t tr_core, tr_cnfg, tr_obs, tr_ch;
++static uint16_t tr_apid = 0xffffu;
++static bool tr_started, tr_broken;
++static volatile uint32_t tr_wanted;     /* 0..1000 */
++static uint32_t tr_shown;
++static uint32_t tr_max_secs = TORCH_DEFAULT_MAX_SECS;
++static int tr_sleep_chan;
++static int sys_torch_level = 0;
++
++SYSCTL_DECL(_kern_rmx1931);
++SYSCTL_INT(_kern_rmx1931, OID_AUTO, torch_level, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sys_torch_level, 0, "Current RMX1931 flashlight level (0..1000)");
++
++static uint32_t
++tr_rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++tr_wr32(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++tr_wait_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&tr_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint64_t
++tr_now_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static bool
++tr_reg_read(uint8_t reg, uint8_t *out)
++{
++	if (tr_apid == 0xffffu || !tr_obs) {
++		return false;
++	}
++	uint32_t off = 0x80u * (uint32_t)tr_apid;
++	tr_wr32(tr_obs, off, (1u << 27) | ((uint32_t)reg << 4));
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t st = tr_rd32(tr_obs, off + 0x08u);
++		if (st & 1u) {
++			if (st & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)tr_rd32(tr_obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++tr_reg_writable(uint8_t reg)
++{
++	return reg == FLASH_REG_SAFETY_TMR0 || reg == FLASH_REG_TGR_CURRENT0 ||
++	       reg == FLASH_REG_MOD_CTRL || reg == FLASH_REG_IRES ||
++	       reg == FLASH_REG_STROBE_CTRL0 || reg == FLASH_REG_EN_LED_CTRL;
++}
++
++static bool
++tr_reg_write(uint8_t reg, uint8_t val)
++{
++	if (tr_broken || !tr_ch || tr_apid == 0xffffu || !tr_reg_writable(reg)) {
++		tr_broken = true;
++		return false;
++	}
++	/* Re-verify APID still maps to PPID 0x5d3 before every write. */
++	if (((tr_rd32(tr_core, 0x900u + 4u * (uint32_t)tr_apid) >> 8) & 0xfffu) != TORCH_PPID) {
++		tr_broken = true;
++		return false;
++	}
++	bool ok = false;
++	lck_mtx_lock(&rmx_torch_lock);
++	tr_wr32(tr_ch, 0x10u, val);
++	tr_wr32(tr_ch, 0x00u, (0u << 27) | ((uint32_t)reg << 4));
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t st = tr_rd32(tr_ch, 0x08u);
++		if (st & 1u) {
++			ok = (st & 0x0eu) == 0;
++			break;
++		}
++		delay(1);
++	}
++	lck_mtx_unlock(&rmx_torch_lock);
++	if (!ok) {
++		tr_broken = true;
++		return false;
++	}
++	uint8_t rb = 0xff;
++	if (!tr_reg_read(reg, &rb) || rb != val) {
++		printf("RMX TORCH: verify mismatch reg=%#x wrote=%#x read=%#x\n", reg, val, rb);
++		tr_broken = true;
++		return false;
++	}
++	return true;
++}
++
++static bool
++tr_reg_mask(uint8_t reg, uint8_t mask, uint8_t val)
++{
++	uint8_t cur = 0;
++	if (!tr_reg_read(reg, &cur)) {
++		return false;
++	}
++	uint8_t next = (uint8_t)((cur & ~mask) | (val & mask));
++	return next == cur ? true : tr_reg_write(reg, next);
++}
++
++static bool
++tr_hw_off(void)
++{
++	bool a = tr_reg_mask(FLASH_REG_EN_LED_CTRL, 0x01u, 0x00u);
++	bool b = tr_reg_mask(FLASH_REG_TGR_CURRENT0, 0x7fu, 0x00u);
++	bool c = tr_reg_write(FLASH_REG_SAFETY_TMR0, 0x13u);
++	bool d = tr_reg_write(FLASH_REG_MOD_CTRL, 0x00u);
++	return a && b && c && d;
++}
++
++static bool
++tr_hw_on(uint32_t level_1000)
++{
++	if (level_1000 == 0) {
++		return tr_hw_off();
++	}
++	if (level_1000 > 1000u) {
++		level_1000 = 1000u;
++	}
++	/* Scale 1..1000 -> 13..125 mA; apply PM8150L_IRES_WA (5 mA step) for <= 20 mA. */
++	uint32_t ma = (TORCH_MAX_MA * level_1000 + 999u) / 1000u;
++	if (ma < 10u) {
++		ma = 10u;
++	}
++	uint8_t ires_bits = 0x00u;      /* 12.5 mA */
++	uint8_t code = 0u;
++	if (ma <= 20u) {
++		ires_bits = 0x03u;      /* 5.0 mA per PM8150L_IRES_WA */
++		code = (uint8_t)((ma * 1000u / 5000u) - 1u);
++	} else {
++		uint32_t steps = (ma * 1000u) / 12500u;
++		code = (uint8_t)((steps > 0 ? steps - 1u : 0u));
++		if (code > 9u) {
++			code = 9u;      /* 125 mA hard ceiling */
++		}
++	}
++	if (!tr_reg_mask(FLASH_REG_STROBE_CTRL0, 0x07u, 0x00u) ||
++	    !tr_reg_mask(FLASH_REG_IRES, 0x03u, ires_bits) ||
++	    !tr_reg_mask(FLASH_REG_TGR_CURRENT0, 0x7fu, code) ||
++	    !tr_reg_write(FLASH_REG_SAFETY_TMR0, 0x13u) ||
++	    !tr_reg_write(FLASH_REG_MOD_CTRL, 0x80u) ||
++	    !tr_reg_mask(FLASH_REG_EN_LED_CTRL, 0x01u, 0x01u)) {
++		(void)tr_hw_off();
++		return false;
++	}
++	return true;
++}
++
++static const char *
++tr_check_trouble(void)
++{
++	uint8_t rt = 0, s2 = 0;
++	if (!tr_reg_read(FLASH_REG_INT_RT_STS, &rt) || !tr_reg_read(FLASH_REG_STATUS2, &s2)) {
++		return "flash status unreadable";
++	}
++	if (rt & 0x01u) {
++		return "flash fault interrupt";
++	}
++	if (s2 & 0x17u) {
++		return "VPH droop or LED thermal derate";
++	}
++	/* PM8150L temp-alarm (SID 4, 0x2405 subtype / 0x2408 status). */
++	uint8_t t_sub = 0, t_st = 0;
++	if (sweet_spmi_read(4, 0x2405u, &t_sub) == 0 &&
++	    sweet_spmi_read(4, 0x2408u, &t_st) == 0) {
++		unsigned stage = (t_sub == 0x08u) ? (t_st & 0x03u) : ((t_st >> 4) & 0x07u);
++		if (stage > 0) {
++			return "PM8150L thermal alarm stage > 0";
++		}
++	}
++	int bat_deci_c = 250;
++	if (rmx1931_battery_temperature(&bat_deci_c) && bat_deci_c >= 450) {
++		return "battery temperature >= 45 C";
++	}
++	return NULL;
++}
++
++static int
++torch_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++torch_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (uio_offset(uio) > 0) {
++		return 0;
++	}
++	char line[16];
++	int len = snprintf(line, sizeof(line), "%u\n", tr_shown);
++	return uiomove(line, len, uio);
++}
++
++static int
++torch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	char buf[16];
++	user_ssize_t resid = uio_resid(uio);
++	if (resid <= 0 || resid > (user_ssize_t)sizeof(buf)) {
++		return EINVAL;
++	}
++	int len = (int)resid;
++	bzero(buf, sizeof(buf));
++	int err = uiomove(buf, len, uio);
++	if (err) {
++		return err;
++	}
++	uint32_t level = 0;
++	/* Accept both binary uint32_t (libsweet_media.dylib) and ASCII ("0".."1000\n"). */
++	bool ascii = true;
++	for (int i = 0; i < len; ++i) {
++		char c = buf[i];
++		if (!((c >= '0' && c <= '9') || c == ' ' || c == '\n' || c == '\r')) {
++			ascii = false;
++			break;
++		}
++	}
++	if (len == 4 && !ascii) {
++		memcpy(&level, buf, sizeof(level));
++	} else if (ascii) {
++		const char *p = buf;
++		while (*p == ' ') {
++			p++;
++		}
++		if (*p < '0' || *p > '9') {
++			return EINVAL;
++		}
++		while (*p >= '0' && *p <= '9') {
++			level = level * 10u + (uint32_t)(*p++ - '0');
++			if (level > 1000u) {
++				level = 1000u;
++			}
++		}
++	} else if (len == 4) {
++		memcpy(&level, buf, sizeof(level));
++	} else {
++		return EINVAL;
++	}
++	if (level > 1000u) {
++		level = 1000u;
++	}
++	tr_wanted = level;
++	wakeup(&tr_sleep_chan);
++	return 0;
++}
++
++static const struct cdevsw rmx_torch_cdevsw = {
++	.d_open       = torch_open,
++	.d_close      = torch_open,
++	.d_read       = torch_read,
++	.d_write      = torch_write,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++static void
++tr_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t applied = 0;
++	uint64_t since = 0, last_check = 0;
++	bool wait_zero = false;
++
++	while (!tr_broken) {
++		uint32_t want = tr_wanted;
++		uint64_t now = tr_now_ms();
++
++		if (want == 0) {
++			wait_zero = false;
++		}
++		if (wait_zero) {
++			want = 0;
++		}
++		if (want != applied) {
++			if (tr_hw_on(want)) {
++				if (applied == 0 && want != 0) {
++					since = now;
++				}
++				applied = want;
++				tr_shown = want;
++				sys_torch_level = (int)want;
++				printf("RMX TORCH: level %u/1000\n", want);
++			} else {
++				printf("RMX TORCH: hardware write failed; disabling torch\n");
++				break;
++			}
++		}
++		if (applied != 0 && now - since >= (uint64_t)tr_max_secs * 1000ull) {
++			printf("RMX TORCH: %u s safety limit reached; turning off\n", tr_max_secs);
++			wait_zero = true;
++			(void)tr_hw_off();
++			applied = 0;
++			tr_shown = 0;
++			sys_torch_level = 0;
++			continue;
++		}
++		if (applied != 0 && now - last_check >= 100ull) {
++			last_check = now;
++			const char *why = tr_check_trouble();
++			if (why != NULL) {
++				printf("RMX TORCH: emergency off (%s)\n", why);
++				wait_zero = true;
++				(void)tr_hw_off();
++				applied = 0;
++				tr_shown = 0;
++				sys_torch_level = 0;
++			}
++		}
++		tr_wait_ms(applied != 0 ? 25u : 100u);
++	}
++	(void)tr_hw_off();
++	sys_torch_level = 0;
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++rmx1931_torch_init(void)
++{
++	uint32_t mode = 3;
++	thread_t thread;
++
++	if (tr_started) {
++		return;
++	}
++	tr_started = true;
++	(void)PE_parse_boot_argn("rmxtorch", &mode, sizeof(mode));
++	if (mode == 0) {
++		printf("RMX TORCH: disabled (rmxtorch=0)\n");
++		return;
++	}
++	(void)PE_parse_boot_argn("rmxtorch_max_s", &tr_max_secs, sizeof(tr_max_secs));
++	if (tr_max_secs < 1u || tr_max_secs > 120u) {
++		tr_max_secs = TORCH_DEFAULT_MAX_SECS;
++	}
++
++	(void)sweet_spmi_init();
++	tr_core = ml_io_map(TORCH_SPMI_CORE, 0x2000);
++	tr_cnfg = ml_io_map(TORCH_SPMI_CNFG, 0x1000);
++	tr_obs = ml_io_map(TORCH_SPMI_OBS, 0x10000);
++	if (!tr_core || !tr_cnfg || !tr_obs) {
++		printf("RMX TORCH: SPMI map failed\n");
++		return;
++	}
++	uint32_t ver = tr_rd32(tr_core, 0);
++	uint32_t napids = tr_rd32(tr_core, 4u) & 0x7ffu;
++	if (ver < 0x50000000u || ver >= 0x70000000u || napids == 0 || napids > 512u) {
++		return;
++	}
++	uint16_t found = 0xffffu;
++	uint32_t owner = 7u;
++	for (uint32_t i = 0; i < napids; ++i) {
++		uint32_t apid_map = tr_rd32(tr_core, 0x900u + 4u * i);
++		if (!apid_map || ((apid_map >> 8) & 0xfffu) != TORCH_PPID) {
++			continue;
++		}
++		uint32_t own = tr_rd32(tr_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == 0xffffu || own == 0) {
++			found = (uint16_t)i;
++			owner = own;
++		}
++	}
++	if (found == 0xffffu || owner != 0) {
++		printf("RMX TORCH: PM8150L flash (ppid=%#x) unavailable apid=%#x owner=%u\n",
++		    TORCH_PPID, found, owner);
++		return;
++	}
++	tr_apid = found;
++	uint8_t type = 0, subtype = 0;
++	if (!tr_reg_read(FLASH_REG_TYPE, &type) ||
++	    !tr_reg_read(FLASH_REG_SUBTYPE, &subtype) ||
++	    type != 0x18u || subtype < 0x04u) {
++		printf("RMX TORCH: unexpected peripheral type=%#x subtype=%#x\n", type, subtype);
++		tr_apid = 0xffffu;
++		return;
++	}
++	tr_ch = ml_io_map((vm_offset_t)(TORCH_SPMI_CHNLS + 0x10000ul * (uintptr_t)found), 0x1000);
++	if (!tr_ch) {
++		printf("RMX TORCH: SPMI channel map failed\n");
++		return;
++	}
++	int major = cdevsw_add(-1, &rmx_torch_cdevsw);
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT,
++	    GID_WHEEL, 0666, "hakios-torch") == NULL) {
++		printf("RMX TORCH: failed to create /dev/hakios-torch\n");
++		return;
++	}
++	printf("RMX TORCH: /dev/hakios-torch ready (PM8150L ppid=%#x apid=%u type=%#x sub=%#x max=%umA/%us)\n",
++	    TORCH_PPID, found, type, subtype, TORCH_MAX_MA, tr_max_secs);
++	if (kernel_thread_start(tr_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 6a121c5..9ccebed 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,14 +1,18 @@
+ /*
+- * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
++ * Battery/PMIC observer EXT_READL helper for SM8150 / SM7150.
+  * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+  * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+- * Init is serialized by the single built-in SweetBattery personality.
+- * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+- * Also the PM8150 RTC (peripheral 0x60) for the time of day (SweetPlatformExpert.cpp).
++ * Whitelisted peripherals:
++ *   - SID 0 (PM8150 / PM6150): 0x10..0x13 (charger), 0x24 (temp-alarm),
++ *                              0x48 (QG), 0x60 (RTC)
++ *   - SID 2 (PM8150B):         0x10..0x13, 0x16 (SMB5 charger/USB), 0x24 (temp-alarm)
++ *   - SID 4 (PM8150L):         0x24 (temp-alarm)
++ *   - SID 5 (PM8150L-2):       0xd3 (flash-led-v2 status)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <libkern/OSAtomic.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
+ #include "sweet_spmi.h"
+@@ -23,7 +27,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+-static bool sp_attempted, sp_ready;
++static volatile UInt32 sp_state; /* 0=uninit, 1=initializing, 2=done */
++static bool sp_ready;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+ static bool sp_poisoned[512];
+ 
+@@ -52,15 +57,42 @@ sp_find_apid(unsigned ppid)
+ 	return found;
+ }
+ 
++static bool
++sp_allowed(unsigned sid, unsigned peripheral)
++{
++	switch (sid) {
++	case 0:
++		return peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++		       peripheral == 0x13 || peripheral == 0x24 || peripheral == 0x48 ||
++		       peripheral == 0x60;
++	case 2:
++		return peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++		       peripheral == 0x13 || peripheral == 0x16 || peripheral == 0x24;
++	case 4:
++		return peripheral == 0x24;
++	case 5:
++		return peripheral == 0xd3;
++	default:
++		return false;
++	}
++}
++
+ int
+ sweet_spmi_init(void)
+ {
+-	if (sp_attempted) {
++	if (sp_state == 2) {
++		return sp_ready ? 0 : -1;
++	}
++	if (!OSCompareAndSwap(0, 1, &sp_state)) {
++		while (sp_state != 2) {
++			delay(10);
++		}
+ 		return sp_ready ? 0 : -1;
+ 	}
+-	sp_attempted = true;
+ 	sp_lock = IOLockAlloc();
+ 	if (!sp_lock) {
++		__asm__ volatile("dmb ish" ::: "memory");
++		sp_state = 2;
+ 		return -1;
+ 	}
+ 	sp_core = ml_io_map(SP_CORE_PA, 0x2000);
+@@ -68,6 +100,8 @@ sweet_spmi_init(void)
+ 	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
+ 	if (!sp_core || !sp_cfg || !sp_obs) {
+ 		printf("SWEET BATTERY: SPMI mapping failed\n");
++		__asm__ volatile("dmb ish" ::: "memory");
++		sp_state = 2;
+ 		return -1;
+ 	}
+ 	uint32_t arb_version = sp_rd(sp_core, 0);
+@@ -76,9 +110,13 @@ sweet_spmi_init(void)
+ 	    !sp_count || sp_count > 512) {
+ 		printf("SWEET BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
+ 		    arb_version, sp_count);
++		__asm__ volatile("dmb ish" ::: "memory");
++		sp_state = 2;
+ 		return -1;
+ 	}
+ 	sp_ready = true;
++	__asm__ volatile("dmb ish" ::: "memory");
++	sp_state = 2;
+ 	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
+ 	    arb_version, sp_count);
+ 	return 0;
+@@ -87,11 +125,8 @@ sweet_spmi_init(void)
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks and the RTC (0x60); keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
++	if (!sp_ready || !out || addr > 0xffffu || !sp_allowed(sid, peripheral)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index eee65bd..083693a 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,9 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_fts_init(void);
+ extern void rmx1931_touch_init(void);
++extern void rmx1931_battery_init(void);
++extern void rmx1931_torch_init(void);
++extern void rmx1931_haptic_init(void);
+ extern void sweet_cpufreq_init(void);
+ extern void sweet_pmem_init(void);
+ extern void flame_wlan_init(void);
+@@ -671,6 +674,9 @@ sweet_ufs_init(void)
+ 	sweet_touch_init();
+ 	sweet_fts_init();
+ 	rmx1931_touch_init();
++	rmx1931_battery_init();
++	rmx1931_torch_init();
++	rmx1931_haptic_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 1e27d11..5897a3a 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -999,6 +999,12 @@ bsd_init(void)
+ 
+ 		bsd_init_kprintf("calling devfs_kernel_mount\n");
+ 		devfs_kernel_mount(mounthere);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		{
++			extern void rmx1931_audio_init(void);
++			rmx1931_audio_init();
++		}
++#endif
+ 	}
+ #endif /* DEVFS */
+ 
+@@ -1111,6 +1117,10 @@ bsdinit_task(void)
+ 		printf("SWEET: local dirs ready (var/local=%d m2v-cache=%d dropbear=%d)\n",
+ 		    e1, e2, e3);
+ 	}
++	{
++		extern void sweet_exec_inject_init(void);
++		sweet_exec_inject_init();
++	}
+ #endif
+ 
+ 	load_init_program(p);
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..b262f4e 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -3076,9 +3076,11 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
+ 	int error = 0;
+ 	struct persona *persona = NULL;
+ 
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	if (!IOCurrentTaskHasEntitlement( PERSONA_MGMT_ENTITLEMENT)) {
+ 		return EPERM;
+ 	}
++#endif
+ 
+ 	if (px_persona->pspi_flags & POSIX_SPAWN_PERSONA_GROUPS) {
+ 		if (px_persona->pspi_ngroups > NGROUPS_MAX) {
+@@ -3087,12 +3089,14 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
+ 	}
+ 
+ 	persona = persona_lookup(px_persona->pspi_id);
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	if (!persona) {
+ 		error = ESRCH;
+ 		goto out;
+ 	}
+ 
+ out:
++#endif
+ 	if (persona) {
+ 		persona_put(persona);
+ 	}
+@@ -3112,9 +3116,11 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+ 	 * the kauth with a different UID/GID combo
+ 	 */
+ 	persona = persona_lookup(px_persona->pspi_id);
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	if (!persona) {
+ 		return ESRCH;
+ 	}
++#endif
+ 
+ 	cred = kauth_cred_proc_ref(p);
+ 
+@@ -3140,6 +3146,34 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+ 		    px_persona->pspi_gmuid);
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (persona == NULL) {
++		/*
++		 * SWEET has no personas: adopt the requested credential directly on the
++		 * spawned process and adjust per-ruid process counts as persona_proc_adopt()
++		 * would, avoiding ESRCH in persona-spawning tools and chgproccnt panics on exit.
++		 */
++		__block kauth_cred_t new_cred = cred;
++		__block uid_t old_ruid = KAUTH_UID_NONE;
++		uid_t new_ruid = kauth_cred_getruid(cred);
++
++		(void)proc_update_label(p, true, ^kauth_cred_t (kauth_cred_t cur_cred) {
++			old_ruid = kauth_cred_getruid(cur_cred);
++			if (new_cred != cur_cred) {
++				kauth_cred_ref(new_cred);
++				kauth_cred_unref(&cur_cred);
++			}
++			return new_cred;
++		});
++		kauth_cred_unref(&cred);
++		if (old_ruid != KAUTH_UID_NONE && old_ruid != new_ruid) {
++			(void)chgproccnt(new_ruid, 1);
++			(void)chgproccnt(old_ruid, -1);
++		}
++		return 0;
++	}
++#endif
++
+ 	ret = persona_proc_adopt(p, persona, cred);
+ 
+ 	kauth_cred_unref(&cred);
+@@ -5568,10 +5602,174 @@ bad:
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * sysctl kern.exec_inject holds "LIBRARY NAME NAME ... [; LIBRARY NAME ...]".
++ * Matching programs get DYLD_INSERT_LIBRARIES=LIBRARY[:LIBRARY2...] added to
++ * their initial environment (launchd strips DYLD_* from LaunchDaemons).
++ * Loaded once from /private/var/local/inject.conf (or installed /usr/local/lib
++ * sweet dylibs) in bsdinit_task before launchd starts; sweetinject=0 disables.
++ */
++static TUNABLE(uint32_t, xpcproxy_idversion, "xpcproxy_idversion", 0);
++static char exec_inject_conf[512];
++SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED,
++    exec_inject_conf, sizeof(exec_inject_conf),
++    "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
++
++void sweet_exec_inject_init(void);
++
++static bool
++sweet_file_exists(const char *path, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, ctx) == 0) {
++		vnode_put(vp);
++		return true;
++	}
++	return false;
++}
++
++void
++sweet_exec_inject_init(void)
++{
++	uint32_t on = 1;
++	vfs_context_t ctx;
++	vnode_t vp = NULLVP;
++
++	(void)PE_parse_boot_argn("sweetinject", &on, sizeof(on));
++	if (!on) {
++		printf("SWEET INJECT: disabled (sweetinject=0)\n");
++		return;
++	}
++	if (exec_inject_conf[0] != '\0') {
++		return;
++	}
++	ctx = vfs_context_kernel();
++	if (vnode_open("/private/var/local/inject.conf", FREAD, 0, 0, &vp, ctx) == 0) {
++		char raw[1024];
++		int resid = 0;
++		bzero(raw, sizeof(raw));
++		if (vn_rdwr(UIO_READ, vp, raw, (int)(sizeof(raw) - 1), 0, UIO_SYSSPACE,
++		    IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) == 0) {
++			size_t n = (sizeof(raw) - 1) - (size_t)resid;
++			size_t out = 0;
++			bool in_space = true, need_sep = false, has_tok = false;
++			raw[n] = '\0';
++			for (size_t i = 0; i < n && out + 4 < sizeof(exec_inject_conf); i++) {
++				char c = raw[i];
++				if (c == '#') {
++					while (i < n && raw[i] != '\n') {
++						i++;
++					}
++					c = '\n';
++				}
++				if (c == '\r' || c == '\n' || c == ';') {
++					if (has_tok) {
++						need_sep = true;
++						has_tok = false;
++					}
++					in_space = true;
++				} else if (c == ' ' || c == '\t') {
++					in_space = true;
++				} else {
++					if (need_sep) {
++						exec_inject_conf[out++] = ' ';
++						exec_inject_conf[out++] = ';';
++						exec_inject_conf[out++] = ' ';
++						need_sep = false;
++					} else if (in_space && out > 0) {
++						exec_inject_conf[out++] = ' ';
++					}
++					exec_inject_conf[out++] = c;
++					in_space = false;
++					has_tok = true;
++				}
++			}
++			exec_inject_conf[out] = '\0';
++		}
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	if (exec_inject_conf[0] == '\0') {
++		bool has_media = sweet_file_exists("/usr/local/lib/libsweet_media.dylib", ctx);
++		bool has_sysfix = sweet_file_exists("/usr/local/lib/libsweet_sysfix.dylib", ctx);
++		if (has_media && has_sysfix) {
++			strlcpy(exec_inject_conf,
++			    "/usr/local/lib/libsweet_media.dylib mediaserverd ; "
++			    "/usr/local/lib/libsweet_sysfix.dylib containermanagerd containermanagerd_system SpringBoard",
++			    sizeof(exec_inject_conf));
++		} else if (has_media) {
++			strlcpy(exec_inject_conf,
++			    "/usr/local/lib/libsweet_media.dylib mediaserverd",
++			    sizeof(exec_inject_conf));
++		} else if (has_sysfix) {
++			strlcpy(exec_inject_conf,
++			    "/usr/local/lib/libsweet_sysfix.dylib containermanagerd containermanagerd_system SpringBoard",
++			    sizeof(exec_inject_conf));
++		}
++	}
++	if (exec_inject_conf[0] != '\0') {
++		printf("SWEET INJECT: %s\n", exec_inject_conf);
++	}
++}
++
++static bool
++exec_inject_env(struct image_params *imgp, char *env, size_t size)
++{
++	const char *name, *p = exec_inject_conf;
++	size_t namelen, used;
++	bool any = false;
++
++	if (*p == '\0' || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	namelen = (size_t)imgp->ip_ndp->ni_cnd.cn_namelen;
++	used = strlcpy(env, "DYLD_INSERT_LIBRARIES=", size);
++	while (*p != '\0') {
++		const char *library;
++		size_t liblen;
++		bool matched = false;
++
++		while (*p == ' ' || *p == ';') {
++			p++;
++		}
++		library = p;
++		while (*p != '\0' && *p != ' ' && *p != ';') {
++			p++;
++		}
++		liblen = (size_t)(p - library);
++		while (*p == ' ') {
++			const char *word = ++p;
++
++			while (*p != '\0' && *p != ' ' && *p != ';') {
++				p++;
++			}
++			if (!matched && (size_t)(p - word) == namelen && namelen != 0 && liblen != 0 &&
++			    strncmp(word, name, namelen) == 0) {
++				matched = true;
++			}
++		}
++		if (matched && liblen != 0 && used + 1 + liblen < size) {
++			if (any) {
++				env[used++] = ':';
++			}
++			memcpy(env + used, library, liblen);
++			used += liblen;
++			env[used] = '\0';
++			any = true;
++		}
++	}
++	return any;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	char inject_env[512];
++#endif
+ 	int error = 0;
+ 	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
+ 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
+@@ -5741,6 +5939,21 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (exec_inject_env(imgp, inject_env, sizeof(inject_env))) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+@@ -6618,7 +6831,19 @@ handle_mac_transition:
+ 	}
+ 
+ 	/* Update the process' identity version and set the security token */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * Preserve xpcproxy's pidversion across exec into its target service so
++	 * RunningBoard's pre-exec audit token stays valid (fixes SecTaskLoadEntitlements
++	 * error 3 and Safari WebKit process assertions). xpcproxy_idversion=1 restores
++	 * stock behavior.
++	 */
++	if (xpcproxy_idversion || strncmp(p->p_comm, "xpcproxy", sizeof(p->p_comm)) != 0) {
++		proc_setpidversion(p, OSIncrementAtomic(&nextpidversion));
++	}
++#else
+ 	proc_setpidversion(p, OSIncrementAtomic(&nextpidversion));
++#endif
+ 	task_set_uniqueid(task);
+ 	set_security_token_task_internal(p, task);
+ 
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index ff2c725..219b4c8 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -25,15 +25,21 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/debug.h>
+ #include <kern/startup.h>
++#include <kern/task.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
++#include <mach/vm_param.h>
+ #include <sys/codesign.h>
++#include <sys/kauth.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
++#include <sys/proc_internal.h>
+ #include <sys/systm.h>
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
+ #include <security/mac_policy.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+@@ -283,10 +289,99 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * data (container paths, extension tokens) fail with ENOENT. The first
+  * use of each operation number is logged.
+  */
++/*
++ * Sandbox op 4 (container path for pid / audit token): containerized apps and
++ * app extensions receive CFFIXED_USER_HOME=<container> in their initial stack
++ * environment from RunningBoard / LaunchServices. Answer from the target
++ * process's exec stack strings when present; return ENOENT for uncontainerized
++ * daemons so they do not treat an empty buffer as a container path.
++ */
++#define SWEET_SANDBOX_CONTAINER_VAR     "CFFIXED_USER_HOME="
++
++static int
++sweet_sandbox_container_path(user_addr_t arg)
++{
++	struct {
++		int64_t     pid;
++		uint64_t    pidversion;
++		user_addr_t buffer;
++		user_size_t size;
++		uint64_t    check_pidversion;
++	} args;
++	const size_t prefix_len = sizeof(SWEET_SANDBOX_CONTAINER_VAR) - 1;
++	proc_t p;
++	task_t task;
++	vm_map_t map;
++	vm_map_copy_t copy = NULL;
++	vm_offset_t strings = 0;
++	vm_size_t strings_size;
++	user_addr_t user_stack;
++	size_t argslen, len;
++	const char *s, *end;
++	int error;
++	bool found = false;
++
++	error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	p = proc_find((int)args.pid);
++	if (p == PROC_NULL) {
++		return ESRCH;
++	}
++	if (args.check_pidversion && (uint64_t)proc_pidversion(p) != args.pidversion) {
++		proc_rele(p);
++		return ESRCH;
++	}
++	user_stack = p->user_stack;
++	argslen = (size_t)p->p_argslen;
++	task = proc_task(p);
++	if (user_stack == 0 || argslen == 0 || argslen > (256u * 1024u) || task == TASK_NULL) {
++		proc_rele(p);
++		return ENOENT;
++	}
++	task_reference(task);
++	proc_rele(p);
++	map = get_task_map_reference(task);
++	task_deallocate(task);
++	if (map == VM_MAP_NULL) {
++		return ENOENT;
++	}
++	strings_size = vm_map_round_page(argslen, vm_map_page_mask(map));
++	if (kmem_alloc(kernel_map, &strings, strings_size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		vm_map_deallocate(map);
++		return ENOMEM;
++	}
++	if (vm_map_copyin(map, (vm_map_address_t)(user_stack - strings_size), strings_size, FALSE, &copy) != KERN_SUCCESS) {
++		copy = NULL;
++	}
++	vm_map_deallocate(map);
++	if (copy == NULL || vm_map_copy_overwrite(kernel_map, strings, copy, strings_size, FALSE) != KERN_SUCCESS) {
++		if (copy != NULL) {
++			vm_map_copy_discard(copy);
++		}
++		kmem_free(kernel_map, strings, strings_size);
++		return ENOENT;
++	}
++	end = (const char *)(strings + strings_size);
++	for (s = end - argslen; s < end; s += len + 1) {
++		len = strnlen(s, (size_t)(end - s));
++		if (len > prefix_len && s + len < end && strncmp(s, SWEET_SANDBOX_CONTAINER_VAR, prefix_len) == 0) {
++			s += prefix_len;
++			len -= prefix_len;
++			error = len < (size_t)args.size ? copyout(s, args.buffer, len + 1) : ENAMETOOLONG;
++			found = true;
++			break;
++		}
++	}
++	kmem_free(kernel_map, strings, strings_size);
++	return found ? error : ENOENT;
++}
++
+ static uint64_t sweet_sandbox_seen;
+ 
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -296,6 +391,7 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
++		return sweet_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
+ 	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */
+@@ -306,21 +402,21 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ }
+ 
+ /*
+- * Policy "AMFI" syscalls. dyld asks amfi_check_dyld_policy_self (call 0x5a,
+- * arg = { u64 input flags, user pointer to u64 output flags }) what the
+- * process may do; on error it gets 0 = nothing, and with nothing every
+- * @rpath/@executable_path/@loader_path load fails ("security policy does not
+- * allow @ path expansion"): any app with embedded frameworks. Grant @ paths
+- * always, and DYLD_* variables, fallback paths, interposing, failed
+- * insertions and LC_DYLD_ENVIRONMENT unless the process is restricted
+- * (__RESTRICT segment) or FairPlay encrypted, like a development device.
+- * Other calls fail with ENOPOLICY as before the policy had this name.
++ * Policy "AMFI" syscalls:
++ *   - 0x5a (amfi_check_dyld_policy_self): grant 0xffULL (@ paths, DYLD_INSERT_LIBRARIES
++ *     for kern.exec_inject even on __RESTRICT daemons, interposing, fallback paths)
++ *     unless FairPlay encrypted.
++ *   - 0x60 (amfi_interface_query_bootarg_state): report 0x86ULL (not enforcing) so
++ *     ExtensionKit loads /System/Library/xpc/extensions.plist without an AMFI IOKit
++ *     service, unblocking app extensions, PlugInKit (pkd), and Shortcuts.
+  */
+-#define SWEET_AMFI_DYLD_POLICY_SELF     0x5a
+-#define SWEET_AMFI_DYLD_IN_RESTRICTED   (1ULL << 1)
+-#define SWEET_AMFI_DYLD_IN_ENCRYPTED    (1ULL << 2)
+-#define SWEET_AMFI_DYLD_AT_PATH         (1ULL << 0)
+-#define SWEET_AMFI_DYLD_DEVELOPMENT     0xfaULL         /* path vars, fallback, print, insert failures, interpose, embedded vars */
++#define SWEET_AMFI_DYLD_POLICY_SELF             0x5a
++#define SWEET_AMFI_QUERY_BOOTARG_STATE          0x60
++#define SWEET_AMFI_DYLD_IN_RESTRICTED           (1ULL << 1)
++#define SWEET_AMFI_DYLD_IN_ENCRYPTED            (1ULL << 2)
++#define SWEET_AMFI_DYLD_AT_PATH                 (1ULL << 0)
++#define SWEET_AMFI_DYLD_ALLOW_ALL               0xffULL
++#define SWEET_AMFI_BOOTARG_NOT_ENFORCING        0x86ULL
+ 
+ static uint64_t sweet_amfi_seen[2];
+ 
+@@ -333,6 +429,10 @@ sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
+ 		proc_name(proc_pid(p), name, sizeof(name));
+ 		printf("SWEET AMFI: %s syscall %d\n", name, call);
+ 	}
++	if (call == SWEET_AMFI_QUERY_BOOTARG_STATE) {
++		uint64_t state = SWEET_AMFI_BOOTARG_NOT_ENFORCING;
++		return copyout(&state, arg, sizeof(state));
++	}
+ 	if (call != SWEET_AMFI_DYLD_POLICY_SELF) {
+ 		return ENOPOLICY;
+ 	}
+@@ -345,8 +445,8 @@ sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
+ 		return error;
+ 	}
+ 	uint64_t out = SWEET_AMFI_DYLD_AT_PATH;
+-	if (!(args.input & (SWEET_AMFI_DYLD_IN_RESTRICTED | SWEET_AMFI_DYLD_IN_ENCRYPTED))) {
+-		out |= SWEET_AMFI_DYLD_DEVELOPMENT;
++	if (!(args.input & SWEET_AMFI_DYLD_IN_ENCRYPTED)) {
++		out = SWEET_AMFI_DYLD_ALLOW_ALL;
+ 	}
+ 	return copyout(&out, (user_addr_t)args.output, sizeof(out));
+ }
+@@ -358,11 +458,58 @@ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 
+ /*
+  * Privileges for non-root processes come from MAC policies (priv_check_cred
+- * -> mac_priv_grant); on iOS Sandbox/AMFI grant them. Without a grant UIKit
+- * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
+- * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
+- * Grant that one; log the first denial of each other privilege per process.
++ * -> mac_priv_grant); on iOS Sandbox/AMFI grant them by entitlement. Grant
++ * PRIV_WORK_INTERVAL unconditionally (UIKit/SpringBoard CoreAnimation) and
++ * match standard iOS kernel/network/VFS privileges against the caller's parsed
++ * XML entitlements (privs=0 disables entitlement matching).
+  */
++static const struct {
++	int priv;
++	const char *entitlement;
++} sweet_sandbox_privileges[] = {
++	{ PRIV_PROC_UUID_POLICY, "com.apple.private.kernel.uuid-policy" },
++	{ PRIV_GLOBAL_PROC_INFO, "com.apple.private.kernel.global-proc-info" },
++	{ PRIV_SYSTEM_OVERRIDE, "com.apple.private.kernel.system-override" },
++	{ PRIV_HW_DEBUG_DATA, "com.apple.private.kernel.hw-debug-data" },
++	{ PRIV_SELECTIVE_FORCED_IDLE, "com.apple.private.kernel.selective-forced-idle" },
++	{ PRIV_DARKBOOT, "com.apple.private.kernel.darkboot" },
++	{ PRIV_AUDIO_LATENCY, "com.apple.private.kernel.audio_latency" },
++	{ PRIV_KTRACE_BACKGROUND, "com.apple.private.kernel.ktrace-background" },
++	{ PRIV_SETPRIORITY_DARWIN_ROLE, "com.apple.private.kernel.setpriority-darwin-role" },
++	{ PRIV_PACKAGE_EXTENSIONS, "com.apple.private.kernel.set-package-extensions" },
++	{ PRIV_TRIM_ACTIVE_FILE, "com.apple.private.apfs.trim-active-file" },
++	{ PRIV_PROC_CPUMON_OVERRIDE, "com.apple.private.kernel.override-cpumon" },
++	{ PRIV_VM_PRESSURE, "vm-pressure-level" },
++	{ PRIV_VM_JETSAM, "com.apple.private.kernel.jetsam" },
++	{ PRIV_NET_PRIVILEGED_TRAFFIC_CLASS, "com.apple.private.network.privileged-traffic-class" },
++	{ PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, "com.apple.private.network.socket-delegate" },
++	{ PRIV_NET_INTERFACE_CONTROL, "com.apple.private.network.interface-control" },
++	{ PRIV_NET_PRIVILEGED_NETWORK_STATISTICS, "com.apple.private.network.statistics" },
++	{ PRIV_NET_PRIVILEGED_NECP_POLICIES, "com.apple.private.necp.policies" },
++	{ PRIV_NET_RESTRICTED_AWDL, "com.apple.private.network.awdl.restricted" },
++	{ PRIV_NET_QOSMARKING_POLICY_OVERRIDE, "com.apple.private.network.qos-marking-policy-override" },
++	{ PRIV_NET_RESTRICTED_MULTIPATH_EXTENDED, "com.apple.developer.networking.multipath_extended" },
++	{ PRIV_NET_RESTRICTED_ROUTE_NC_READ, "com.apple.developer.networking.route_nc_read" },
++	{ PRIV_NET_VALIDATED_RESOLVER, "com.apple.private.validated-resolver" },
++	{ PRIV_NET_CUSTOM_PROTOCOL, "com.apple.developer.networking.custom-protocol" },
++	{ PRIV_NET_PRIVILEGED_NECP_DROP_ALL_BYPASS, "com.apple.private.necp.drop_all_bypass" },
++	{ PRIV_NET_PRIVILEGED_IPSEC_WAKE_PACKET, "com.apple.private.network.ipsec-wake-packet" },
++	{ PRIV_NETINET_RESERVEDPORT, "com.apple.private.network.reserved-port" },
++	{ PRIV_NETINET_TCP_KA_OFFLOAD, "com.apple.developer.networking.tcp_ka_offload" },
++	{ PRIV_SKYWALK_REGISTER_USER_PIPE, "com.apple.private.skywalk.register-user-pipe" },
++	{ PRIV_SKYWALK_REGISTER_KERNEL_PIPE, "com.apple.private.skywalk.register-kernel-pipe" },
++	{ PRIV_SKYWALK_REGISTER_NET_IF, "com.apple.private.skywalk.register-net-if" },
++	{ PRIV_SKYWALK_REGISTER_FLOW_SWITCH, "com.apple.private.skywalk.register-flow-switch" },
++	{ PRIV_SKYWALK_OBSERVE_ALL, "com.apple.private.skywalk.observe-all" },
++	{ PRIV_SKYWALK_OBSERVE_STATS, "com.apple.private.skywalk.observe-stats" },
++	{ PRIV_VFS_OPEN_BY_ID, "com.apple.private.vfs.open-by-id" },
++	{ PRIV_VFS_MOVE_DATA_EXTENTS, "com.apple.private.vfs.move-data-extents" },
++	{ PRIV_VFS_SNAPSHOT, "com.apple.private.vfs.snapshot" },
++	{ PRIV_VFS_DATALESS_RESOLVER, "com.apple.private.vfs.dataless-resolver" },
++	{ PRIV_VFS_SETSIZE, "com.apple.private.vfs.setsize" },
++};
++static TUNABLE(uint32_t, sweet_privs_by_entitlement, "privs", 1);
++
+ #define SWEET_PRIV_LOG_MAX      64
+ static struct {
+ 	int  priv;
+@@ -371,11 +518,23 @@ static struct {
+ static int sweet_priv_logged_count;
+ 
+ static int
+-sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
++sweet_sandbox_priv_grant(kauth_cred_t cred, int priv)
+ {
+ 	if (priv == PRIV_WORK_INTERVAL) {
+ 		return 0;
+ 	}
++	if (sweet_privs_by_entitlement && cred == kauth_cred_get()) {
++		proc_t cur = current_proc();
++		for (unsigned i = 0; i < sizeof(sweet_sandbox_privileges) / sizeof(sweet_sandbox_privileges[0]); i++) {
++			if (sweet_sandbox_privileges[i].priv == priv) {
++				if (cur != PROC_NULL &&
++				    sweet_amfi_query_boolean_with_proc(cur, sweet_sandbox_privileges[i].entitlement) == KERN_SUCCESS) {
++					return 0;
++				}
++				break;
++			}
++		}
++	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
+ 	for (int i = 0; i < sweet_priv_logged_count; i++) {
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..19d5917 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -1,8 +1,10 @@
+ /*
+  * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+- * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+- * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+- * See report.md for binary evidence, register provenance and integration.
++ * On RMX1931 (rmxbattery=1, default), bsd/dev/rmx1931_battery.c feeds real
++ * TI BQ28Z610/BQ27541 fuel-gauge + PM8150B charger telemetry via
++ * SweetBatteryReport().
++ * sweetbattery=1: read-only PM6150/PM8150 polling every 30 seconds when no
++ * dedicated board gauge is active.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -12,6 +14,8 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#include "../../../bsd/dev/rmx1931_battery.h"
++
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -23,23 +27,37 @@ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void free(void) APPLE_KEXT_OVERRIDE;
++	void submitBoardState(const struct rmx1931_battery_state *st);
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fHasBoardGauge;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++	void publishBoard(const struct rmx1931_battery_state &st);
+ 	void poll(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
++	static IOReturn reportAction(OSObject *owner, void *arg0, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+ 	static unsigned estimatePercent(unsigned mv);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
++static SweetBattery *gSweetBatteryInstance;
++
++extern "C" void
++SweetBatteryReport(const struct rmx1931_battery_state *state)
++{
++	SweetBattery *inst = gSweetBatteryInstance;
++	if (inst && state && state->valid) {
++		inst->submitBoardState(state);
++	}
++}
++
+ bool
+ SweetBattery::init(OSDictionary *dictionary)
+ {
+@@ -51,7 +69,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fHasBoardGauge = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -97,6 +115,112 @@ SweetBattery::putBool(const char *key, bool value)
+ 	}
+ }
+ 
++void
++SweetBattery::publishBoard(const struct rmx1931_battery_state &st)
++{
++	fHasBoardGauge = true;
++	setBatteryInstalled(st.present);
++	/* Publish SOC directly as 0..100 of 100 so powerd matches fuel-gauge % exactly. */
++	setCurrentCapacity(st.soc);
++	setMaxCapacity(100);
++	setExternalConnected(st.external_connected);
++	setExternalChargeCapable(st.charge_capable);
++	setIsCharging(st.charging);
++	setAtWarnLevel(!st.external_connected && st.soc <= 20);
++	setAtCriticalLevel(false);
++	setVoltage(st.voltage_mv);
++	setAmperage(st.current_ma);
++	setTimeRemaining(-1);
++	setCycleCount(st.cycle_count);
++	putBool("FullyCharged", st.full);
++	putBool("AppleRawExternalConnected", st.external_connected);
++	putNumber("AppleRawCurrentCapacity", st.rem_mah);
++	putNumber("AppleRawMaxCapacity", st.fcc_mah);
++	putNumber("NominalChargeCapacity", st.fcc_mah);
++	putNumber("DesignCapacity", st.design_mah);
++	putNumber("InstantAmperage", (UInt32)st.current_ma);
++	/* iOS battery convention: centidegrees C (e.g. 28.5 C -> 2850). */
++	putNumber("Temperature", (UInt32)(st.temp_deci_c * 10));
++	putBool("SweetBatteryHardwareSampleValid", true);
++	putBool("SweetBatteryCurrentValid", true);
++	putBool("SweetBatterySOCEstimated", false);
++	putBool("SweetBatteryTemperatureEstimated", false);
++	putBool("SweetBatteryFallback", false);
++	putNumber("SweetBatteryPercent", st.soc);
++
++	if (st.external_connected) {
++		OSDictionary *adapter = OSDictionary::withCapacity(4);
++		if (adapter) {
++			OSNumber *watts = OSNumber::withNumber(15u, 32);
++			OSNumber *curr = OSNumber::withNumber(3000u, 32);
++			OSNumber *volt = OSNumber::withNumber(5000u, 32);
++			if (watts) adapter->setObject("Watts", watts);
++			if (curr) adapter->setObject("Current", curr);
++			if (volt) adapter->setObject("Voltage", volt);
++			adapter->setObject("IsWireless", kOSBooleanFalse);
++			OSSafeReleaseNULL(watts);
++			OSSafeReleaseNULL(curr);
++			OSSafeReleaseNULL(volt);
++			setAdapterInfo(0);
++			const OSSymbol *adSym = OSSymbol::withCString("AdapterDetails");
++			if (adSym) {
++				setPSProperty(adSym, adapter);
++				adSym->release();
++			}
++			adapter->release();
++		}
++	}
++
++	OSDictionary *legacy = OSDictionary::withCapacity(7);
++	if (legacy) {
++		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
++		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
++		    kIOBatteryFlagsKey};
++		UInt32 values[] = {st.soc, 100u, st.voltage_mv, (UInt32)st.current_ma,
++		    st.cycle_count,
++		    (UInt32)((st.present ? kIOBatteryInstalled : 0) |
++		    (st.external_connected ? kIOBatteryChargerConnect : 0) |
++		    (st.charging ? kIOBatteryCharge : 0))};
++		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
++			OSNumber *number = OSNumber::withNumber(values[i], 32);
++			if (number) {
++				legacy->setObject(keys[i], number);
++				number->release();
++			}
++		}
++		setLegacyIOBatteryInfo(legacy);
++		legacy->release();
++	}
++	updateStatus();
++	if (fLastMode != 2) {
++		IOLog("SWEET BATTERY: RMX1931 BQ gauge active, %u%% %umV (pack %umV) external=%d charging=%d\n",
++		    st.soc, st.voltage_mv, st.pack_voltage_mv, st.external_connected, st.charging);
++		fLastMode = 2;
++	}
++}
++
++void
++SweetBattery::submitBoardState(const struct rmx1931_battery_state *st)
++{
++	if (fLoop && st) {
++		struct rmx1931_battery_state copy = *st;
++		(void)fLoop->runAction(&SweetBattery::reportAction, this,
++		    &copy, NULL, NULL, NULL);
++	}
++}
++
++IOReturn
++SweetBattery::reportAction(OSObject *owner, void *arg0, void *, void *, void *)
++{
++	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
++	const struct rmx1931_battery_state *st = (const struct rmx1931_battery_state *)arg0;
++	if (!self || !st) {
++		return kIOReturnBadArgument;
++	}
++	self->publishBoard(*st);
++	return kIOReturnSuccess;
++}
++
+ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+@@ -206,6 +330,9 @@ SweetBattery::estimatePercent(unsigned mv)
+ void
+ SweetBattery::poll(void)
+ {
++	if (fHasBoardGauge) {
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -262,13 +389,13 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
++	fLoop = IOWorkLoop::workLoop();
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+-		fLoop = IOWorkLoop::workLoop();
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+@@ -280,6 +407,7 @@ SweetBattery::start(IOService *provider)
+ 			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
+ 		}
+ 	}
++	gSweetBatteryInstance = this;
+ 	registerService();
+ 	return true;
+ }
+@@ -287,6 +415,9 @@ SweetBattery::start(IOService *provider)
+ void
+ SweetBattery::stop(IOService *provider)
+ {
++	if (gSweetBatteryInstance == this) {
++		gSweetBatteryInstance = NULL;
++	}
+ 	if (fLoop && fTimerAdded) {
+ 		/* Serialize against a running timer callback, including rearming. */
+ 		(void)fLoop->runAction(&SweetBattery::stopPolling, this);
+@@ -312,6 +443,9 @@ SweetBattery::stopPolling(OSObject *owner, void *, void *, void *, void *)
+ void
+ SweetBattery::free(void)
+ {
++	if (gSweetBatteryInstance == this) {
++		gSweetBatteryInstance = NULL;
++	}
+ 	OSSafeReleaseNULL(fTimer);
+ 	OSSafeReleaseNULL(fLoop);
+ 	IOPMPowerSource::free();
