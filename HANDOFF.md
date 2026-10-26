@@ -5,6 +5,12 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### Existing kmem RNG fallback was compiled out (kernel 0135, 2026-10-26)
+- While 0134 builds, an explicitly temporary local binary diagnostic corrected only the Firehose copy destination and booted with `firehose_chunk_count=16 firehose_io_pages=8`. Logging then initialized successfully; this is diagnostic evidence, not a Gate 1 pass or a substitute for testing the CI artifact.
+- Next observed panic: `_crypto_random_kmem_ctx_size+0xc`, FAR `0x150`, called by `vm_map_store_crypto_init`; `g_crypto_funcs` is NULL. Patch 0013 already supplies an allocator RNG fallback, but guards it with `SWEET`, which is unavailable in this translation unit. CI's actual compile command defines `ARM64_BOARD_CONFIG_SWEET`.
+- 0135 changes those five guards to `ARM64_BOARD_CONFIG_SWEET`, matching adjacent SWEET crypto wrappers. It does not introduce a new generator or bypass the VM initialization. Pending fresh CI and Gate 1 on the untouched artifact.
+
+
 ### Gate 1 boot fixes: entropy and Firehose header (kernel 0134, 2026-10-26)
 - CI [40284205612](https://github.com/nithinyadavamaraboina-online/ios-rmx1931/actions/runs/40284205612) for `ed7b0f9` (0133) PASSED compilation, final link and packaging. Downloaded kernel SHA-256 verified against artifact SHA256SUMS: `ed03288bdbe75b263f4c3514084db33a6ad7367ec6d5055759b30d2d03325547`.
 - Gate 1 inputs: `sweet-init-v84.macho` SHA-256 `6e6d513bed1736eda72b2f2fdcab83efce3a7612ae41ddce230106061c7f9afd`, QEMU 8.2.2 virt/cortex-a76, boot args `debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0 wdt=-1`, boot_args v2.
