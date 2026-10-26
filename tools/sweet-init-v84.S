@@ -30,7 +30,7 @@
 _start:
 	mov	x9, sp
 	and	x9, x9, #~15
-	sub	sp, sp, #64		/* 64-byte aligned scratch frame */
+	sub	sp, x9, #64		/* 16-byte aligned 64-byte scratch frame */
 
 	adr	x0, path
 	mov	x1, #O_RDWR

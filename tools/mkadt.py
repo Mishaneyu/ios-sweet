@@ -22,6 +22,13 @@ MEM_SIZE = 0x3d000000
 # big, 0xc0000000, so XNU takes 0x1_00000000 up (same size as on the Redmi).
 HIGH_PHYS_BASE = 0x100000000
 HIGH_MEM_SIZE = 0xfcc00000
+# Actual physical LPDDR4X address range for XNU's gDramBase/gDramSize
+# (is_dram_addr() in pmap_map_bd_with_options / wimg_to_pte and pmap_first_pnum).
+# Must cover all physical RAM regions mapped as Write-Combine (0x9d000000 fbcon,
+# <4G USB bounce buffers, 0x1fd000000 /pram, 0x1fe000000 console mirror) while
+# keeping SM8150 MMIO (<0x80000000) outside is_dram_addr().
+DRAM_BASE, DRAM_SIZE = 0x80000000, 0x200000000
+QEMU_DRAM_BASE, QEMU_DRAM_SIZE = 0x40000000, 0x1c0000000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -117,6 +124,7 @@ def node(name, props=(), children=()):
 def build(seed=None, qemu=False, highmem=False, d22ap=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    dram_base, dram_size = (QEMU_DRAM_BASE, QEMU_DRAM_SIZE) if qemu else (DRAM_BASE, DRAM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     # XNU 12377 requires four SHA-512 blocks from PE_get_random_seed;
     # the legacy iOS 16 target requests one block.
@@ -131,8 +139,10 @@ def build(seed=None, qemu=False, highmem=False, d22ap=False):
     chip_id = 0x8015 if d22ap else 0x8030  # A11 Skye (D22AP) vs A13 Cebu (D421AP)
     chosen_props = [
         ph(),
-        ('dram-base', u64(phys_base)),
-        ('dram-size', u64(mem_size)),
+        ('dram-base', u64(dram_base)),
+        ('dram-size', u64(dram_size)),
+        ('sweet-phys-base', u64(phys_base)),
+        ('sweet-mem-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
         ('firmware-version', cstr('flame-shim')),

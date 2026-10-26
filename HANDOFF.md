@@ -1,9 +1,35 @@
 # Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-26, 15:42 IST** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-26, 18:58 IST** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
+
+### OFFICIAL GATE 1a, GATE 1b & GATE 2 PASSED ON UNTOUCHED CI KERNEL 0136 (`xnu-12377.121.6`, iOS 26.5.2 `D421AP` `arm64e`, 2026-10-26)
+- **Kernel**: Untouched GitHub Actions CI artifact from run [40305677449](https://github.com/nithinyadavamaraboina-online/ios-rmx1931/actions/runs/40305677449) (`7c74787`, kernel `0136`), saved at `work/boot/kernel-26-0136` (`21,315,640` B, SHA-256 `66893f5e370b4bb84a537be899bb9c2c3604df6f7f21e5f9f58bb790f54d0ebf`). Zero binary patches or local kernel edits.
+- **Official Gate 1a (QEMU `virt` `-cpu cortex-a76` + `sweet-init-v84.macho`)**:
+  - Boot-args: `debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0 wdt=-1`.
+  - **PASSED**: `*** SWEET v8.4 + arm64e SELF-TEST: ALL 9 SUITES PASSED (PID 1) ***`, `{"status": "no_panic_observed", "unknown_glyphs": 0}` (`work/gate1a-0136/`).
+- **Official Gate 1b (QEMU `virt` `-cpu cortex-a76` + `/home/paink/ios26-qemu-dyld.img` real iOS 26.5.2 `dyld-1378` / `libignition-58~38278` + mixed `arm64e`/`arm64`)**:
+  - Boot-args: `debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0 launchd_unsecure_cache=1 wdt=-1`.
+  - **PASSED**: `*** SWEET DYLD-1378 (iOS 26.5.2) + ARM64E + ARM64 MIXED DYLIB: PASSED (PID 1) ***` (`work/gate1b-0136/`).
+- **Gate 2 Root Causes Isolated & Fixed (Host Tools Only — Zero Kernel Changes)**:
+  1. **Early hardware stop at `arm_init.c:642` (`PE_create_console()` -> `check_for_panic_log()`)**: In `xnu-12377`, `pmap_map_bd_with_options(..., PMAP_MAP_BD_WCOMB)` and `wimg_to_pte(..., VM_WIMG_WCOMB)` check `is_dram_addr(pa)` (`[gDramBase, gDramBase + gDramSize)` from `/chosen` `dram-base`/`dram-size`) and downgrade addresses outside that range to `Device-GRE` (`CACHE_ATTRINDX_POSTED_COMBINED_REORDERED`). `tools/mkadt.py` previously set `dram-base`/`dram-size` to XNU's managed slice (`0x100000000..0x1fcc00000`), leaving `/pram` (`0x1fd000000`), `SWEET_MIRROR_PA` (`0x1fe000000`), `sweet-fbcon` (`0x9d000000`), and `<4G` USB bounce buffers outside `is_dram_addr()`. On real ARMv8.2 Cortex-A55 silicon, `bzero((void *)gPanicBase, gPanicSize)` executed `dc zva` on `Device-GRE` memory, raising a synchronous Alignment Fault (`ESR_EC=0x25`, `FSC=0x21`) and faulting recursively inside `SavePanicInfo()` (whereas QEMU TCG does not fault on `dc zva` to Device memory). Fixed in `tools/mkadt.py` and `tools/mkpayload.py` by setting `/chosen` `dram-base`/`dram-size` to physical LPDDR4X (`0x80000000`, `0x200000000` on SM8150; `0x40000000`, `0x1c0000000` on QEMU) while passing XNU's managed slice via `sweet-phys-base`/`sweet-mem-size`.
+  2. **PID 1 `handle_sp_align` in `tools/sweet-init-v84.S`**: `and x9, x9, #~15` was followed by `sub sp, sp, #64` instead of `sub sp, x9, #64`, faulting on `str x0, [sp]` (`0x1000004c4`) when `exec_mach_imgact` left `sp % 16 == 8` with the longer hardware cmdline. Fixed to `sub sp, x9, #64`.
+- **Official Gate 2 (`RMX1931` non-destructive `rd=md0` hardware boot, `userdata` `/dev/block/sda16` untouched, `backup/boot.img` restored)**:
+  - Boot-args: `debug=0xc serial=3 cpus=8 keepsyms=1 wdt=-1 rd=md0 sweetprobe=1 sweetgpu=1 sweetrtcoff=1792944948 ufsroot=rawdump ufsrw=1 ufslogsecs=2 rmxtouchdelay=2 rmxtouchlog=1 flamereboot=30`.
+  - **PASSED (`work/boot/gate2-rmx1931-ios26-rd.log`)**:
+    - `Darwin Kernel Version 25.5.0: Mon Oct 26 10:21:14 UTC 2026; runner:xnu.obj/DEVELOPMENT_ARM64_SWEET`
+    - `SWEET CPU: 8/8 CPUs initialized, SGI1 verified` (`A55 x4` @ `1785 MHz`, `A76 x3` @ `2419 MHz`, `A76 prime` @ `2956 MHz`)
+    - `SWEET FB: AppleCLCD 1080x2400 stride 4320 at 0x9d000000, default surface 1, presented as 1125x2436`
+    - `SWEET UFS: "rawdump" on LUN 0: first block 0x1c9208, 128 MiB, read-write, DMA at 0x104c84000`
+    - `SWEET USB: DWC3 GSNPSID 0x33313130`
+    - `*** SWEET v8.4 + arm64e SELF-TEST: ALL 9 SUITES PASSED (PID 1) ***` (all 10 EL1 `sleh.c` instruction classes verified on real Kryo 485 silicon in `<2 ms`)
+    - `SWEET GPU: bring-up done, GPU ready in 286 ms (pool 0x105000000)` (`gmu: init result babeface BOOTED`, `675 MHz`, `zap: auth and reset rc 0`)
+    - `RMX TOUCH: Synaptics S3706 ready (1080x2400, 10 fingers, poll=4ms/8ms)` (`product="S3706A" fwid=0xcc183013`)
+    - 10 `SWEET init-v84: still alive` heartbeats through `flamereboot=30`, clean return to Fastboot at `+67s`, `backup/boot.img` restored.
+- **Still open — Gate 3**: Stream `/home/paink/ios26-root-rmx1931.img` (`30 GiB`) to `/dev/block/sda16` (`userdata`) **only after explicit user confirmation**, boot full iOS 26.5.2 (`23F84`) userland (`rd=ufsroot0`), and verify `launchd`, `backboardd`, `SpringBoard`, `SweetMetal2` (`Adreno 640`), touch, USB/SSH, and Wi-Fi.
+
 
 ### Kernel 0135 built cleanly on CI; Gate 1 preflight findings folded into kernel 0136 (2026-10-26)
 - CI [40295879220](https://github.com/nithinyadavamaraboina-online/ios-rmx1931/actions/runs/40295879220) (`7852c4a`, kernel `0135`) PASSED compilation, final link and packaging. Downloaded `kernel.development.sweet` (`work/boot/kernel-26-0135`, `21,315,648` B) and verified SHA-256 `a905e3d7a19fec3583907f8582ec3b854398cd33248195aea2fae68ae9bc163d`.

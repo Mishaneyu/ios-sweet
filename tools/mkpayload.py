@@ -181,11 +181,12 @@ def add_gpufw_to_adt(adt_blob, fw_dir):
 
 
 def adt_dram(adt_blob):
-    """Kernel-managed RAM <base, size> from the ADT's /chosen dram-base/dram-size."""
+    """Kernel-managed RAM <base, size> from /chosen sweet-phys-base/sweet-mem-size (or dram-base/size)."""
     root, _ = adt.parse(adt_blob)
     chosen = next(c for c in root.children if c.name == 'chosen')
-    return (struct.unpack('<Q', chosen.prop('dram-base'))[0],
-            struct.unpack('<Q', chosen.prop('dram-size'))[0])
+    pbase = chosen.prop('sweet-phys-base') or chosen.prop('dram-base')
+    msize = chosen.prop('sweet-mem-size') or chosen.prop('dram-size')
+    return (struct.unpack('<Q', pbase)[0], struct.unpack('<Q', msize)[0])
 
 
 def build(kernel_path, adt_path, cmdline, ramdisk_path=None, poke_path=None, gpufw_dir=None, bootargs_v1=False):
