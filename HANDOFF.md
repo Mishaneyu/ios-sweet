@@ -1,26 +1,32 @@
 # Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-26, 06:03 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-26, 06:50 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
 
-### METAL/TURNIP SMOOTHNESS CONFIRMED (Boot #7, kernel 0128) + BACKLIGHT, WI-FI, DIRECT SWAP PRESENT & OVERLAY IN KERNEL 0129 (2026-10-26, 06:03)
-- **Boot #7 (`shim/out/shim-rmx1931-ios.img`, kernel `0128`, `flamereboot=3600`)**:
-  - User confirmed UI smoothness improved substantially once `/private/var/local/m2v-cache` (`0777`), `675 MHz` Adreno 640 Prime OPP, and `4 ms` touch polling took effect, and reported remaining items: frame pacing still below locked 60 fps, Wi-Fi stuck on "Connecting...", brightness slider & auto-brightness inactive, custom default wallpaper requested, and Phone dialer / Bluetooth status.
-- **Root causes found from `boot6-ios.log` + `dtb/live.dtb` + `d22ap.adt`**:
-  1. **Wi-Fi (`WCN3990`)**: `RMX1931`'s `pil_wlan_fw_region` is `0x9b000000 + 0x180000` (1.5 MiB), whereas `phone/wifi/wlfw.c` had `MSA_SIZE = 0x100000u` (1 MiB), causing `wlfw_start()` (`wlfw.c:274`) to reject the MSA region before mission mode. Also `RMX1931`'s `modemr.jsn` includes `tms/pdr_enabled` on `msm/modem/root_pd`, and `configd` starts at `~13 s` before `wland` publishes `en0` (`~22 s`), writing a `preferences.plist` without an `en0` DHCP service.
-  2. **Brightness slider**: `IODeviceTree:/backlight` and `AppleARMBacklight` were absent, so `CoreBrightness` / `BacklightServices` had no service to drive.
-  3. **Frame pacing / background CPU spikes**:
-     - `AppleCLCD::swap()` only buffered `fPending` until the unsynchronized 60 Hz software timer `vsyncFired` woke up (`0..16.7 ms` extra latency + beat-frequency dropped frames), instead of queuing the 16 us async 2D present IB directly behind `backboardd`'s Turnip render IB on `SwapEnd`.
-     - `com.apple.bluetoothd` (90 crash-restarts in Boot #6) and `com.apple.fairplayd.H2` (89 crash-restarts + deadlocks `locationd`) were still enabled in `launchd.plist`, and the default `7400.WWDC_2022` wallpaper used a 3-layer `.ca` `LayeredAnimation`.
-- **Fixes in Kernel 0129 (`xnu/patches/0129-rmx1931-backlight-wifi-fps-overlay.patch`) + `wland` + `tools/`**:
-  - **Wi-Fi (`phone/wifi/*`, `bsd/dev/flame_sta.c`, `bsd/dev/redwood_apple80211.c`)**: `MSA_SIZE = 0x180000u`, `tms/pdr_enabled` in `pdmapper.c`, `bridge_link(1)` ordered before `FW_JOIN_DONE(0)` in the already-joined shortcut, automatic `SystemConfiguration/preferences.plist` `en0` check + `configd` restart 800 ms after `FW_HELLO`, `flame_wlan_link_bss` priority in `sta_join`, and open-vs-WPA2 `AUTH_TYPE` (`capability & 0x0010`).
-  - **Brightness slider (`tools/mkadt.py`, `KernelConfigTables.cpp`, `SweetFramebuffer.cpp`, `sweet_gpu.c`)**: `/backlight` node with `D22AP` calibration constants (`LminProduct`/`LmidProduct`/`LmaxProduct`, `user-accessible-max-nits=625`), `AppleARMBacklight::setProperties("brightness-nits")` with `isqrt` gamma-2.0 perceptual curve (`8%..100%` sRGB), and tear-free off-screen staged 2D dimming (`DISPLAY_DIM_OFF = 0x410000`) + static-screen refresh.
-  - **Direct `SwapEnd` GPU present (`SweetFramebuffer.cpp`)**: `AppleCLCD::swap()` (`sweetfb_direct=1`, default on) queues `present()` immediately when `sweet_gpu_ready() && fFlushTicks == 1 && !fPowerOff`.
-  - **In-place root overlay (`tools/mkpayload.py --overlay`, `bsd/vfs/vfs_syscalls.c`, `bsd/kern/bsd_init.c`)**: unpacks `/chosen/sweet-overlay` POSIX `ustar` + `.sweet-rm` unlinks once per FNV-1a stamp (`/private/var/local/.overlay-stamp`) before `launchd` starts, updating `wland`, `launchd.plist` (`bluetoothd` + `fairplayd.H2` removed), and the `Still` default wallpaper without re-flashing 16 GiB `sda16`.
+### BOOT #8 LAUNCHED (kernel 0129) + BOOT #7 HARDWARE TELEMETRY VERIFIED (2026-10-26, 06:50)
+- **Boot #7 (`shim/out/shim-rmx1931-ios.img`, kernel `0128`, `flamereboot=3600`) — observed on hardware (`work/boot/boot7-ios.log`, `603,135 B`, 232 `SWEETLOG` flushes over `542 s`, clean SpringBoard shutdown at `537.25 s`)**:
+  - **Adreno 640 3D Metal2 + 675 MHz Prime OPP**:
+    - `[5.295] SWEET: local dirs ready (var/local=0 m2v-cache=0 dropbear=0)`
+    - `[5.517] SWEET GPU: hfi: perf/bw tables, core fw start, start, perf vote 675 MHz -> 0`
+    - `[10.440] MTL2[59 backboardd]: device Turnip Adreno (TM) 640 in 1246 ms (cache /var/local/m2v-cache/backboardd)`
+    - Rendered `6,000+` swaps across Lock Screen, Home Screen, and Settings (`5s` averages up to `28.2 fps`, `429 submits`, `GPU busy 40%`, `364 MB` peak GPU pool, `0 missed` submits).
+  - **Exact Wi-Fi "Connecting..." root cause confirmed in `boot7-ios.log`**:
+    - `wland` brought up `WCN3990` mission mode cleanly at `[53.995] flame wlan: the radio is up (02:50:49:58:45:4c): en0 for wifid`, scanned nearby APs, and completed WPA2 association + 4-way handshake in `1.458 s` (`[301.987] ASSOCIATE -> [303.445] net: the link (wcn3990) is up; flame wifi: join -> 0; STATE=4; CURRENT_NETWORK=answered`).
+    - However, `configd` had started at `[7.429]` and written `SystemConfiguration/preferences.plist` at `[9.456]` (`lo0` only) before `en0` existed (`53.995 s`), so `configd` never created an `en0` DHCP service (`zero` `SWEET NET: configd en0` lines after `303.445 s`), leaving Settings spinning waiting for an IPv4 lease.
+  - **Remaining items from Boot #7**:
+    - `AppleCLCD::swap()` buffered `fPending` until the unsynchronized 60 Hz software timer (`0..16.7 ms` extra latency + beat-frequency frame drops), while `bluetoothd` and `fairplayd.H2` respawned every 10 s (`309.05 s`, `319.12 s`, ...).
+    - `IODeviceTree:/backlight` and `AppleARMBacklight` were absent (brightness slider inactive), and `7400.WWDC_2022` used `.HEIC`-backed 3-layer `.ca` `LayeredAnimation`.
+- **Boot #8 (`shim/out/shim-rmx1931-ios.img`, `48beeccd...`, kernel `0129` `6e04eba2...`)**:
+  - Boot-args: `debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 sweetfb_direct=1 ufslogsecs=2 sweetgpu=1 sweetgpufreq=6 sweetmtl=2 sweetusb=2 sweetusbframes=0 sweetrtcoff=1792944948 rmxtouchdelay=2 flamereboot=7200`.
+  - **Kernel `0129` (`xnu/patches/0129-rmx1931-backlight-wifi-fps-overlay.patch`, CI run `40251109001`) + `wland` (`userland.yml` run `40249988919`) + `--overlay work/boot/rmx1931-overlay.tar` (`aa0b79fc064ab8d2`)**:
+    1. **Wi-Fi DHCP & join (`phone/wifi/*`, `flame_sta.c`, `redwood_apple80211.c`, `.sweet-rm`)**: `.sweet-rm` unlinks stale `preferences.plist`/`NetworkInterfaces.plist` before `launchd` starts, and `wland`'s `ensure_en0_configd()` checks `preferences.plist` 800 ms after `FW_HELLO` and restarts `configd` once if `"en0"` is missing so iOS creates and persists the `en0` DHCP service; `MSA_SIZE = 0x180000u` matching `pil_wlan_fw_region`, `tms/pdr_enabled` in `pdmapper.c`, `flame_wlan_link_bss` priority in `sta_join`, and open-vs-WPA2 `AUTH_TYPE` (`capability & 0x0010`).
+    2. **Brightness slider (`tools/mkadt.py`, `KernelConfigTables.cpp`, `SweetFramebuffer.cpp`, `sweet_gpu.c`)**: `/backlight` ADT node with `D22AP` calibration constants + `AppleARMBacklight` (`brightness-nits` Q16.16 -> `isqrt` gamma-2.0 perceptual curve -> tear-free off-screen staged Adreno 640 2D AMOLED dimming at `DISPLAY_DIM_OFF = 0x410000` + static-screen refresh).
+    3. **Direct `SwapEnd` GPU present & daemon cleanup**: `AppleCLCD::swap()` (`sweetfb_direct=1`) queues `present()` directly on `SwapEnd`; `launchd.plist` in overlay strips `com.apple.bluetoothd` and `com.apple.fairplayd.H2`; warm `/var/local/m2v-cache` preserved on `sda16`.
+    4. **Default wallpaper (`7400.WWDC_2022-375w-812h@3x~iphone.wallpaper`)**: pre-`launchd` `sweet_apply_overlay()` unpacks `1125x2436` `Wallpaper.png` + `375x812` `Thumbnail.png` + `Still` `Wallpaper.plist` and unlinks stale SpringBoard `.cpbitmap` caches.
 - **Open (next)**:
-  1. Build `kernel-0129` (`xnu.yml`) + `wland` (`userland.yml`), pack `shim-rmx1931-ios.img` with `--overlay work/boot/rmx1931-overlay.tar`, pull Boot #7 `SWEETLOG`, and boot **Boot #8**.
+  1. Collect user feedback & `SWEETLOG` from **Boot #8** (verify `en0` DHCP lease + internet, brightness slider `SWEET BL` logs, direct `SwapEnd` frame pacing, and `Still` PNG default wallpaper).
   2. Unsupported hardware subsystems (no drivers yet): cellular baseband/IMS (`MobilePhone.app`), `WCN3990` UART HCI (`Bluetooth`), and SLPI/ADSP SSC ambient light sensor (Auto-Brightness).
 
 ### INTERACTIVE iOS 16.7.16 UI ON RMX1931 (Boot #6, kernel 0127) + ROOT CAUSE OF CPU FALLBACK FIXED IN KERNEL 0128 (2026-10-26, 04:20)
