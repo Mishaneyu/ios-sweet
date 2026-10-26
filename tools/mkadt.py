@@ -118,7 +118,12 @@ def build(seed=None, qemu=False, highmem=False, d22ap=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
-    seed = seed if seed is not None else os.urandom(64)
+    # XNU 12377 requires four SHA-512 blocks from PE_get_random_seed;
+    # the legacy iOS 16 target requests one block.
+    seed_size = 64 if d22ap else 256
+    seed = seed if seed is not None else os.urandom(seed_size)
+    if len(seed) != seed_size:
+        raise ValueError(f'{"D22AP" if d22ap else "D421AP"} requires {seed_size} random-seed bytes, got {len(seed)}')
     cl4_entropy = b''.join(hashlib.sha512(seed + bytes([i])).digest() for i in range(3))  # 192 bytes
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))

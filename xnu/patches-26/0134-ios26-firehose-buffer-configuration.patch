@@ -1,0 +1,45 @@
+From 8d1668fe275b475dc7b9bf3e690d9f0c49c617b5 Mon Sep 17 00:00:00 2001
+From: Nithin Amaraboina <48430674+nithinpain@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 13:08:44 +0530
+Subject: [PATCH] Match firehose compatibility header to linked libdispatch
+ buffer configuration
+
+---
+ EXTERNAL_HEADERS/os/firehose_buffer_private.h | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/EXTERNAL_HEADERS/os/firehose_buffer_private.h b/EXTERNAL_HEADERS/os/firehose_buffer_private.h
+index 40ef0ed..1464aca 100644
+--- a/EXTERNAL_HEADERS/os/firehose_buffer_private.h
++++ b/EXTERNAL_HEADERS/os/firehose_buffer_private.h
+@@ -11,9 +11,15 @@ struct firehose_buffer_range_s {
+     uint16_t fbr_length;
+ };
+ 
+-#define FIREHOSE_BUFFER_KERNEL_CHUNK_COUNT 1
+-#define FIREHOSE_BUFFER_KERNEL_DEFAULT_CHUNK_COUNT 64
+-#define FIREHOSE_BUFFER_KERNEL_DEFAULT_IO_PAGES 0
++/* Keep this compatibility surface in sync with libdispatch-1542.100.32.
++ * The boot chunk belongs at the end of the buffer, never over its header. */
++extern uint8_t __firehose_buffer_kernel_chunk_count;
++extern uint8_t __firehose_num_kernel_io_pages;
++#define FIREHOSE_BUFFER_KERNEL_MIN_CHUNK_COUNT 16
++#define FIREHOSE_BUFFER_KERNEL_MAX_CHUNK_COUNT 64
++#define FIREHOSE_BUFFER_KERNEL_CHUNK_COUNT __firehose_buffer_kernel_chunk_count
++#define FIREHOSE_BUFFER_KERNEL_DEFAULT_CHUNK_COUNT FIREHOSE_BUFFER_KERNEL_MIN_CHUNK_COUNT
++#define FIREHOSE_BUFFER_KERNEL_DEFAULT_IO_PAGES 8
+ 
+ __BEGIN_DECLS
+ 
+@@ -31,7 +37,7 @@ void __firehose_allocate(vm_offset_t *addr, vm_size_t size);
+ void __firehose_critical_region_enter(void);
+ void __firehose_critical_region_leave(void);
+ 
+-bool __firehose_kernel_configuration_valid(uint32_t chunk_count, uint32_t io_pages);
++int __firehose_kernel_configuration_valid(uint8_t chunk_count, uint8_t io_pages);
+ firehose_buffer_t __firehose_buffer_create(size_t *size);
+ bool __firehose_merge_updates(firehose_push_reply_t reply);
+ 
+-- 
+2.53.0.windows.1
+

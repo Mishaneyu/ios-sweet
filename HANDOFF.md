@@ -5,6 +5,15 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### Gate 1 boot fixes: entropy and Firehose header (kernel 0134, 2026-10-26)
+- CI [40284205612](https://github.com/nithinyadavamaraboina-online/ios-rmx1931/actions/runs/40284205612) for `ed7b0f9` (0133) PASSED compilation, final link and packaging. Downloaded kernel SHA-256 verified against artifact SHA256SUMS: `ed03288bdbe75b263f4c3514084db33a6ad7367ec6d5055759b30d2d03325547`.
+- Gate 1 inputs: `sweet-init-v84.macho` SHA-256 `6e6d513bed1736eda72b2f2fdcab83efce3a7612ae41ddce230106061c7f9afd`, QEMU 8.2.2 virt/cortex-a76, boot args `debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0 wdt=-1`, boot_args v2.
+- First run panicked in `prng_random.c`: XNU 12377 needs 256 bootloader entropy bytes, but the ADT had 64. `tools/mkadt.py` now generates/requires 256 bytes for D421AP and retains 64 for legacy D22AP. Serialized lengths and rejection of short explicit seeds checked.
+- With regenerated `--qemu` ADT, kernel passed VM initialization but stalled after OSLog initialization for 120 seconds. Gate 1 has NOT passed: no nine-suite success marker. Repeated CPU samples: PC `_dispatch_firehose_gate_wait+0xc`, through `__firehose_buffer_tracepoint_reserve` and `log_payload_send`; allocator word `0x40004`.
+- Root cause confirmed in kernel disassembly: staged `EXTERNAL_HEADERS/os/firehose_buffer_private.h` defines `FIREHOSE_BUFFER_KERNEL_CHUNK_COUNT` as 1, so `__firehose_allocate` copies the early boot chunk over the buffer header. `0134` matches libdispatch-1542.100.32's variable chunk count, default 16 chunks/8 IO pages, and configuration-query ABI. Logging remains enabled.
+- Pending: build 0134, rerun Gate 1 with the regenerated ADT, require explicit `ALL 9 SUITES PASSED`. Local captures are in ignored `work/gate1-0133-seed256/`. No phone partitions touched.
+
+
 ### iOS 26 compiles; final link query supplied: kernel 0133 (2026-10-26, 12:41 IST)
 - CI `40283186822` (`8fa7188`, kernel 0132) compiled all kernel translation units successfully. Final link failed only on `_ml_device_is_prod_fused`, referenced by `sysctl_load_devicetree_entries` in `kern_mib.o`.
 - `0133-ios26-production-fuse-query.patch` supplies the missing query under `#if defined(SWEET)` in `osfmk/arm64/machine_routines.c`. It returns TRUE, matching XNU's conservative x86 fallback instead of inventing an Apple fuse-controller probe on Qualcomm. This does not inspect or modify Qualcomm fuse state.

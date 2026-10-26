@@ -132,3 +132,5 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 - 0132 iOS 26: use current interrupt-debug / VM region APIs in SWEET diagnostics, declare the existing console flag, and supply pinned dxb browser-engine entitlement constants for NECP and exec.
 
 - 0133 iOS 26: supply `ml_device_is_prod_fused` for SWEET using XNU's conservative x86 fallback (TRUE), resolving the sole remaining kernel 0132 link error.
+
+- iOS 26 patch 0134: match Firehose chunk-count configuration and ABI to libdispatch; prevent early-boot log copy from corrupting buffer header.
