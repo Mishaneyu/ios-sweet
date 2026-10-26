@@ -18,9 +18,9 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
-    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, Library, LoadAction,
+    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
     MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
@@ -724,6 +724,46 @@ pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: 
             buffer.new_texture(&descriptor, offset, bytes_per_row)
         };
         Ok(boxed(NmbTexture(texture.map_err(e("texture over buffer"))?)))
+    })
+}
+
+#[repr(C)]
+pub struct NmbSurfacePlane {
+    pub offset: u64,
+    pub bytes_per_row: u64,
+    pub planar: bool,
+    pub has_ycbcr: bool,
+    pub pixel_format: u32,
+    pub plane: u64,
+    pub width: u64,
+    pub height: u64,
+    pub chroma_offset: u64,
+    pub chroma_bytes_per_row: u64,
+    pub matrix: *const c_char,
+}
+
+/// # Safety
+/// `plane` and any non-null `plane.matrix` C string are valid for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_texture_new_iosurface(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor,
+                                                   plane: *const NmbSurfacePlane) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || {
+        let descriptor = texture_descriptor(descriptor)?;
+        let buffer = &get(buffer)?.0;
+        let p = get(plane)?;
+        let mut surf_plane = IoSurfacePlane::new(p.offset, p.bytes_per_row, p.planar);
+        if p.has_ycbcr {
+            let mut ycbcr = IoSurfaceYCbCr::new(p.pixel_format, p.plane, [p.width, p.height], p.chroma_offset, p.chroma_bytes_per_row);
+            if !p.matrix.is_null() {
+                // SAFETY: caller's contract.
+                if let Ok(m) = unsafe { CStr::from_ptr(p.matrix) }.to_str() {
+                    ycbcr = ycbcr.with_matrix(SurfaceYCbCrMatrix::from_attachment(m));
+                }
+            }
+            surf_plane = surf_plane.with_ycbcr(ycbcr);
+        }
+        let texture = buffer.new_texture_with_iosurface_plane(&descriptor, surf_plane);
+        Ok(boxed(NmbTexture(texture.map_err(e("texture over iosurface"))?)))
     })
 }
 

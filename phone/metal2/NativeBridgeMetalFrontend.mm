@@ -129,6 +129,7 @@ static void waitForResource(id resource);
 @property(nonatomic) NmbTextureDescriptor descriptor;
 @property(nonatomic,strong) NBBuffer *buffer;
 @property(nonatomic) IOSurfaceRef surface;
+@property(nonatomic) NSUInteger surfacePlane;
 @property(nonatomic) NSUInteger offset,rowBytes;
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
@@ -209,7 +210,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
 - (BOOL)isFramebufferOnly {return NO;}
 - (IOSurfaceRef)iosurface {return _surface;}
-- (NSUInteger)iosurfacePlane {return 0;}
+- (NSUInteger)iosurfacePlane {return _surfacePlane;}
 - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
 - (NSUInteger)bufferOffset {return _offset;}
 - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
@@ -225,7 +226,7 @@ NB_RESOURCE_SPI
  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
- if(_surface)view.surface=(IOSurfaceRef)CFRetain(_surface);
+ if(_surface){view.surface=(IOSurfaceRef)CFRetain(_surface);view.surfacePlane=_surfacePlane;}
  return (id<MTLTexture>)view;
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
@@ -260,8 +261,9 @@ static void flushSurfaces(NSMutableSet *surfaces) {
  if(!surfaces.count)return;
  std::vector<std::pair<uintptr_t,size_t>> ranges;
  ranges.reserve(surfaces.count);
+ const size_t page=(size_t)getpagesize();
  for(NBTexture *texture in surfaces)if(texture.surface)
-  ranges.emplace_back(reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(texture.surface)),IOSurfaceGetAllocSize(texture.surface));
+  ranges.emplace_back(reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(texture.surface))&~(page-1),IOSurfaceGetAllocSize(texture.surface));
  std::sort(ranges.begin(),ranges.end());
  const auto last=std::unique(ranges.begin(),ranges.end());
  gSurfaceFlushDuplicates+=(uint64_t)(ranges.end()-last);
@@ -1413,13 +1415,53 @@ static char sweetMemoryOwnerKey;
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
- if(!surface || !d || plane || IOSurfaceGetPlaneCount(surface))return nil;
- void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
- if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
+ if(!surface || !d)return nil;
+ const size_t planeCount=IOSurfaceGetPlaneCount(surface);
+ if(planeCount?plane>=planeCount:plane!=0)return nil;
+ void *rawBase=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
+ if(!page || (page&(page-1)) || !rawBase || !allocation || allocation>SIZE_MAX-(page-1))return nil;
+ void *base=(void *)((uintptr_t)rawBase&~(page-1));
  const size_t bytes=(allocation+page-1)&~(page-1);
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
- NBTexture *texture=textureOnBuffer(buffer,d,0,IOSurfaceGetBytesPerRow(surface),true);if(!texture)return nil;
- texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+ NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+ uint64_t offset=0,rowBytes=0;
+ if(planeCount) {
+  void *planeBase=IOSurfaceGetBaseAddressOfPlane(surface,plane);
+  if(!planeBase || (uintptr_t)planeBase<(uintptr_t)base)return nil;
+  offset=(uint64_t)((uintptr_t)planeBase-(uintptr_t)base);
+  rowBytes=(uint64_t)IOSurfaceGetBytesPerRowOfPlane(surface,plane);
+ } else {
+  offset=(uint64_t)((uintptr_t)rawBase-(uintptr_t)base);
+  rowBytes=(uint64_t)IOSurfaceGetBytesPerRow(surface);
+ }
+ NmbSurfacePlane sp={};
+ sp.offset=offset;sp.bytes_per_row=rowBytes;sp.planar=planeCount>0;
+ char matrixBuf[64]={};
+ if(planeCount>=2) {
+  void *chromaBase=IOSurfaceGetBaseAddressOfPlane(surface,1);
+  if(chromaBase && (uintptr_t)chromaBase>=(uintptr_t)base) {
+   sp.has_ycbcr=true;
+   sp.pixel_format=(uint32_t)IOSurfaceGetPixelFormat(surface);
+   sp.plane=(uint64_t)plane;
+   sp.width=(uint64_t)IOSurfaceGetWidth(surface);
+   sp.height=(uint64_t)IOSurfaceGetHeight(surface);
+   sp.chroma_offset=(uint64_t)((uintptr_t)chromaBase-(uintptr_t)base);
+   sp.chroma_bytes_per_row=(uint64_t)IOSurfaceGetBytesPerRowOfPlane(surface,1);
+   CFTypeRef mv=IOSurfaceCopyValue(surface,CFSTR("IOSurfaceYCbCrMatrix"));
+   if(mv) {
+    if(CFGetTypeID(mv)==CFStringGetTypeID() && CFStringGetCString((CFStringRef)mv,matrixBuf,sizeof matrixBuf,kCFStringEncodingUTF8))
+     sp.matrix=matrixBuf;
+    CFRelease(mv);
+   }
+  }
+ }
+ NmbTexture *handle=nmb_texture_new_iosurface(buffer.handle,&descriptor,&sp);
+ noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+ if(!handle){NBLOG(@"native-metal: texture over iosurface (plane %lu/%lu fmt %u ostype 0x%x) refused: %@",(unsigned long)plane,(unsigned long)planeCount,(unsigned)descriptor.format,(unsigned)IOSurfaceGetPixelFormat(surface),lastError());return nil;}
+ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+ texture.buffer=buffer;texture.offset=(NSUInteger)offset;texture.rowBytes=(NSUInteger)rowBytes;
+ texture.surface=(IOSurfaceRef)CFRetain(surface);texture.surfacePlane=plane;
+ return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);

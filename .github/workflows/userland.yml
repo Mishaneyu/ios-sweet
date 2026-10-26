@@ -68,12 +68,13 @@ jobs:
           done
           ls -la work/dxb/xnu/bsd/dev/
 
-      - name: Build wland, gpu/pmem, media/audio, and phone/tools
+      - name: Build wland, gpu/pmem, media/audio, store, and phone/tools
         run: |
           sh phone/wifi/build.sh
           sh phone/gpu/build.sh
           sh phone/media/build.sh
           sh phone/audio/build.sh
+          sh phone/store/build.sh
           bash phone/tools/build.sh
 
       - name: Build Mesa Turnip (libvulkan_freedreno.dylib) for iOS 16 arm64
@@ -190,19 +191,21 @@ jobs:
 
       - name: Package userland bundle
         run: |
-          mkdir -p dist-userland/bin dist-userland/Extensions dist-userland/lib dist-userland/HAL
+          mkdir -p dist-userland/bin dist-userland/Extensions dist-userland/lib dist-userland/HAL dist-userland/Applications
           if [ -d phone/metal2/out/SweetMetal2.bundle ]; then
             cp -R phone/metal2/out/SweetMetal2.bundle dist-userland/Extensions/
           fi
           cp phone/media/out/libsweet_media.dylib phone/media/out/libsweet_sysfix.dylib dist-userland/lib/
           cp -R phone/audio/out/HakiosAudio.driver dist-userland/HAL/
+          cp -R phone/store/out/SweetStore.app dist-userland/Applications/
+          cp phone/store/out/sweetstored dist-userland/bin/
           cp phone/metal2/out/m2vtest dist-userland/bin/ 2>/dev/null || true
           cp phone/wifi/out/wland dist-userland/bin/
           cp phone/gpu/out/gpu phone/gpu/out/pmem dist-userland/bin/
           cp phone/tools/out/* dist-userland/bin/
           cp work/userland/stage/* dist-userland/bin/ 2>/dev/null || true
           tar czf ios-userland.tar.gz -C dist-userland .
-          ls -lh ios-userland.tar.gz dist-userland/bin dist-userland/Extensions dist-userland/lib dist-userland/HAL
+          ls -lh ios-userland.tar.gz dist-userland/bin dist-userland/Extensions dist-userland/lib dist-userland/HAL dist-userland/Applications
 
       - uses: actions/upload-artifact@v4
         with:

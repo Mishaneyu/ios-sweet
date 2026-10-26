@@ -1,0 +1,220 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 423042f..6c2f4aa 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -43,7 +43,9 @@
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceSetYCbCrMatrix     = 5,
+ 	kSweetSurfaceLimits             = 13,
++	kSweetSurfaceSetBulkAttachments = 27,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
+ };
+@@ -65,6 +67,11 @@ enum {
+ #define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
++#define SWEET_SURFACE_STATE_YCBCR       0x24    /* u32 YCbCr matrix in the state page */
++#define SWEET_SURFACE_STATE_BULK        0x30    /* 112-byte bulk attachments in the state page */
++#define SWEET_SURFACE_BULK_SIZE         112u
++#define SWEET_SURFACE_BULK_IN_SIZE      0x88u   /* 112B data + u64 size + u64 mask + u32 id */
++#define SWEET_SURFACE_MAX_EXT           4096u
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+ static IOLock       *sweet_surface_lock;
+@@ -317,18 +324,30 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 		s->pixelFormat = 0x42475241u;
+ 		one_plane = true;
+ 	}
++	uint32_t topExtL = sweet_dict_u32(props, "IOSurfaceExtendedPixelsOnLeft", 0);
++	uint32_t topExtR = sweet_dict_u32(props, "IOSurfaceExtendedPixelsOnRight", 0);
++	uint32_t topExtT = sweet_dict_u32(props, "IOSurfaceExtendedPixelsOnTop", 0);
++	uint32_t topExtB = sweet_dict_u32(props, "IOSurfaceExtendedPixelsOnBottom", 0);
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
++	    topExtL > SWEET_SURFACE_MAX_EXT || topExtR > SWEET_SURFACE_MAX_EXT ||
++	    topExtT > SWEET_SURFACE_MAX_EXT || topExtB > SWEET_SURFACE_MAX_EXT ||
+ 	    s->bytesPerElement > 64 || s->elementWidth == 0 || s->elementHeight == 0) {
+ 		return kIOReturnBadArgument;
+ 	}
++	uint32_t effTopW = s->width + topExtL + topExtR;
++	uint32_t effTopH = s->height + topExtT + topExtB;
+ 	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
+-	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
++	    sweet_row_bytes(effTopW, s->elementWidth, s->bytesPerElement));
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(effTopH, s->elementHeight);
++	s->planes[0].extLeft = topExtL;
++	s->planes[0].extRight = topExtR;
++	s->planes[0].extTop = topExtT;
++	s->planes[0].extBottom = topExtB;
+ 
+ 	OSArray *planes = one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+@@ -345,19 +364,38 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			}
+ 			p->width = sweet_dict_u32(pd, "IOSurfacePlaneWidth", s->width);
+ 			p->height = sweet_dict_u32(pd, "IOSurfacePlaneHeight", s->height);
++			p->extLeft = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnLeft", topExtL);
++			p->extRight = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnRight", topExtR);
++			p->extTop = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnTop", topExtT);
++			p->extBottom = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnBottom", topExtB);
+ 			p->bytesPerElement = (uint16_t)sweet_dict_u32(pd, "IOSurfacePlaneBytesPerElement", 1);
+ 			p->elementWidth = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementWidth", 1);
+ 			p->elementHeight = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementHeight", 1);
+ 			if (p->width > SWEET_SURFACE_MAX_DIM || p->height > SWEET_SURFACE_MAX_DIM ||
++			    p->extLeft > SWEET_SURFACE_MAX_EXT || p->extRight > SWEET_SURFACE_MAX_EXT ||
++			    p->extTop > SWEET_SURFACE_MAX_EXT || p->extBottom > SWEET_SURFACE_MAX_EXT ||
+ 			    p->bytesPerElement > 64 || p->elementWidth == 0 || p->elementHeight == 0) {
+ 				return kIOReturnBadArgument;
+ 			}
++			uint32_t effW = p->width + p->extLeft + p->extRight;
++			uint32_t effH = p->height + p->extTop + p->extBottom;
+ 			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
+-			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
++			    sweet_row_bytes(effW, p->elementWidth, p->bytesPerElement));
++			if (p->bytesPerRow < (uint64_t)sweet_div_up(p->width, p->elementWidth) * p->bytesPerElement) {
++				return kIOReturnBadArgument;
++			}
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+-			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+-			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
+-			next = round_page((uint64_t)p->offset + p->size);
++			uint64_t minSize = (uint64_t)p->bytesPerRow * sweet_div_up(effH, p->elementHeight);
++			uint64_t reqSize = sweet_dict_u32(pd, "IOSurfacePlaneSize", (uint32_t)minSize);
++			if (reqSize < minSize) {
++				reqSize = minSize;
++			}
++			if (reqSize > SWEET_SURFACE_MAX_ALLOC) {
++				return kIOReturnNoMemory;
++			}
++			p->size = (uint32_t)reqSize;
++			/* Leave a guard slack page between kernel-placed planes for codec macroblock overhang. */
++			next = round_page((uint64_t)p->offset + p->size) + page_size;
+ 			if ((uint64_t)p->offset + p->size > end) {
+ 				end = (uint64_t)p->offset + p->size;
+ 			}
+@@ -392,7 +430,9 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	if (alloc < end) {
+ 		alloc = end;
+ 	}
+-	alloc = round_page(alloc);
++	/* Keep one writable zeroed slack page past nominal plane end so macroblock
++	 * software decoders (H264SW.videocodec) never fault into ref->state (+0x40). */
++	alloc = round_page(alloc) + page_size;
+ 	if (alloc == 0 || alloc > SWEET_SURFACE_MAX_ALLOC) {
+ 		return kIOReturnNoMemory;
+ 	}
+@@ -637,6 +677,13 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 	put32(out, 0x44, s->cacheMode);
+ 	put32(out, 0x50, s->parentID);
+ 	put32(out, 0x54, 1);
++	if (s->planeCount == 0) {
++		uint8_t *p0 = out + 0x68;
++		put32(p0, 0x70, s->planes[0].extRight);
++		put32(p0, 0x74, s->planes[0].extBottom);
++		put32(p0, 0x78, s->planes[0].extLeft);
++		put32(p0, 0x7c, s->planes[0].extTop);
++	}
+ 	for (uint32_t i = 0; i < s->planeCount; i++) {
+ 		uint8_t *p = out + 0x68 + i * 0x80;
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+@@ -648,6 +695,10 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
+ 		p[0x1b] = pl->elementHeight;
++		put32(p, 0x70, pl->extRight);
++		put32(p, 0x74, pl->extBottom);
++		put32(p, 0x78, pl->extLeft);
++		put32(p, 0x7c, pl->extTop);
+ 	}
+ }
+ 
+@@ -812,6 +863,69 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return ret;
+ 	}
++	case kSweetSurfaceSetYCbCrMatrix: {
++		if (args->scalarInputCount < 2) {
++			return kIOReturnBadArgument;
++		}
++		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
++		if (s == NULL) {
++			return kIOReturnNotFound;
++		}
++		uint32_t matrix = (uint32_t)args->scalarInput[1];
++		IOLockLock(sweet_surface_lock);
++		put32((uint8_t *)s->state->getBytesNoCopy(), SWEET_SURFACE_STATE_YCBCR, matrix);
++		__asm__ volatile("dmb ish" ::: "memory");
++		IOLockUnlock(sweet_surface_lock);
++		s->release();
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
++	case kSweetSurfaceSetBulkAttachments: {
++		uint8_t inBuf[SWEET_SURFACE_BULK_IN_SIZE];
++		if (args->structureInputDescriptor != NULL) {
++			if (args->structureInputDescriptor->getLength() < SWEET_SURFACE_BULK_IN_SIZE) {
++				return kIOReturnBadArgument;
++			}
++			args->structureInputDescriptor->readBytes(0, inBuf, SWEET_SURFACE_BULK_IN_SIZE);
++		} else if (args->structureInput != NULL && args->structureInputSize >= SWEET_SURFACE_BULK_IN_SIZE) {
++			memcpy(inBuf, args->structureInput, SWEET_SURFACE_BULK_IN_SIZE);
++		} else {
++			return kIOReturnBadArgument;
++		}
++		uint64_t bulkSize = 0, mask = 0;
++		uint32_t surfID = 0;
++		memcpy(&bulkSize, inBuf + 0x70, 8);
++		memcpy(&mask, inBuf + 0x78, 8);
++		memcpy(&surfID, inBuf + 0x80, 4);
++		if (bulkSize > SWEET_SURFACE_BULK_SIZE) {
++			return kIOReturnBadArgument;
++		}
++		SweetSurface *s = sweet_surface_copy(surfID);
++		if (s == NULL) {
++			return kIOReturnNotFound;
++		}
++		static const struct { uint8_t off, len; } fields[15] = {
++			{  0, 32 }, { 32, 16 }, { 48,  8 },
++			{ 56,  1 }, { 57,  1 }, { 58,  1 }, { 59,  1 },
++			{ 60,  1 }, { 61,  1 }, { 62,  1 }, { 63,  1 },
++			{ 64, 24 }, { 88,  4 }, { 92,  8 }, { 100, 12 },
++		};
++		uint8_t *dst = (uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_BULK;
++		IOLockLock(sweet_surface_lock);
++		for (unsigned bit = 0; bit < 15; bit++) {
++			if (!(mask & (1ULL << bit)) || fields[bit].off >= bulkSize) {
++				continue;
++			}
++			size_t avail = (size_t)bulkSize - fields[bit].off;
++			size_t n = fields[bit].len < avail ? fields[bit].len : avail;
++			memcpy(dst + fields[bit].off, inBuf + fields[bit].off, n);
++		}
++		__asm__ volatile("dmb ish" ::: "memory");
++		IOLockUnlock(sweet_surface_lock);
++		s->release();
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
+ 	case kSweetSurfaceCreatePort: {
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+ 		if (s == NULL || args->scalarOutputCount < 1) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..4ba58dc 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -20,6 +20,7 @@
+ 
+ struct sweet_surface_plane {
+ 	uint32_t width, height, bytesPerRow, offset, size;
++	uint32_t extLeft, extRight, extTop, extBottom;
+ 	uint16_t bytesPerElement;
+ 	uint8_t  elementWidth, elementHeight;
+ };
