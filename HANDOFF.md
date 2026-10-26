@@ -5,6 +5,15 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### iOS 26 CI compilation fixes staged: kernel 0131 (2026-10-26, 12:04 IST)
+- Branch: `upgrade_ios_version_target`; starting repository commit `96662ac`.
+- Inspected the saved full log from GitHub Actions run `40265518489` and the local `xnu-12377.121.6` source through patch 0130.
+- `0001-stage-trustcache.sh` stages the five TrustCache headers from the existing, pinned `darwin-xnu-build` `patches/TrustCache.patch`; repeat runs verify the exact patch in reverse and refuse conflicting headers. No replacement trust-cache implementation is added; SWEET's AMFI TrustCache interface remains version 0.
+- `0131-ios26-open-source-build-fixes.patch`: include `vm/vm_kern_xnu.h` in UFS, pmem, GPU and USB (the existing `kmem_alloc_contig` wrapper and `kmem_free` are still available there); add the exact `CORE_ENTITLEMENTS_I_KNOW_WHAT_IM_DOING` macro for SWEET and `-Wno-reserved-identifier`; omit the unused private CodeSignature include on SWEET; include Apple core-type constants and return a generic P-core type on SWEET rather than decoding Qualcomm MPIDR affinity as an Apple core type; drop the obsolete `sysreg_restore` cache clean (XNU 26 programs TCR/MAIR directly in `start.s`).
+- Local validation: all 123 `patches-26` patches apply sequentially to the staged XNU baseline; `tools/validate-repo.py` passes (124 legacy patches, 123 iOS 26 patches, 35 Python tools, 31 shell scripts); existing TrustCache headers pass repeat staging.
+- Pending: push and inspect the new macOS CI build, resolve any newly exposed diagnostics, then run Gate 1 using the newly built kernel and `sweet-init-v84.macho`. No new kernel build or Gate 1 success is claimed yet.
+
+
 ### iOS 26.5.2 (`23F84`, `xnu-12377.121.6`, `D421AP` `arm64e`) REBASE, OFFLINE DE-PAC, SLEH EMULATOR & ROOT IMAGES READY (2026-10-26, 11:40)
 - **Branch**: `upgrade_ios_version_target` (tracked at `origin/upgrade_ios_version_target`, HEAD `d9e833a`).
 - **Target IPSW & Version**: iOS 26.5.2 (`23F84`, Darwin `25.5.0`, `xnu-12377.121.6`, `iPhone12,3` / `D421AP` iPhone 11 Pro).

@@ -126,3 +126,5 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 - 0128 RMX1931 Metal/GPU/touch: ensure `/private/var/local` + `m2v-cache` (`0777`) and `/private/etc/dropbear` (`0700`) before `launchd`, unlock SM8150-AC `675 MHz` Adreno 640 OPP (`sweetgpufreq=6`), and 4 ms active touch polling.
 - 0129 iOS 26 (`xnu-12377.121.6` in `xnu/patches-26/`): grade `arm64e` slices on `ARM64_V8`, pass `ptrauth_disabled=1`, unify `arm64`/`arm64e` shared region + `v3`/`v5` auth rebase `memcpy`, and unsigned `DYLD_CHAINED_PTR_ARM64E*` page-in fixups.
 - 0130 iOS 26 (`xnu/patches-26/`): EL1 `sleh.c` user-mode emulator for `arm64e` PAC (`reta*`, `bra*`/`blra*`, `pac*`/`aut*`/`xpac*`, `pacga`, `ldra*`) and ARMv8.3/v8.4 ISA (`fjcvtzs`, `fcadd`/`fcmla`, `stlur*`/`ldapur*`, `FlagM`/`DIT`, `SHA3`).
+
+- 0131 iOS 26 (`xnu/patches-26/`): stage pinned dxb TrustCache headers, expose internal kmem APIs, opt SWEET into the private CE API, suppress reserved-identifier noise, and fix unused CodeSignature / Apple core-type / stale sysreg_restore build diagnostics.
