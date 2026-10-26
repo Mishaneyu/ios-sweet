@@ -1,0 +1,32 @@
+From e1254b7d7c57828d60b667d6a68ce51c5d360ec9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 13:09:21 +0200
+Subject: [PATCH] betalm: GPU pool skips the non-RAM hole 0xbcc00000-0xc0000000
+
+---
+ bsd/dev/sweet_gpu.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 3253bb2..7597568 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -928,9 +928,13 @@ static const struct { uint64_t pa, size; } gpool_ranges[] = {
+ 	 * below 4 GB (cdsp_sec_regions) ends at 0xa8c00000 and LG's
+ 	 * ramoops_region is 0xb0000000 + 3 MB; XNU takes RAM from 4 GB up
+ 	 * (mkadt --highmem); ABL's ramdisk and the shim are dead once XNU runs.
+-	 * wland's radio pool follows at 0xf0000000.
++	 * wland's radio pool follows at 0xf0000000. The live memory node is
++	 * <0x80000000 0x3cc00000>, <0xc0000000 ...>: 0xbcc00000-0xc0000000 is
++	 * not RAM (ABL removes it; touching it hangs the SoC with a striped
++	 * screen as soon as the pool grows past ~200 MB), so two ranges.
+ 	 */
+-	{ 0xb0400000ULL, 0x3fc00000ULL },       /* 1020 MB */
++	{ 0xb0400000ULL, 0x0c800000ULL },       /* 200 MB, up to the hole at 0xbcc00000 */
++	{ 0xc0000000ULL, 0x30000000ULL },       /* 768 MB, up to the radio pool */
+ #else
+ 	{ 0xc4000000ULL, 0x1c000000ULL },       /* 448 MB (the first 64 MB left to ABL's ramdisk) */
+ 	{ 0xe1000000ULL, 0x1f000000ULL },       /* 496 MB */
+-- 
+2.43.0
+
