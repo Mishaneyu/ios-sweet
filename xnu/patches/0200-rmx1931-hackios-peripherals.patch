@@ -1,4 +1,4 @@
-From 233401fea25c9c9215c29e9cc9ae46e0be66aa14 Mon Sep 17 00:00:00 2001
+From 687e1c9a0d105701c38a7a3ae8b9d433af161e5b Mon Sep 17 00:00:00 2001
 From: RMX1931 Port <port@local>
 Date: Mon, 26 Oct 2026 01:08:36 +0000
 Subject: [PATCH] rmx1931: port HackiOS AMFI/sandbox/exec_inject + BQ28Z610
@@ -6,7 +6,7 @@ Subject: [PATCH] rmx1931: port HackiOS AMFI/sandbox/exec_inject + BQ28Z610
 
 ---
  bsd/conf/files                    |   4 +
- bsd/dev/rmx1931_audio.c           | 196 +++++++++
+ bsd/dev/rmx1931_audio.c           | 193 +++++++++
  bsd/dev/rmx1931_battery.c         | 463 ++++++++++++++++++++
  bsd/dev/rmx1931_battery.h         |  37 ++
  bsd/dev/rmx1931_haptic.c          | 688 ++++++++++++++++++++++++++++++
@@ -17,7 +17,7 @@ Subject: [PATCH] rmx1931: port HackiOS AMFI/sandbox/exec_inject + BQ28Z610
  bsd/kern/kern_exec.c              | 225 ++++++++++
  bsd/kern/sweet_amfi.c             | 203 ++++++++-
  iokit/Kernel/arm/SweetBattery.cpp | 146 ++++++-
- 12 files changed, 2495 insertions(+), 39 deletions(-)
+ 12 files changed, 2492 insertions(+), 39 deletions(-)
  create mode 100644 bsd/dev/rmx1931_audio.c
  create mode 100644 bsd/dev/rmx1931_battery.c
  create mode 100644 bsd/dev/rmx1931_battery.h
@@ -41,10 +41,10 @@ index 96a8aa8..1dc0334 100644
  bsd/dev/sweet_files.c			standard
 diff --git a/bsd/dev/rmx1931_audio.c b/bsd/dev/rmx1931_audio.c
 new file mode 100644
-index 0000000..d2f25af
+index 0000000..4f780c7
 --- /dev/null
 +++ b/bsd/dev/rmx1931_audio.c
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,193 @@
 +/*
 + * /dev/hakios-audio: non-blocking 48 kHz 16-bit stereo PCM audio sink and
 + * volume ioctl endpoint for HakiosAudio.driver (CoreAudio HAL plug-in).
@@ -169,9 +169,6 @@ index 0000000..d2f25af
 +		uint64_t deadline;
 +		lck_mtx_lock(&rmx_audio_lock);
 +		stretch_last = mach_absolute_time();
-+		if (stretch_frames == 0) {
-+			stretch_first = stretch_last;
-+		}
 +		stretch_frames += count;
 +		if (peak > AUDIO_SILENCE) {
 +			stretch_sound += count;
