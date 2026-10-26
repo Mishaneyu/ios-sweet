@@ -155,23 +155,36 @@ jobs:
       - name: Inspect closed KDK support libs
         if: always()
         run: |
-          mkdir -p out/kdk-libs
+          mkdir -p out-debug/kdk-libs
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
             [ -f "$lib" ] || continue
             b=$(basename "$lib" .a)
-            ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
-            nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
-            lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
+            ar t "$lib" > "out-debug/kdk-libs/$b.members.txt" 2>&1 || true
+            nm -m "$lib" > "out-debug/kdk-libs/$b.nm.txt" 2>&1 || true
+            lipo -info "$lib" >> out-debug/kdk-libs/arch.txt 2>&1 || true
           done
-          ls -la out/kdk-libs
+          ls -la out-debug/kdk-libs
 
       - name: Collect
         if: always()
         run: |
-          mkdir -p out
-          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
-          ls -la out
-          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          mkdir -p out out-debug
+          for f in dxb/fakeroot/System/Library/Kernels/kernel.development.* \
+                   dxb/fakeroot/System/Library/Kernels/kernel.release.* \
+                   dxb/fakeroot/System/Library/Kernels/kernel.debug.*; do
+            [ -e "$f" ] || continue
+            b=$(basename "$f")
+            case "$b" in
+              *.dSYM|*.link|*.unstripped)
+                cp -R "$f" "out-debug/$b"
+                ;;
+              *)
+                [ -f "$f" ] && cp "$f" "out/$b"
+                ;;
+            esac
+          done
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) 2>/dev/null || true
+          ls -la out out-debug
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -179,3 +192,11 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel-debug
+          path: out-debug/
+          retention-days: 3
+          if-no-files-found: ignore

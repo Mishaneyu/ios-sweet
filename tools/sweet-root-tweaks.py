@@ -64,28 +64,91 @@ def merge_pref(root, name, values):
     print('pref', name, sorted(values))
 
 
-def launchd(root):
-    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
-    st = os.stat(path)
-    plist = load(path)
+SKIP_LABELS = {
+    'com.apple.CommCenter',
+    'com.apple.aned',
+    'com.apple.aneuserd',
+    'com.apple.modelcatalogd',
+    'com.apple.generativeexperiencesd',
+    'com.apple.security.cryptexd',
+    'com.apple.ManagedSettingsAgent',
+    'com.apple.deviceaccessd',
+    'com.apple.passd',
+    'com.apple.icloud.findmydeviced',
+    'com.apple.findmy.findmylocated',
+    'com.apple.findmy.findmybeaconingd',
+    'com.apple.driverkitd',
+    'com.apple.webinspectord',
+    'com.apple.PerfPowerServices',
+    'com.apple.PerfPowerServicesExtended',
+    'com.apple.perfpowermetricd',
+    'com.apple.wifip2pd',
+    'com.apple.biomed',
+    'com.apple.biomesyncd',
+    'com.apple.biometrickitd.pearl',
+    'com.apple.nanotimekitcompaniond',
+    'com.apple.nanoregistryd',
+    'com.apple.nanoregistrylaunchd',
+    'com.apple.nanoprefsyncd',
+    'com.apple.nanoprefsyncd.2',
+    'com.apple.nanobackupd',
+}
+
+SKIP_PLISTS = {
+    'com.apple.security.cryptexd.plist',
+    'com.apple.ManagedSettingsAgent.plist',
+    'com.apple.deviceaccessd.plist',
+    'com.apple.passd.plist',
+    'com.apple.icloud.findmydeviced.plist',
+    'com.apple.findmy.findmylocated.plist',
+    'com.apple.findmy.findmybeaconingd.plist',
+    'com.apple.driverkitd.plist',
+    'com.apple.webinspectord.plist',
+    'com.apple.PerfPowerServices.plist',
+    'com.apple.PerfPowerServicesExtended.plist',
+    'com.apple.perfpowermetricd.plist',
+    'com.apple.wifip2pd.plist',
+    'com.apple.biomed.plist',
+    'com.apple.biomesyncd.plist',
+    'com.apple.biometrickitd.pearl.plist',
+    'com.apple.nanotimekitcompaniond.plist',
+    'com.apple.nanoregistryd.plist',
+    'com.apple.nanoregistrylaunchd.plist',
+    'com.apple.nanoprefsyncd.plist',
+    'com.apple.nanobackupd.plist',
+}
+
+SKIP_PREFIXES = (
+    '/System/Library/NanoLaunchDaemons/',
+)
+
+
+def clean_launchd_plist(plist):
+    """Rename _PanicOnCrash -> _PanicOnCrasX and strip hardware-absent/crash-looping LaunchDaemons."""
     jobs = plist['LaunchDaemons']
     renamed = 0
     for job in jobs.values():
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    skip_labels = {
-        'com.apple.CommCenter',
-        'com.apple.aned',
-        'com.apple.aneuserd',
-        'com.apple.modelcatalogd',
-        'com.apple.generativeexperiencesd',
-    }
-    removed = [k for k, j in jobs.items() if j.get('Label') in skip_labels]
+    removed = [
+        k for k, j in jobs.items()
+        if j.get('Label') in SKIP_LABELS
+        or os.path.basename(k) in SKIP_PLISTS
+        or k.startswith(SKIP_PREFIXES)
+    ]
     for k in removed:
         del jobs[k]
+    return renamed, removed
+
+
+def launchd(root):
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    renamed, removed = clean_launchd_plist(plist)
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} unsupported hw/ANE jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} unsupported hw/ANE/Nano jobs removed')
 
 
 def containers(root):

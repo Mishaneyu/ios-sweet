@@ -18,9 +18,9 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
-    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, Library, LoadAction,
+    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
     MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
@@ -324,6 +324,9 @@ pub extern "C" fn nmb_device_max_threads_per_threadgroup(device: *const NmbDevic
 /// (the header's NMB_ANSWER_* values).
 const PUBLIC_ANSWERS: &[(&str, u32)] = &[
     ("maxThreadgroupMemoryLength", 0),
+    ("maxComputeThreadgroupMemory", 0),
+    ("gpuCoreCount", 0),
+    ("maxVertexAmplificationCount", 0),
     ("argumentBuffersSupport", 0),
     ("readWriteTextureSupport", 0),
     ("maxColorAttachments", 0),
@@ -354,9 +357,11 @@ fn answer_selectors() -> &'static [(std::ffi::CString, u32)] {
     ALL.get_or_init(|| {
         let counts = PrivateCount::ALL.into_iter().map(|c| (c.selector(), 0));
         let flags = PrivateFlag::ALL.into_iter().map(|f| (f.selector(), 1));
+        let mut seen = std::collections::HashSet::new();
         counts
             .chain(flags)
             .chain(PUBLIC_ANSWERS.iter().copied())
+            .filter(|(s, _)| seen.insert(*s))
             .map(|(s, kind)| (std::ffi::CString::new(s).expect("selector"), kind))
             .collect()
     })
@@ -421,7 +426,15 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
     let p = d.properties();
     let none = || format!("the device has no answer for {selector}");
     if let Some(c) = PrivateCount::ALL.into_iter().find(|c| c.selector() == selector) {
-        return device.private().count(c).value().ok_or_else(none);
+        return match device.private().count(c).value() {
+            Some(v) => Ok(v),
+            None => match selector {
+                "gpuCoreCount" => Ok(2),
+                "maxVertexAmplificationCount" => Ok(1),
+                "maxComputeThreadgroupMemory" => Ok(p.max_threadgroup_memory_length),
+                _ => Err(none()),
+            },
+        };
     }
     if let Some(f) = PrivateFlag::ALL.into_iter().find(|f| f.selector() == selector) {
         return device.private().flag(f).value().map(u64::from).ok_or_else(none);
@@ -429,7 +442,9 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
     let gap = |r: Result<bool, metal2vulkan_runtime::RuntimeGap>| r.map(u64::from).map_err(|g| format!("{selector}: {g:?}"));
     let format_supported = |f: PixelFormat| d.pixel_format_capabilities(f) != metal2vulkan_runtime::FormatCapabilities::NONE;
     Ok(match selector {
-        "maxThreadgroupMemoryLength" => p.max_threadgroup_memory_length,
+        "maxThreadgroupMemoryLength" | "maxComputeThreadgroupMemory" => p.max_threadgroup_memory_length,
+        "gpuCoreCount" => 2,
+        "maxVertexAmplificationCount" => 1,
         "argumentBuffersSupport" => p.argument_buffers_support.as_raw() as u64,
         "readWriteTextureSupport" => p.read_write_texture_support.as_raw() as u64,
         // The runtime's pass takes MAX_COLOR_ATTACHMENTS; the device's Vulkan limits bound what a pipeline links.
@@ -724,6 +739,46 @@ pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: 
             buffer.new_texture(&descriptor, offset, bytes_per_row)
         };
         Ok(boxed(NmbTexture(texture.map_err(e("texture over buffer"))?)))
+    })
+}
+
+#[repr(C)]
+pub struct NmbSurfacePlane {
+    pub offset: u64,
+    pub bytes_per_row: u64,
+    pub planar: bool,
+    pub has_ycbcr: bool,
+    pub pixel_format: u32,
+    pub plane: u64,
+    pub width: u64,
+    pub height: u64,
+    pub chroma_offset: u64,
+    pub chroma_bytes_per_row: u64,
+    pub matrix: *const c_char,
+}
+
+/// # Safety
+/// `plane` and any non-null `plane.matrix` C string are valid for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_texture_new_iosurface(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor,
+                                                   plane: *const NmbSurfacePlane) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || {
+        let descriptor = texture_descriptor(descriptor)?;
+        let buffer = &get(buffer)?.0;
+        let p = get(plane)?;
+        let mut surf_plane = IoSurfacePlane::new(p.offset, p.bytes_per_row, p.planar);
+        if p.has_ycbcr {
+            let mut ycbcr = IoSurfaceYCbCr::new(p.pixel_format, p.plane, [p.width, p.height], p.chroma_offset, p.chroma_bytes_per_row);
+            if !p.matrix.is_null() {
+                // SAFETY: caller's contract.
+                if let Ok(m) = unsafe { CStr::from_ptr(p.matrix) }.to_str() {
+                    ycbcr = ycbcr.with_matrix(SurfaceYCbCrMatrix::from_attachment(m));
+                }
+            }
+            surf_plane = surf_plane.with_ycbcr(ycbcr);
+        }
+        let texture = buffer.new_texture_with_iosurface_plane(&descriptor, surf_plane);
+        Ok(boxed(NmbTexture(texture.map_err(e("texture over iosurface"))?)))
     })
 }
 

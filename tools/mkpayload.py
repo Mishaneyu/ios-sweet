@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack an xnu kernel Mach-O + ADT into the payload the sweet shim boots.
 
-  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--bootargs-v1]
+  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--overlay TAR] [--bootargs-v1]
 
 The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
 (no kmutil, no iBoot) resolves those for us, and xnu only rebases static
@@ -180,6 +180,15 @@ def add_gpufw_to_adt(adt_blob, fw_dir):
     return adt.serialize(root)
 
 
+def add_overlay_to_adt(adt_blob, tar_blob):
+    """Return the ADT with /chosen/sweet-overlay = ustar archive unpacked before launchd."""
+    root, _ = adt.parse(adt_blob)
+    chosen = next(c for c in root.children if c.name == 'chosen')
+    chosen.props = [p for p in chosen.props if p[0] != 'sweet-overlay']
+    chosen.props.append(('sweet-overlay', 0, tar_blob))
+    return adt.serialize(root)
+
+
 def adt_dram(adt_blob):
     """Kernel-managed RAM <base, size> from /chosen sweet-phys-base/sweet-mem-size (or dram-base/size)."""
     root, _ = adt.parse(adt_blob)
@@ -189,7 +198,7 @@ def adt_dram(adt_blob):
     return (struct.unpack('<Q', pbase)[0], struct.unpack('<Q', msize)[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, poke_path=None, gpufw_dir=None, bootargs_v1=False):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, poke_path=None, gpufw_dir=None, overlay_path=None, bootargs_v1=False):
     ver = 1 if bootargs_v1 else 2
     boot_line_len = BOOT_LINE_LENGTH_V1 if bootargs_v1 else BOOT_LINE_LENGTH_V2
     seg_table_off = CMDLINE + boot_line_len
@@ -212,6 +221,8 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, poke_path=None, gpu
         adt_blob = add_poke_to_adt(adt_blob, open(poke_path).read())
     if gpufw_dir:
         adt_blob = add_gpufw_to_adt(adt_blob, gpufw_dir)
+    if overlay_path:
+        adt_blob = add_overlay_to_adt(adt_blob, open(overlay_path, 'rb').read())
     # The ADT decides where the kernel's RAM is (mkadt.py --highmem).
     PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
@@ -262,10 +273,11 @@ if __name__ == '__main__':
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     ap.add_argument('--poke', help='register script for bsd/dev/sweet_poke.c (/chosen/sweet-poke)')
     ap.add_argument('--gpufw', help='Adreno firmware directory for bsd/dev/sweet_gpu.c (/chosen/gpufw,*)')
+    ap.add_argument('--overlay', help='ustar root overlay unpacked before launchd (/chosen/sweet-overlay)')
     ap.add_argument('--bootargs-v1', action='store_true',
                     help='emit legacy v1 payload (608-byte boot_args CommandLine for xnu-8796 / iOS 16)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.poke, a.gpufw, a.bootargs_v1)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.poke, a.gpufw, a.overlay, a.bootargs_v1)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

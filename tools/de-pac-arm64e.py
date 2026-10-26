@@ -519,6 +519,7 @@ class DyldCacheSet:
         """Parse every Mach-O in the cache set, exclude LC_DATA_IN_CODE, and group ranges by file_idx."""
         by_file = {i: [] for i in range(len(self.files))}
         mh_patches = []  # (file_idx, file_off, cpusub)
+        mappings_with_mh = set()
 
         for mh_va in self.image_header_vms():
             mh = self.read_vm(mh_va, 32)
@@ -536,6 +537,7 @@ class DyldCacheSet:
             if idx >= 0:
                 ms, me, fidx, foff, _ = self.mappings[idx]
                 if ms <= mh_va and mh_va + 32 <= me:
+                    mappings_with_mh.add(idx)
                     mh_patches.append((fidx, foff + (mh_va - ms), cpusub))
 
             exec_vm = []
@@ -589,6 +591,20 @@ class DyldCacheSet:
             for cs, ce in subtract_intervals(exec_vm, dice_vm):
                 for fidx, foff, flen in self.vm_to_exec_file_ranges(cs, ce):
                     by_file[fidx].append((foff, flen))
+
+        # iOS 26+ split DSC dedicates Mach-O-less executable subcaches (.02, .04, ..., .74, .76, .78, .80)
+        # to cross-dylib range-extension & auth-GOT stub islands (adrp/add/ldr x16,[x17]/braa x16,x17).
+        skip_suffixes = ('.dylddata', '.dyldreadonly', '.dyldlinkedit', '.symbols')
+        for idx, (ms, me, fidx, foff, maxprot) in enumerate(self.mappings):
+            if fidx <= 0 or idx in mappings_with_mh or not (maxprot & VM_PROT_EXECUTE):
+                continue
+            fname = os.path.basename(self.files[fidx])
+            if fname.endswith(skip_suffixes):
+                continue
+            mlen = me - ms
+            hdr_skip = 0x4000 if foff == 0 else 0
+            if mlen > hdr_skip:
+                by_file[fidx].append((foff + hdr_skip, mlen - hdr_skip))
 
         # Merge adjacent/overlapping intervals per file (e.g. if branch pool / imagesText overlapped)
         for fidx, rlist in by_file.items():

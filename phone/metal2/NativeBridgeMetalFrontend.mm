@@ -129,6 +129,7 @@ static void waitForResource(id resource);
 @property(nonatomic) NmbTextureDescriptor descriptor;
 @property(nonatomic,strong) NBBuffer *buffer;
 @property(nonatomic) IOSurfaceRef surface;
+@property(nonatomic) NSUInteger surfacePlane;
 @property(nonatomic) NSUInteger offset,rowBytes;
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
@@ -193,6 +194,14 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
  *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
  return true;
 }
+static uint64_t sweetTexelBytes(MTLPixelFormat f);
+static bool sweetBlock(MTLPixelFormat f, uint32_t *bw, uint32_t *bh, uint32_t *bytes);
+@interface NSObject (NBTextureViewDesc)
+- (MTLPixelFormat)pixelFormat;
+- (MTLTextureType)textureType;
+- (NSRange)levelRange;
+- (NSRange)sliceRange;
+@end
 @implementation NBTexture
 - (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
@@ -209,12 +218,26 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
 - (BOOL)isFramebufferOnly {return NO;}
 - (IOSurfaceRef)iosurface {return _surface;}
-- (NSUInteger)iosurfacePlane {return 0;}
+- (NSUInteger)iosurfacePlane {return _surfacePlane;}
 - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
 - (NSUInteger)bufferOffset {return _offset;}
 - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
 - (id<MTLTexture>)parentTexture {return _parent;}
 - (NSUInteger)rotation {return 0;}
+- (NSUInteger)allocatedSize {
+ if(_surface)return IOSurfaceGetAllocSize(_surface);
+ if(_buffer && !_rowBytes)return [_buffer allocatedSize];
+ const uint64_t w=MAX((uint64_t)1,_descriptor.width),h=MAX((uint64_t)1,_descriptor.height),
+                d=MAX((uint64_t)1,_descriptor.depth),a=MAX((uint64_t)1,_descriptor.array_length),
+                s=MAX((uint64_t)1,_descriptor.samples);
+ if(_rowBytes)return (NSUInteger)(_rowBytes*h*d*a);
+ uint32_t bw=0,bh=0,bb=0;
+ const uint64_t base=sweetBlock((MTLPixelFormat)_descriptor.format,&bw,&bh,&bb)
+     ? ((w+bw-1)/bw)*((h+bh-1)/bh)*bb
+     : w*h*sweetTexelBytes((MTLPixelFormat)_descriptor.format);
+ const uint64_t page=(uint64_t)getpagesize();
+ return (NSUInteger)((base*d*a*s+page-1)&~(page-1));
+}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
@@ -225,7 +248,7 @@ NB_RESOURCE_SPI
  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
- if(_surface)view.surface=(IOSurfaceRef)CFRetain(_surface);
+ if(_surface){view.surface=(IOSurfaceRef)CFRetain(_surface);view.surfacePlane=_surfacePlane;}
  return (id<MTLTexture>)view;
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
@@ -234,6 +257,22 @@ NB_RESOURCE_SPI
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices {
  const uint64_t l[2]={levels.location,levels.length},s[2]={slices.location,slices.length};
  return [self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
+}
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices swizzle:(MTLTextureSwizzleChannels)swizzle {
+ (void)swizzle;
+ return [self newTextureViewWithPixelFormat:format textureType:type levels:levels slices:slices];
+}
+- (id<MTLTexture>)newTextureViewWithDescriptor:(id)d {
+ if(!d)return nil;
+ const MTLPixelFormat format=[d pixelFormat]?:self.pixelFormat;
+ const MTLTextureType type=[d textureType];
+ NSRange levels=[d levelRange],slices=[d sliceRange];
+ if(!levels.length)levels=NSMakeRange(0,MAX((NSUInteger)1,self.mipmapLevelCount));
+ if(!slices.length) {
+  const NSUInteger mult=([self textureType]==MTLTextureTypeCube || [self textureType]==MTLTextureTypeCubeArray)?6:1;
+  slices=NSMakeRange(0,MAX((NSUInteger)1,self.arrayLength*mult));
+ }
+ return [self newTextureViewWithPixelFormat:format textureType:type levels:levels slices:slices];
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
@@ -260,8 +299,9 @@ static void flushSurfaces(NSMutableSet *surfaces) {
  if(!surfaces.count)return;
  std::vector<std::pair<uintptr_t,size_t>> ranges;
  ranges.reserve(surfaces.count);
+ const size_t page=(size_t)getpagesize();
  for(NBTexture *texture in surfaces)if(texture.surface)
-  ranges.emplace_back(reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(texture.surface)),IOSurfaceGetAllocSize(texture.surface));
+  ranges.emplace_back(reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(texture.surface))&~(page-1),IOSurfaceGetAllocSize(texture.surface));
  std::sort(ranges.begin(),ranges.end());
  const auto last=std::unique(ranges.begin(),ranges.end());
  gSurfaceFlushDuplicates+=(uint64_t)(ranges.end()-last);
@@ -390,7 +430,35 @@ static std::string quartzCoreCallers();
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
- handler(function,error);
+ if(handler)handler(function,error);
+}
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)pipelineLibrary error:(NSError **)error {
+ (void)pipelineLibrary;
+ if(!values) {
+  if(!name){if(error)*error=nbError(@"a function name is required");return nil;}
+  id<MTLFunction> function=[self newFunctionWithName:name];
+  if(!function){if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",name,lastError()]);return nil;}
+  if(error)*error=nil;return function;
+ }
+ return [self newFunctionWithName:name constantValues:values error:error];
+}
+- (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)pipelineLibrary completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+ NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values pipelineLibrary:pipelineLibrary error:&error];
+ if(handler)handler(function,error);
+}
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values functionCache:(id)cache error:(NSError **)error {
+ (void)cache;
+ return [self newFunctionWithName:name constantValues:values pipelineLibrary:nil error:error];
+}
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values functionCache:(id)cache specializedName:(NSString *)specializedName error:(NSError **)error {
+ (void)cache;
+ id<MTLFunction> function=[self newFunctionWithName:name constantValues:values pipelineLibrary:nil error:error];
+ if(function && specializedName.length && [(id)function isKindOfClass:[NBFunction class]])((NBFunction *)function).name=specializedName;
+ return function;
+}
+- (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values functionCache:(id)cache specializedName:(NSString *)specializedName completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+ NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values functionCache:cache specializedName:specializedName error:&error];
+ if(handler)handler(function,error);
 }
 - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
 // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
@@ -401,6 +469,14 @@ static std::string quartzCoreCallers();
  id<MTLFunction> function=[self newFunctionWithName:d.name];
  if(!function){if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
  if(error)*error=nil;return function;
+}
+- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+ NSError *error=nil;id<MTLFunction> function=[self newFunctionWithDescriptor:d error:&error];
+ if(handler)handler(function,error);
+}
+- (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d destinationArchive:(id<MTLBinaryArchive>)archive error:(NSError **)error {
+ (void)archive;
+ return [self newFunctionWithDescriptor:d error:error];
 }
 - (NSArray<NSString *> *)functionNames {
  NSMutableArray *names=[NSMutableArray array];
@@ -550,6 +626,8 @@ static void waitForResource(id resource) {
 - (void)insertDebugSignpost:(NSString *)s {(void)s;}
 - (void)pushDebugGroup:(NSString *)s {(void)s;}
 - (void)popDebugGroup {}
+- (void)useResidencySet:(id)residencySet {(void)residencySet;}
+- (void)useResidencySets:(const id __unsafe_unretained [])residencySets count:(NSUInteger)count {(void)residencySets;(void)count;}
 // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
@@ -808,6 +886,8 @@ static void scheduled(void *context);
 // Debug groups and cache hints name work for tools and the driver's caches; they change nothing the GPU computes here.
 - (void)pushDebugGroup:(NSString *)name {(void)name;}
 - (void)popDebugGroup {}
+- (void)useResidencySet:(id)residencySet {(void)residencySet;}
+- (void)useResidencySets:(const id __unsafe_unretained [])residencySets count:(NSUInteger)count {(void)residencySets;(void)count;}
 - (void)encodeCacheHintTag:(uint64_t)tag resourceGroups:(const id __unsafe_unretained [])groups count:(NSUInteger)count {(void)tag;(void)groups;(void)count;}
 - (void)encodeCacheHintFinalize:(uint64_t)tag resourceGroups:(const id __unsafe_unretained [])groups count:(NSUInteger)count {(void)tag;(void)groups;(void)count;}
 // The kernel driver's own submission times are not recorded: 0 is Metal's answer where they are unavailable.
@@ -991,6 +1071,10 @@ static void completed(void *context) {
 - (BOOL)setGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
 - (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
 - (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d {(void)d;return [self commandBuffer];}
+- (void)addResidencySet:(id)residencySet {(void)residencySet;}
+- (void)addResidencySets:(const id __unsafe_unretained [])residencySets count:(NSUInteger)count {(void)residencySets;(void)count;}
+- (void)removeResidencySet:(id)residencySet {(void)residencySet;}
+- (void)removeResidencySets:(const id __unsafe_unretained [])residencySets count:(NSUInteger)count {(void)residencySets;(void)count;}
 @end
 
 // ---- the device ----
@@ -1108,6 +1192,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 - (NSUInteger)size {return nmb_heap_size(_handle);}
 - (NSUInteger)usedSize {return nmb_heap_used_size(_handle);}
 - (NSUInteger)currentAllocatedSize {return nmb_heap_allocated_size(_handle);}
+- (NSUInteger)allocatedSize {return nmb_heap_allocated_size(_handle);}
 - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment {return nmb_heap_max_available_size(_handle,alignment);}
 - (MTLResourceOptions)resourceOptions {return _options;}
 - (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
@@ -1145,6 +1230,48 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 @property(nonatomic,strong) NSArray *resources;
 @end
 @implementation NBResourceGroup
+@end
+@interface NBResidencySet : NBObject {
+ NSMutableSet *_allocations;
+}
+@end
+@implementation NBResidencySet
+- (instancetype)init {
+ if((self=[super init]))_allocations=[NSMutableSet new];
+ return self;
+}
+- (uint64_t)allocatedSize {
+ uint64_t total=0;
+ @synchronized(self){
+  for(id a in _allocations)
+   if([a respondsToSelector:@selector(allocatedSize)])total+=[(NBBuffer *)a allocatedSize];
+ }
+ return total;
+}
+- (NSUInteger)allocationCount {@synchronized(self){return _allocations.count;}}
+- (NSArray *)allAllocations {@synchronized(self){return _allocations.allObjects;}}
+- (BOOL)containsAllocation:(id)allocation {
+ if(!allocation)return NO;
+ @synchronized(self){return [_allocations containsObject:allocation];}
+}
+- (void)addAllocation:(id)allocation {
+ if(allocation)@synchronized(self){[_allocations addObject:allocation];}
+}
+- (void)addAllocations:(const id __unsafe_unretained [])allocations count:(NSUInteger)count {
+ if(!allocations)return;
+ @synchronized(self){for(NSUInteger i=0;i<count;i++)if(allocations[i])[_allocations addObject:allocations[i]];}
+}
+- (void)removeAllocation:(id)allocation {
+ if(allocation)@synchronized(self){[_allocations removeObject:allocation];}
+}
+- (void)removeAllocations:(const id __unsafe_unretained [])allocations count:(NSUInteger)count {
+ if(!allocations)return;
+ @synchronized(self){for(NSUInteger i=0;i<count;i++)if(allocations[i])[_allocations removeObject:allocations[i]];}
+}
+- (void)removeAllAllocations {@synchronized(self){[_allocations removeAllObjects];}}
+- (void)commit {}
+- (void)requestResidency {}
+- (void)endResidency {}
 @end
 
 // Creation and archive population must use the same complete supported descriptor.
@@ -1281,8 +1408,30 @@ static char sweetMemoryOwnerKey;
   memcpy((uint8_t *)dst+offset+y*dstRow,(const uint8_t *)src+(y0+y)*_row+x0*_texel,w*_texel);
 }
 @end
+@interface NBArchitecture : NSObject <NSCopying>
+@end
+@implementation NBArchitecture
+- (NSString *)name {return @"applegpu_g9p";}
+- (NSString *)revision {return @"A1";}
+- (int)cpuType {return 0x100000c;}
+- (int)cpuSubtype {return 0;}
+- (id)copyWithZone:(NSZone *)zone {
+ (void)zone;
+#if __has_feature(objc_arc)
+ return self;
+#else
+ return [self retain];
+#endif
+}
+@end
 @implementation NBDeviceMethods
 - (NSString *)name {return gName;}
+- (id)architecture {
+ static NBArchitecture *arch;
+ static dispatch_once_t once;
+ dispatch_once(&once,^{arch=[NBArchitecture new];});
+ return arch;
+}
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
 - (BOOL)hasUnifiedMemory {return YES;}
@@ -1327,6 +1476,13 @@ static char sweetMemoryOwnerKey;
 - (id<MTLCommandQueue>)newCommandQueue {
  NmbQueue *handle=nmb_queue_new(gDevice);if(!handle)return nil;
  NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
+}
+- (id<MTLCommandQueue>)newCommandQueueWithDescriptor:(id)d {(void)d;return [(id<MTLDevice>)self newCommandQueue];}
+- (id)newResidencySetWithDescriptor:(id)d error:(NSError **)error {
+ NBResidencySet *set=[NBResidencySet new];
+ if([d respondsToSelector:@selector(label)])set.label=[(NBObject *)d label];
+ if(error)*error=nil;
+ return set;
 }
 - (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)d {
  if(!d)return nil;
@@ -1413,13 +1569,53 @@ static char sweetMemoryOwnerKey;
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
- if(!surface || !d || plane || IOSurfaceGetPlaneCount(surface))return nil;
- void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
- if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
+ if(!surface || !d)return nil;
+ const size_t planeCount=IOSurfaceGetPlaneCount(surface);
+ if(planeCount?plane>=planeCount:plane!=0)return nil;
+ void *rawBase=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
+ if(!page || (page&(page-1)) || !rawBase || !allocation || allocation>SIZE_MAX-(page-1))return nil;
+ void *base=(void *)((uintptr_t)rawBase&~(page-1));
  const size_t bytes=(allocation+page-1)&~(page-1);
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
- NBTexture *texture=textureOnBuffer(buffer,d,0,IOSurfaceGetBytesPerRow(surface),true);if(!texture)return nil;
- texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+ NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+ uint64_t offset=0,rowBytes=0;
+ if(planeCount) {
+  void *planeBase=IOSurfaceGetBaseAddressOfPlane(surface,plane);
+  if(!planeBase || (uintptr_t)planeBase<(uintptr_t)base)return nil;
+  offset=(uint64_t)((uintptr_t)planeBase-(uintptr_t)base);
+  rowBytes=(uint64_t)IOSurfaceGetBytesPerRowOfPlane(surface,plane);
+ } else {
+  offset=(uint64_t)((uintptr_t)rawBase-(uintptr_t)base);
+  rowBytes=(uint64_t)IOSurfaceGetBytesPerRow(surface);
+ }
+ NmbSurfacePlane sp={};
+ sp.offset=offset;sp.bytes_per_row=rowBytes;sp.planar=planeCount>0;
+ char matrixBuf[64]={};
+ if(planeCount>=2) {
+  void *chromaBase=IOSurfaceGetBaseAddressOfPlane(surface,1);
+  if(chromaBase && (uintptr_t)chromaBase>=(uintptr_t)base) {
+   sp.has_ycbcr=true;
+   sp.pixel_format=(uint32_t)IOSurfaceGetPixelFormat(surface);
+   sp.plane=(uint64_t)plane;
+   sp.width=(uint64_t)IOSurfaceGetWidth(surface);
+   sp.height=(uint64_t)IOSurfaceGetHeight(surface);
+   sp.chroma_offset=(uint64_t)((uintptr_t)chromaBase-(uintptr_t)base);
+   sp.chroma_bytes_per_row=(uint64_t)IOSurfaceGetBytesPerRowOfPlane(surface,1);
+   CFTypeRef mv=IOSurfaceCopyValue(surface,CFSTR("IOSurfaceYCbCrMatrix"));
+   if(mv) {
+    if(CFGetTypeID(mv)==CFStringGetTypeID() && CFStringGetCString((CFStringRef)mv,matrixBuf,sizeof matrixBuf,kCFStringEncodingUTF8))
+     sp.matrix=matrixBuf;
+    CFRelease(mv);
+   }
+  }
+ }
+ NmbTexture *handle=nmb_texture_new_iosurface(buffer.handle,&descriptor,&sp);
+ noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+ if(!handle){NBLOG(@"native-metal: texture over iosurface (plane %lu/%lu fmt %u ostype 0x%x) refused: %@",(unsigned long)plane,(unsigned long)planeCount,(unsigned)descriptor.format,(unsigned)IOSurfaceGetPixelFormat(surface),lastError());return nil;}
+ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+ texture.buffer=buffer;texture.offset=(NSUInteger)offset;texture.rowBytes=(NSUInteger)rowBytes;
+ texture.surface=(IOSurfaceRef)CFRetain(surface);texture.surfacePlane=plane;
+ return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
@@ -1583,6 +1779,13 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  // MTLTextureImplementation." on every miss (~600 lines/s from backboardd while scrolling).
  {Protocol *tp=objc_getProtocol("MTLTextureImplementation");if(tp)class_addProtocol([NBTexture class],tp);
   NBLOG(@"native-metal: MTLTextureImplementation %s",tp?([NBTexture conformsToProtocol:tp]?"adopted":"not adopted"):"missing");}
+ if(Protocol *rp=objc_getProtocol("MTLResidencySet"))class_addProtocol([NBResidencySet class],rp);
+ if(Protocol *rps=objc_getProtocol("MTLResidencySetSPI"))class_addProtocol([NBResidencySet class],rps);
+ if(Protocol *ap=objc_getProtocol("MTLAllocation")) {
+  class_addProtocol([NBBuffer class],ap);
+  class_addProtocol([NBTexture class],ap);
+  class_addProtocol([NBHeap class],ap);
+ }
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
  return gDeviceObject;

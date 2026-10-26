@@ -1,0 +1,1954 @@
+From 9846cedb50c710885edea2389775cf604be3ccc1 Mon Sep 17 00:00:00 2001
+From: XNU 26 Rebase <rebase@local>
+Date: Mon, 26 Oct 2026 18:12:58 +0000
+Subject: [PATCH] ios26: EL0 PAC locore fast-path, pre-launchd overlay, cool
+ Kryo 485 OPPs, SPMI touch lock, backlight/wifi/video
+
+---
+ bsd/dev/flame_sta.c                   |  39 ++-
+ bsd/dev/redwood_apple80211.c          |   4 +-
+ bsd/dev/rmx1931_touch.c               |  49 ++--
+ bsd/dev/sweet_cpufreq.c               |  32 +--
+ bsd/dev/sweet_files.c                 |   4 +
+ bsd/dev/sweet_gpu.c                   |  92 ++++++-
+ bsd/dev/sweet_keys.c                  |   5 +
+ bsd/dev/sweet_spmi.c                  |  23 ++
+ bsd/dev/sweet_spmi.h                  |   3 +
+ bsd/kern/bsd_init.c                   |  10 +
+ bsd/vfs/vfs_syscalls.c                | 249 +++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 335 +++++++++++++++++++++++--
+ iokit/Kernel/arm/SweetSurface.cpp     | 128 +++++++++-
+ iokit/Kernel/arm/SweetSurface.h       |   1 +
+ iokit/KernelConfigTables.cpp          |   5 +
+ osfmk/arm64/locore.s                  | 336 ++++++++++++++++++++++++++
+ osfmk/arm64/sleh.c                    |  98 +++++---
+ 17 files changed, 1301 insertions(+), 112 deletions(-)
+
+diff --git a/bsd/dev/flame_sta.c b/bsd/dev/flame_sta.c
+index 7e40bda..8abc042 100644
+--- a/bsd/dev/flame_sta.c
++++ b/bsd/dev/flame_sta.c
+@@ -103,20 +103,35 @@ sta_join(const struct redwood_sta_join *what)
+ 	sta_last_error = error;
+ 	bzero(&sta_joined_bss, sizeof(sta_joined_bss));
+ 	if (error == 0) {
+-		for (unsigned i = 0; flame_wlan_heard(i, &t); i++) {
+-			if (t.ssid_length == what->ssid_length && memcmp(t.ssid, what->ssid, t.ssid_length) == 0) {
+-				memcpy(sta_joined_bss.bssid, t.bssid, 6);
+-				memcpy(sta_joined_bss.ssid, t.ssid, t.ssid_length);
+-				sta_joined_bss.ssid_length = t.ssid_length;
+-				sta_joined_bss.frequency = t.frequency;
+-				sta_joined_bss.rssi = t.rssi;
+-				sta_joined_bss.beacon_interval = t.beacon_interval;
+-				sta_joined_bss.capability = t.capability;
+-				sta_joined_bss.elements_length = t.elements_length < REDWOOD_STA_ELEMENTS_MOST ? t.elements_length : REDWOOD_STA_ELEMENTS_MOST;
+-				memcpy(sta_joined_bss.elements, t.elements, sta_joined_bss.elements_length);
+-				break;
++		bool found = flame_wlan_link_bss(&t) && t.frequency != 0;
++		if (!found) {
++			for (unsigned i = 0; flame_wlan_heard(i, &t); i++) {
++				if (any && memcmp(t.bssid, what->bssid, 6) == 0) {
++					found = true;
++					break;
++				}
++				if (t.ssid_length == what->ssid_length && memcmp(t.ssid, what->ssid, t.ssid_length) == 0) {
++					found = true;
++					if (!any) {
++						break;
++					}
++				}
+ 			}
+ 		}
++		if (!found) {
++			found = flame_wlan_link_bss(&t);
++		}
++		if (found) {
++			memcpy(sta_joined_bss.bssid, t.bssid, 6);
++			memcpy(sta_joined_bss.ssid, t.ssid, t.ssid_length);
++			sta_joined_bss.ssid_length = t.ssid_length;
++			sta_joined_bss.frequency = t.frequency;
++			sta_joined_bss.rssi = t.rssi;
++			sta_joined_bss.beacon_interval = t.beacon_interval;
++			sta_joined_bss.capability = t.capability;
++			sta_joined_bss.elements_length = t.elements_length < REDWOOD_STA_ELEMENTS_MOST ? t.elements_length : REDWOOD_STA_ELEMENTS_MOST;
++			memcpy(sta_joined_bss.elements, t.elements, sta_joined_bss.elements_length);
++		}
+ 	}
+ 	printf("flame wifi: join -> %d\n", error);
+ 	return error;
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index e2674ee..5d744a9 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -436,10 +436,10 @@ get(struct apple80211req *request)
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
+-	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
++	case 2: {				/* how it was joined: open system, then WPA2 when Privacy cap bit set */
+ 		struct {
+ 			uint32_t version, lower, upper, extended;
+-		} answer = { .version = 1, .lower = 1, .upper = 8 };
++		} answer = { .version = 1, .lower = 1, .upper = (state->bss.capability & 0x0010) ? 8 : 0 };
+ 
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+diff --git a/bsd/dev/rmx1931_touch.c b/bsd/dev/rmx1931_touch.c
+index 89481fa..2839257 100644
+--- a/bsd/dev/rmx1931_touch.c
++++ b/bsd/dev/rmx1931_touch.c
+@@ -29,6 +29,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -182,17 +183,23 @@ rmx_spmi_read_1v8(uint16_t addr, uint8_t *out)
+ 		return false;
+ 	}
+ 	uint32_t off = 0x80u * (uint32_t)rt.sp_apid;
+-	rmx_wr(rt.sp_obs, off, (1u << 27) | ((uint32_t)(addr & 0xffu) << 4));
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t st = rmx_rd(rt.sp_obs, off + 0x08u);
+-		if (st & 1u) {
+-			if (st & 0x0eu) {
+-				return false;
++	for (unsigned attempt = 0; attempt < 5; ++attempt) {
++		bool intrs = sweet_spmi_bus_acquire();
++		rmx_wr(rt.sp_obs, off, (1u << 27) | ((uint32_t)(addr & 0xffu) << 4));
++		for (unsigned i = 0; i < 1000; ++i) {
++			uint32_t st = rmx_rd(rt.sp_obs, off + 0x08u);
++			if (st & 1u) {
++				if ((st & 0x0eu) == 0) {
++					*out = (uint8_t)rmx_rd(rt.sp_obs, off + 0x18u);
++					sweet_spmi_bus_release(intrs);
++					return true;
++				}
++				break;
+ 			}
+-			*out = (uint8_t)rmx_rd(rt.sp_obs, off + 0x18u);
+-			return true;
++			delay(1);
+ 		}
+-		delay(1);
++		sweet_spmi_bus_release(intrs);
++		delay(500);
+ 	}
+ 	return false;
+ }
+@@ -203,14 +210,24 @@ rmx_spmi_write_1v8(uint16_t addr, uint8_t val)
+ 	if ((addr & 0xff00u) != RMX_1V8_BASE || !rt.sp_ch) {
+ 		return false;
+ 	}
+-	rmx_wr(rt.sp_ch, 0x10u, val);
+-	rmx_wr(rt.sp_ch, 0x00u, (0u << 27) | ((uint32_t)(addr & 0xffu) << 4));
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t st = rmx_rd(rt.sp_ch, 0x08u);
+-		if (st & 1u) {
+-			return (st & 0x0eu) == 0;
++	for (unsigned attempt = 0; attempt < 5; ++attempt) {
++		bool intrs = sweet_spmi_bus_acquire();
++		rmx_wr(rt.sp_ch, 0x10u, val);
++		rmx_wr(rt.sp_ch, 0x00u, (0u << 27) | ((uint32_t)(addr & 0xffu) << 4));
++		for (unsigned i = 0; i < 1000; ++i) {
++			uint32_t st = rmx_rd(rt.sp_ch, 0x08u);
++			if (st & 1u) {
++				sweet_spmi_bus_release(intrs);
++				if ((st & 0x0eu) == 0) {
++					return true;
++				}
++				goto retry;
++			}
++			delay(1);
+ 		}
+-		delay(1);
++		sweet_spmi_bus_release(intrs);
++retry:
++		delay(500);
+ 	}
+ 	return false;
+ }
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 82097a3..a1b4863 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -1,12 +1,14 @@
+ /*
+- * flame (SM8150) CPU frequency: the OSM hardware DCVS keeps a frequency
+- * table per cluster and takes a desired table index per cluster; voltage
+- * (CPR) and thermal limits (LMh) stay in hardware. ABL leaves the clusters
+- * slow and nothing under XNU raises them. Linux: drivers/clk/qcom/
+- * clk-cpu-osm.c (msm-4.14), bases from the live DT qcom,cpucc node.
++ * flame / RMX1931 (SM8150 / SM8150-AC) CPU frequency: the OSM hardware DCVS
++ * keeps a frequency table per cluster and takes a desired table index per
++ * cluster; voltage (CPR) and thermal limits (LMh) stay in hardware.
+  *
+- * Boot-arg flamecpufreq: 0 leave as is, 1 (default) highest all-core
+- * frequency, N > 1 the highest entry at or below N MHz.
++ * Boot-arg flamecpufreq:
++ *   0       leave ABL boot clocks untouched
++ *   1       all-core max turbo (1785 / 2419 / 2956 MHz; high voltage/heat)
++ *   2       (default) Kryo 485 voltage-knee sweet spot (1632 / 1804 / 2016 MHz;
++ *           -47% package power, runs cool continuously)
++ *   N > 2   highest entry at or below N MHz across all clusters
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -26,10 +28,11 @@ void sweet_cpufreq_init(void);
+ static const struct {
+ 	const char *name;
+ 	uint32_t pa;
++	unsigned sweet_mhz;
+ } osm_clusters[] = {
+-	{"pwrcl (A55 x4)", 0x18323000u},
+-	{"perfcl (A76 x3)", 0x18325800u},
+-	{"perfpcl (A76 prime)", 0x18327800u},
++	{"pwrcl (A55 x4)",    0x18323000u, 1632u},
++	{"perfcl (A76 x3)",   0x18325800u, 1805u},
++	{"perfpcl (A76 prime)", 0x18327800u, 2016u},
+ };
+ 
+ static uint32_t
+@@ -43,7 +46,7 @@ osm_rd(vm_offset_t base, uint32_t off)
+ void
+ sweet_cpufreq_init(void)
+ {
+-	unsigned want = 1;
++	unsigned want = 2;
+ 	(void)PE_parse_boot_argn("flamecpufreq", &want, sizeof(want));
+ 	for (unsigned c = 0; c < sizeof(osm_clusters) / sizeof(osm_clusters[0]); ++c) {
+ 		vm_offset_t base = ml_io_map(osm_clusters[c].pa, 0x1000);
+@@ -51,6 +54,8 @@ sweet_cpufreq_init(void)
+ 			printf("SWEET CPUFREQ: %s: map failed\n", osm_clusters[c].name);
+ 			continue;
+ 		}
++		unsigned cap_mhz = (want == 2) ? osm_clusters[c].sweet_mhz :
++		    ((want > 2) ? want : 0u);
+ 		uint32_t cur = osm_rd(base, OSM_DESIRED);
+ 		unsigned best = cur, best_khz = 0, prev_khz = 0, n = 0;
+ 		char line[256];
+@@ -60,7 +65,7 @@ sweet_cpufreq_init(void)
+ 			unsigned src = data >> 30, lval = data & 0xffu, cores = (data >> 16) & 7u;
+ 			unsigned khz = src ? OSM_XO_KHZ * lval : 300000u;
+ 			if (i > 0 && khz == prev_khz) {
+-				break; /* a repeated frequency ends the table */
++				break;
+ 			}
+ 			prev_khz = khz;
+ 			n = i + 1;
+@@ -68,8 +73,7 @@ sweet_cpufreq_init(void)
+ 				len += snprintf(line + len, sizeof(line) - len, " %u%s", khz / 1000,
+ 				    cores == 1 ? "*" : "");
+ 			}
+-			/* core count 1 = single-core boost entry: skip, as Linux does */
+-			if (cores == 1 || (want > 1 && khz / 1000 > want)) {
++			if (cores == 1 || (cap_mhz > 0 && khz / 1000 > cap_mhz)) {
+ 				continue;
+ 			}
+ 			if (khz > best_khz) {
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+index dedded7..5edc0d1 100644
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -376,6 +376,10 @@ sf_thread(void *arg __unused, wait_result_t wr __unused)
+ void
+ sweet_files_start(void)
+ {
++	static uint32_t sf_started;
++	if (__atomic_exchange_n(&sf_started, 1u, __ATOMIC_ACQ_REL) != 0u) {
++		return;
++	}
+ 	thread_t thread;
+ 	if (kernel_thread_start(sf_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index f1d8d71..0ecec85 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -56,6 +56,8 @@ int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms
+ 
+ /* Panel mapping for touch (SweetHID.cpp): zero extents = CPU crop, otherwise the GPU's fitted rectangle. */
+ int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
++/* Software AMOLED brightness dim alpha (0 = full brightness, 1..238 = translucent black overlay). */
++volatile uint32_t sweet_backlight_alpha;
+ 
+ static struct a6_gpu gpu;
+ static vm_offset_t pool_kva;
+@@ -545,15 +547,34 @@ present_wait_locked(uint32_t k, const char *why)
+ 	}
+ 	return 0;
+ }
+-#define PANEL_W         1080
+-#define PANEL_H         2400
+-#define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
+-#define DISPLAY_MASK_SIDE       256u
+-#define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
+-#define DISPLAY_MASK_PITCH      (DISPLAY_MASK_DIM * 4)
+-#define DISPLAY_STAGE_OFF       0x600000ULL     /* panel-sized; only the corner bands are used */
++#define PANEL_W		1080
++#define PANEL_H		2400
++#define DISPLAY_DIM_OFF		0x410000ULL	/* 256 x 16x16 (64B pitch) black alpha tiles for backlight dimming */
++#define DISPLAY_DIM_TILE	16u
++#define DISPLAY_DIM_PITCH	(DISPLAY_DIM_TILE * 4)
++#define DISPLAY_DIM_STRIDE	(DISPLAY_DIM_PITCH * DISPLAY_DIM_TILE)
++#define DISPLAY_MASK_OFF	0x500000ULL	/* 2x2 corner mattes, one per corner */
++#define DISPLAY_MASK_SIDE	256u
++#define DISPLAY_MASK_DIM	(DISPLAY_MASK_SIDE * 2)
++#define DISPLAY_MASK_PITCH	(DISPLAY_MASK_DIM * 4)
++#define DISPLAY_STAGE_OFF	0x600000ULL	/* panel-sized staging image */
+ 
+ static uint32_t display_mask_radius;
++static bool display_dim_built;
++
++static void
++display_dim_build(void)
++{
++	for (uint32_t a = 0; a < 256; a++) {
++		uint32_t *tile = (uint32_t *)(pool_kva + DISPLAY_DIM_OFF + (size_t)a * DISPLAY_DIM_STRIDE);
++		uint32_t px = a << 24;
++		for (uint32_t i = 0; i < DISPLAY_DIM_TILE * DISPLAY_DIM_TILE; i++) {
++			tile[i] = px;
++		}
++	}
++	flush_dcache64((addr64_t)(pool_kva + DISPLAY_DIM_OFF), 256u * DISPLAY_DIM_STRIDE, FALSE);
++	display_dim_built = true;
++}
+ 
+ static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
+ 
+@@ -622,10 +643,63 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= frame.dw || 2 * ext >= frame.dh) {
+ 		ext = 0;
+ 	}
+-	static uint32_t ib[10 * A6_BLIT_MAX_DW];
++	static uint32_t ib[16 * A6_BLIT_MAX_DW];
+ 	lck_mtx_lock(&sweet_gpu_lock);
++	uint32_t dim = sweet_backlight_alpha;
++	if (dim > 240) {
++		dim = 240;
++	}
+ 	uint32_t n = 0;
+-	if (ext) {
++	if (dim > 0) {
++		/*
++		 * Tear-free AMOLED software dimming: scale into DISPLAY_STAGE_OFF, blend the
++		 * translucent black dim tile (and optional rounded-corner mattes) off-screen,
++		 * then copy the finished rectangle to A6_GVA_FB in a single pass.
++		 */
++		if (!display_dim_built) {
++			display_dim_build();
++		}
++		if (ext && display_mask_radius != corner_radius) {
++			display_mask_build(corner_radius, ext);
++			display_mask_radius = corner_radius;
++		}
++		struct a6_blit sframe = frame;
++		sframe.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF;
++		n += a6_blit_ib(&gpu, &sframe, ib + n);
++		struct a6_blit dim_blit = {
++			.src_iova = A6_GVA_POOL + DISPLAY_DIM_OFF + (uint64_t)dim * DISPLAY_DIM_STRIDE,
++			.src_w = DISPLAY_DIM_TILE, .src_h = DISPLAY_DIM_TILE, .src_pitch = DISPLAY_DIM_PITCH,
++			.sw = DISPLAY_DIM_TILE, .sh = DISPLAY_DIM_TILE,
++			.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF, .dst_pitch = fb_pitch,
++			.dx = frame.dx, .dy = frame.dy, .dw = frame.dw, .dh = frame.dh,
++			.blend = true,
++		};
++		n += a6_blit_ib(&gpu, &dim_blit, ib + n);
++		if (ext) {
++			uint32_t top = frame.dy, bottom = frame.dy + frame.dh - ext;
++			for (uint32_t corner = 0; corner < 4; corner++) {
++				struct a6_blit matte = {
++					.src_iova = A6_GVA_POOL + DISPLAY_MASK_OFF,
++					.src_w = DISPLAY_MASK_DIM, .src_h = DISPLAY_MASK_DIM, .src_pitch = DISPLAY_MASK_PITCH,
++					.sx = (corner & 1) * DISPLAY_MASK_SIDE, .sy = (corner >> 1) * DISPLAY_MASK_SIDE,
++					.sw = ext, .sh = ext,
++					.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF, .dst_pitch = fb_pitch,
++					.dx = (corner & 1) ? frame.dx + frame.dw - ext : frame.dx,
++					.dy = (corner & 2) ? bottom : top,
++					.dw = ext, .dh = ext, .blend = true,
++				};
++				n += a6_blit_ib(&gpu, &matte, ib + n);
++			}
++		}
++		struct a6_blit copy_all = {
++			.src_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF,
++			.src_w = PANEL_W, .src_h = PANEL_H, .src_pitch = fb_pitch,
++			.sx = frame.dx, .sy = frame.dy, .sw = frame.dw, .sh = frame.dh,
++			.dst_iova = A6_GVA_FB, .dst_pitch = fb_pitch,
++			.dx = frame.dx, .dy = frame.dy, .dw = frame.dw, .dh = frame.dh,
++		};
++		n += a6_blit_ib(&gpu, &copy_all, ib + n);
++	} else if (ext) {
+ 		if (display_mask_radius != corner_radius) {
+ 			display_mask_build(corner_radius, ext);
+ 			display_mask_radius = corner_radius;
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 2615242..c9a037b 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -14,6 +14,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -67,6 +68,7 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	}
+ 	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
+ 	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++	bool intrs = sweet_spmi_bus_acquire();
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+@@ -74,13 +76,16 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 		keys_last_status = keys_rd(keys_obs, off + 0x08u);
+ 		if (keys_last_status & 1u) {
+ 			if (keys_last_status & 0x0eu) {
++				sweet_spmi_bus_release(intrs);
+ 				return false;
+ 			}
+ 			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
++			sweet_spmi_bus_release(intrs);
+ 			return true;
+ 		}
+ 		delay(1);
+ 	}
++	sweet_spmi_bus_release(intrs);
+ 	return false;
+ }
+ 
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 5a84018..f616888 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -28,6 +28,25 @@ static bool sp_attempted, sp_ready;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+ static bool sp_poisoned[512];
+ 
++static uint32_t sp_bus_busy;
++
++bool
++sweet_spmi_bus_acquire(void)
++{
++	boolean_t intrs = ml_set_interrupts_enabled(FALSE);
++	while (__atomic_exchange_n(&sp_bus_busy, 1u, __ATOMIC_ACQUIRE) != 0u) {
++		__asm__ volatile("yield");
++	}
++	return (bool)intrs;
++}
++
++void
++sweet_spmi_bus_release(bool intrs)
++{
++	__atomic_store_n(&sp_bus_busy, 0u, __ATOMIC_RELEASE);
++	(void)ml_set_interrupts_enabled((boolean_t)intrs);
++}
++
+ static uint32_t
+ sp_rd(vm_offset_t base, unsigned off)
+ {
+@@ -107,6 +126,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	}
+ 	unsigned off = 0x80u * apid;
+ 	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
++	bool intrs = sweet_spmi_bus_acquire();
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+@@ -114,15 +134,18 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+ 		if (status & 1u) {
+ 			if (status & 0x0eu) {
++				sweet_spmi_bus_release(intrs);
+ 				IOLockUnlock(sp_lock);
+ 				return -1;
+ 			}
+ 			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++			sweet_spmi_bus_release(intrs);
+ 			IOLockUnlock(sp_lock);
+ 			return 0;
+ 		}
+ 		delay(1);
+ 	}
++	sweet_spmi_bus_release(intrs);
+ 	sp_poisoned[apid] = true;
+ 	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+ 	    sid, addr, apid);
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..f84a87a 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -2,12 +2,15 @@
+ #ifndef SWEET_BATTERY_SPMI_H
+ #define SWEET_BATTERY_SPMI_H
+ #include <stdint.h>
++#include <stdbool.h>
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++bool sweet_spmi_bus_acquire(void);
++void sweet_spmi_bus_release(bool intrs);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index f009205..a5b4843 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1132,6 +1132,16 @@ bsdinit_task(void)
+ 	if (!bsd_rooted_ramdisk() && mountlist.tqh_first != NULL &&
+ 	    !(mountlist.tqh_first->mnt_flag & MNT_RDONLY)) {
+ 		extern int sweet_ensure_dir_mode(const char *path, mode_t mode);
++		extern void sweet_apply_overlay(void);
++		extern void sweet_files_start(void);
++		extern uint32_t sweet_emu_fast_off;
++		int emufast = 1;
++		if (PE_parse_boot_argn("sweetemufast", &emufast, sizeof(emufast)) && emufast == 0) {
++			sweet_emu_fast_off = 1;
++		}
++		(void)sweet_ensure_dir_mode("/private/var/local", 0777);
++		sweet_apply_overlay();
++		sweet_files_start();
+ 		int e1 = sweet_ensure_dir_mode("/private/var/local", 0777);
+ 		int e2 = sweet_ensure_dir_mode("/private/var/local/m2v-cache", 0777);
+ 		int e3 = sweet_ensure_dir_mode("/private/etc/dropbear", 0700);
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index a7240d8..92b8b28 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -110,6 +110,9 @@
+ #include <sys/fsgetpath.h>
+ #include <machine/cons.h>
+ #include <machine/limits.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/device_tree.h>
++#endif
+ #include <miscfs/specfs/specdev.h>
+ 
+ #include <vfs/vfs_disk_conditioner.h>
+@@ -15655,4 +15658,250 @@ sweet_vfs_unlink(const char *path)
+ {
+ 	return unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
+ }
++
++static uint64_t
++sweet_ov_octal(const uint8_t *p, size_t n)
++{
++	uint64_t v = 0;
++	size_t i = 0;
++	while (i < n && (p[i] == ' ' || p[i] == 0)) {
++		i++;
++	}
++	for (; i < n && p[i] >= '0' && p[i] <= '7'; i++) {
++		v = (v << 3) | (uint64_t)(p[i] - '0');
++	}
++	return v;
++}
++
++static void
++sweet_ov_setattr(const char *path, int mode, uid_t uid, gid_t gid)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) == 0) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, mode & 07777);
++		VATTR_SET(&va, va_uid, uid);
++		VATTR_SET(&va, va_gid, gid);
++		(void)vnode_setattr(vp, &va, ctx);
++		vnode_put(vp);
++	}
++}
++
++static void
++sweet_ov_mkdirs_parent(char *fullpath)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	for (char *p = fullpath + 1; *p != 0; p++) {
++		if (*p != '/') {
++			continue;
++		}
++		*p = 0;
++		vnode_t dvp = NULLVP;
++		if (vnode_lookup(fullpath, 0, &dvp, ctx) == 0) {
++			vnode_put(dvp);
++		} else {
++			(void)sweet_vfs_mkdir(fullpath, 0755);
++		}
++		*p = '/';
++	}
++}
++
++static int
++sweet_ov_write_file(const char *path, const uint8_t *data, uint64_t size, int mode, uid_t uid, gid_t gid)
++{
++	static uint8_t chunk_buf[16384];
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++
++	(void)sweet_vfs_unlink(path);
++	int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, mode & 07777, 0, &vp, ctx);
++	if (err == 0) {
++		err = vnode_setsize(vp, 0, 0, ctx);
++	}
++	uint64_t off = 0;
++	while (err == 0 && off < size) {
++		size_t chunk = (size_t)MIN((uint64_t)sizeof(chunk_buf), size - off);
++		memcpy(chunk_buf, data + off, chunk);
++		int resid = 0;
++		err = vn_rdwr(UIO_WRITE, vp, (caddr_t)chunk_buf, (int)chunk, (off_t)off,
++		    UIO_SYSSPACE, IO_UNIT | IO_SYNC, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (err == 0 && resid != 0) {
++			err = EIO;
++		}
++		off += chunk;
++	}
++	if (vp != NULLVP) {
++		(void)vnode_close(vp, FWRITE, ctx);
++	}
++	if (err == 0) {
++		sweet_ov_setattr(path, mode, uid, gid);
++	}
++	return err;
++}
++
++void sweet_apply_overlay(void);
++void
++sweet_apply_overlay(void)
++{
++	static char rel[300], path[320], linktarget[128];
++	DTEntry chosen;
++	void const *blob = NULL;
++	unsigned size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "sweet-overlay", &blob, &size) != kSuccess ||
++	    blob == NULL || size < 512) {
++		return;
++	}
++	const uint8_t *bytes = (const uint8_t *)blob;
++	uint64_t h = 14695981039346656037ULL;
++	for (unsigned i = 0; i < size; i++) {
++		h = (h ^ bytes[i]) * 1099511628211ULL;
++	}
++	char want[20], have[20];
++	snprintf(want, sizeof(want), "%016llx\n", (unsigned long long)h);
++
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t svp = NULLVP;
++	if (vnode_open("/private/var/local/.overlay-stamp", FREAD, 0, 0, &svp, ctx) == 0) {
++		int resid = 0;
++		bzero(have, sizeof(have));
++		int rerr = vn_rdwr(UIO_READ, svp, (caddr_t)have, 17, 0, UIO_SYSSPACE, 0,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		(void)vnode_close(svp, FREAD, ctx);
++		if (rerr == 0 && resid == 0 && memcmp(have, want, 17) == 0) {
++			printf("SWEET OVERLAY: stamp %016llx up to date\n", (unsigned long long)h);
++			return;
++		}
++	}
++
++	unsigned files = 0, dirs = 0, links = 0, removed = 0, errs = 0;
++	uint64_t pos = 0;
++	while (pos + 512 <= (uint64_t)size) {
++		const uint8_t *hdr = bytes + pos;
++		bool all_zero = true;
++		for (unsigned i = 0; i < 512; i++) {
++			if (hdr[i] != 0) {
++				all_zero = false;
++				break;
++			}
++		}
++		if (all_zero) {
++			break;
++		}
++		uint64_t fsize = sweet_ov_octal(hdr + 124, 12);
++		int mode = (int)sweet_ov_octal(hdr + 100, 8);
++		uid_t uid = (uid_t)sweet_ov_octal(hdr + 108, 8);
++		gid_t gid = (gid_t)sweet_ov_octal(hdr + 116, 8);
++		char typeflag = (char)hdr[156];
++
++		size_t plen = 0, nlen = 0;
++		while (plen < 155 && hdr[345 + plen] != 0) {
++			plen++;
++		}
++		while (nlen < 100 && hdr[nlen] != 0) {
++			nlen++;
++		}
++		if (plen > 0) {
++			snprintf(rel, sizeof(rel), "%.*s/%.*s", (int)plen, (const char *)(hdr + 345),
++			    (int)nlen, (const char *)hdr);
++		} else {
++			snprintf(rel, sizeof(rel), "%.*s", (int)nlen, (const char *)hdr);
++		}
++
++		pos += 512;
++		uint64_t data_pos = pos;
++		uint64_t padded = (fsize + 511ULL) & ~511ULL;
++		if (data_pos + padded > (uint64_t)size) {
++			break;
++		}
++		pos += padded;
++
++		if (typeflag == 'x' || typeflag == 'g') {
++			continue;
++		}
++		char *rp = rel;
++		while (rp[0] == '.' && rp[1] == '/') {
++			rp += 2;
++		}
++		while (*rp == '/') {
++			rp++;
++		}
++		size_t rlen = strlen(rp);
++		while (rlen > 0 && rp[rlen - 1] == '/') {
++			rp[--rlen] = 0;
++		}
++		if (rlen == 0 || strcmp(rp, ".") == 0) {
++			continue;
++		}
++
++		if (strcmp(rp, ".sweet-rm") == 0) {
++			const char *s = (const char *)(bytes + data_pos);
++			const char *end = s + fsize;
++			while (s < end) {
++				const char *e = s;
++				while (e < end && *e != '\n' && *e != '\r') {
++					e++;
++				}
++				size_t ll = (size_t)(e - s);
++				while (ll > 0 && (s[0] == ' ' || s[0] == '/')) {
++					s++;
++					ll--;
++				}
++				if (ll > 0 && s[0] != '#' && ll < sizeof(path) - 2) {
++					snprintf(path, sizeof(path), "/%.*s", (int)ll, s);
++					if (sweet_vfs_unlink(path) == 0) {
++						removed++;
++					}
++				}
++				s = e;
++				while (s < end && (*s == '\n' || *s == '\r')) {
++					s++;
++				}
++			}
++			continue;
++		}
++
++		snprintf(path, sizeof(path), "/%s", rp);
++		sweet_ov_mkdirs_parent(path);
++		if (typeflag == '5') {
++			vnode_t dvp = NULLVP;
++			if (vnode_lookup(path, 0, &dvp, ctx) == 0) {
++				vnode_put(dvp);
++			} else {
++				(void)sweet_vfs_mkdir(path, mode ? mode : 0755);
++			}
++			sweet_ov_setattr(path, mode ? mode : 0755, uid, gid);
++			dirs++;
++		} else if (typeflag == '2') {
++			size_t llen = 0;
++			while (llen < 100 && hdr[157 + llen] != 0) {
++				llen++;
++			}
++			snprintf(linktarget, sizeof(linktarget), "%.*s", (int)llen, (const char *)(hdr + 157));
++			(void)sweet_vfs_unlink(path);
++			if (sweet_vfs_symlink(linktarget, path) == 0) {
++				links++;
++			} else {
++				errs++;
++			}
++		} else if (typeflag == '0' || typeflag == 0) {
++			int werr = sweet_ov_write_file(path, bytes + data_pos, fsize, mode ? mode : 0644, uid, gid);
++			if (werr == 0) {
++				files++;
++			} else {
++				printf("SWEET OVERLAY: write %s failed (%d)\n", path, werr);
++				errs++;
++			}
++		}
++	}
++
++	if (errs == 0) {
++		(void)sweet_ov_write_file("/private/var/local/.overlay-stamp", (const uint8_t *)want, 17, 0644, 0, 0);
++	}
++	printf("SWEET OVERLAY: applied %016llx (%u files, %u dirs, %u symlinks, %u unlinked, %u errs)\n",
++	    (unsigned long long)h, files, dirs, links, removed, errs);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bc98b59..29828f5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -49,6 +49,7 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
+ 	uint32_t *out_dw, uint32_t *out_dh);
+ void sweet_gpu_panel_stride(uint32_t stride);
+ extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
++extern volatile uint32_t sweet_backlight_alpha;
+ }
+ #define SWEET_FB_GPU_ROWBYTES           4352    /* the 2D engine writes 64-byte multiples */
+ 
+@@ -61,6 +62,7 @@ extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
++#include <libkern/c++/OSContainers.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+@@ -127,26 +129,34 @@ public:
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+-	IOLock       *fLock;            /* swaps and client list */
++	IOLock       *fLock;		/* swaps and client list */
++	IOLock       *fPresentLock;	/* serializes direct SwapEnd present with timer/backlight */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+-	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
++	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];	/* latest swap, not yet shown */
++	uint8_t       fLastRec[SWEET_FB_SWAP_REC_SIZE];	/* latest swap overall (wake / backlight redraw) */
++	bool          fHasSwap;
+ 	bool          fDirty;
+-	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+-	bool          fPowerOff;      /* RequestPowerChange(0) */
+-	bool          fGPU;           /* panel switched to the GPU's stride; frames scaled to fit */
+-	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	bool          fDirectPresent;	/* queue async GPU present directly on SwapEnd */
++	uint64_t      fLastSwapAbs;
++	uint32_t      fFlushTicks;	/* vsync ticks between panel copies */
++	bool          fPowerOff;	/* RequestPowerChange(0) */
++	bool          fGPU;		/* panel switched to the GPU's stride; frames scaled to fit */
++	uint32_t      fFadeStep;	/* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
++	void refreshBrightness(void);
+ 	void present(const uint8_t *rec);
+ 	bool presentGPU(const uint8_t *rec);
+ 	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
+ };
+ 
++static AppleCLCD *gMainFB;
++
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -218,7 +228,11 @@ AppleCLCD::start(IOService *provider)
+ 		fCornerExt = 0;
+ 	}
+ 	fLock = IOLockAlloc();
++	fPresentLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
++	int direct = 0;
++	PE_parse_boot_argn("sweetfb_direct", &direct, sizeof(direct));
++	fDirectPresent = (direct != 0);
+ 	/* With the GPU (sweetgpu=1) the panel later switches to 4352-byte rows: map that much. */
+ 	int gpu = 0;
+ 	PE_parse_boot_argn("sweetgpu", &gpu, sizeof(gpu));
+@@ -226,7 +240,7 @@ AppleCLCD::start(IOService *provider)
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, mapRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+-	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
++	if (fLock == NULL || fPresentLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+ 		OSSafeReleaseNULL(fWorkLoop);
+@@ -245,9 +259,10 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	gMainFB = this;
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u (direct=%d)\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fDirectPresent ? 1 : 0);
+ 	return true;
+ }
+ 
+@@ -332,10 +347,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		IOLockLock(fb->fPresentLock);
+ 		uint64_t t0 = mach_absolute_time();
+ 		fb->present(rec);
+-		fb->fStatPresentAbs += mach_absolute_time() - t0;
++		uint64_t dt = mach_absolute_time() - t0;
++		IOLockUnlock(fb->fPresentLock);
++		IOLockLock(fb->fLock);
++		fb->fStatPresentAbs += dt;
+ 		fb->fStatPresents++;
++		IOLockUnlock(fb->fLock);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ }
+@@ -379,15 +399,70 @@ static uint32_t sweet_fb_swaps_logged;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	bool direct = false;
++	uint64_t now = mach_absolute_time();
+ 	IOLockLock(fLock);
+-	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-	fDirty = true;
++	memcpy(fLastRec, rec, SWEET_FB_SWAP_REC_SIZE);
++	fHasSwap = true;
++	fLastSwapAbs = now;
++	if (fDirectPresent && fFlushTicks == 1 && !fPowerOff && sweet_gpu_ready()) {
++		fDirty = false;
++		direct = true;
++	} else {
++		memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++		fDirty = true;
++	}
+ 	IOLockUnlock(fLock);
++	if (direct) {
++		IOLockLock(fPresentLock);
++		uint64_t t0 = mach_absolute_time();
++		present(rec);
++		uint64_t dt = mach_absolute_time() - t0;
++		IOLockUnlock(fPresentLock);
++		IOLockLock(fLock);
++		fStatPresentAbs += dt;
++		fStatPresents++;
++		IOLockUnlock(fLock);
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
+ 
++void
++AppleCLCD::refreshBrightness(void)
++{
++	uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++	bool direct = false;
++	uint64_t now = mach_absolute_time();
++	IOLockLock(fLock);
++	if (fHasSwap && !fPowerOff) {
++		uint64_t minGap = fVsyncAbs ? (fVsyncAbs * 3) / 4 : 0;
++		if (sweet_gpu_ready()) {
++			if (now - fLastSwapAbs >= minGap) {
++				fLastSwapAbs = now;
++				memcpy(rec, fLastRec, sizeof(rec));
++				direct = true;
++			}
++		} else {
++			memcpy(fPending, fLastRec, sizeof(fPending));
++			fDirty = true;
++		}
++	}
++	IOLockUnlock(fLock);
++	if (direct) {
++		IOLockLock(fPresentLock);
++		uint64_t t0 = mach_absolute_time();
++		present(rec);
++		uint64_t dt = mach_absolute_time() - t0;
++		IOLockUnlock(fPresentLock);
++		IOLockLock(fLock);
++		fStatPresentAbs += dt;
++		fStatPresents++;
++		IOLockUnlock(fLock);
++	}
++}
++
+ static uint32_t sweet_fb_gpu_why_logged;
+ 
+ /* Why presentGPU fell back to the CPU copy, logged once per reason. */
+@@ -418,8 +493,16 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
+ 	} else if (y >= fHeight - e) {
+ 		cov = fCornerCov + (size_t)(fHeight - 1 - y) * e;
+ 	}
++	uint32_t dim = sweet_backlight_alpha;
++	uint32_t bscale = dim >= 240 ? 15u : (255u - dim);
+ 	if (cov == NULL) {
+-		memcpy(dst, src, (size_t)n * 4);
++		if (bscale >= 255u) {
++			memcpy(dst, src, (size_t)n * 4);
++		} else {
++			for (uint32_t i = 0; i < n; i++) {
++				dst[i] = sweet_display_dim(src[i], bscale);
++			}
++		}
+ 		return;
+ 	}
+ 	/* [x, l): left corner, [l, r): plain, [r, end): right corner. */
+@@ -427,12 +510,19 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
+ 	l = l < x ? x : l;
+ 	r = r < l ? l : (r > end ? end : r);
+ 	for (uint32_t px = x; px < l; px++) {
+-		dst[px - x] = cov[px] == 255 ? src[px - x] : sweet_display_dim(src[px - x], cov[px]);
++		uint32_t c = (cov[px] * bscale) / 255u;
++		dst[px - x] = c >= 255u ? src[px - x] : sweet_display_dim(src[px - x], c);
++	}
++	if (bscale >= 255u) {
++		memcpy(&dst[l - x], &src[l - x], (size_t)(r - l) * 4);
++	} else {
++		for (uint32_t px = l; px < r; px++) {
++			dst[px - x] = sweet_display_dim(src[px - x], bscale);
++		}
+ 	}
+-	memcpy(&dst[l - x], &src[l - x], (size_t)(r - l) * 4);
+ 	for (uint32_t px = r; px < end; px++) {
+-		uint32_t c = cov[fWidth - 1 - px];
+-		dst[px - x] = c == 255 ? src[px - x] : sweet_display_dim(src[px - x], c);
++		uint32_t c = (cov[fWidth - 1 - px] * bscale) / 255u;
++		dst[px - x] = c >= 255u ? src[px - x] : sweet_display_dim(src[px - x], c);
+ 	}
+ }
+ 
+@@ -758,7 +848,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+-				fFB->fDirty = true;     /* on: redraw the latest frame */
++				if (!off && fFB->fHasSwap) {
++					memcpy(fFB->fPending, fFB->fLastRec, SWEET_FB_SWAP_REC_SIZE);
++				}
++				fFB->fDirty = true;	/* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+@@ -787,4 +880,210 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	}
+ 	return ret;
+ }
++
++/*
++ * AppleARMBacklight matching IODeviceTree:/backlight for CoreBrightness / BacklightServices.
++ * Converts linear Q16.16 brightness-nits (D22AP user max = 625 nits = 40960000) into an sRGB
++ * gamma-2.0 perceptual scale via integer square root, driving tear-free Adreno 640 2D dimming.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++
++	IOLock  *fLock;
++	uint32_t fMillinits;
++	uint32_t fRawLevel;
++	uint32_t fLogCount;
++
++	static OSDictionary *makeRange(uint32_t mn, uint32_t mx, uint32_t val);
++	void publishDisplayParams(void);
++	void applyNitsQ16(uint32_t rawQ16);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++static uint32_t
++sweet_isqrt32(uint32_t n)
++{
++	uint32_t res = 0;
++	uint32_t bit = 1u << 30;
++	while (bit > n) {
++		bit >>= 2;
++	}
++	while (bit != 0) {
++		if (n >= res + bit) {
++			n -= res + bit;
++			res = (res >> 1) + bit;
++		} else {
++			res >>= 1;
++		}
++		bit >>= 2;
++	}
++	return res;
++}
++
++OSDictionary *
++AppleARMBacklight::makeRange(uint32_t mn, uint32_t mx, uint32_t val)
++{
++	OSDictionary *d = OSDictionary::withCapacity(3);
++	if (d == NULL) {
++		return NULL;
++	}
++	OSNumber *nMin = OSNumber::withNumber((uint64_t)mn, 32);
++	OSNumber *nMax = OSNumber::withNumber((uint64_t)mx, 32);
++	OSNumber *nVal = OSNumber::withNumber((uint64_t)val, 32);
++	if (nMin != NULL) {
++		d->setObject("min", nMin);
++		nMin->release();
++	}
++	if (nMax != NULL) {
++		d->setObject("max", nMax);
++		nMax->release();
++	}
++	if (nVal != NULL) {
++		d->setObject("value", nVal);
++		nVal->release();
++	}
++	return d;
++}
++
++void
++AppleARMBacklight::publishDisplayParams(void)
++{
++	OSDictionary *params = OSDictionary::withCapacity(3);
++	if (params == NULL) {
++		return;
++	}
++	OSDictionary *dBri = makeRange(6, 2047, fRawLevel);
++	OSDictionary *dNits = makeRange(2000, 625000, fMillinits);
++	OSDictionary *dAmps = makeRange(0, 100000, 25000);
++	if (dBri != NULL) {
++		params->setObject("brightness", dBri);
++		dBri->release();
++	}
++	if (dNits != NULL) {
++		params->setObject("BrightnessMilliNits", dNits);
++		dNits->release();
++	}
++	if (dAmps != NULL) {
++		params->setObject("BrightnessMicroAmps", dAmps);
++		dAmps->release();
++	}
++	setProperty("IODisplayParameters", params);
++	params->release();
++}
++
++void
++AppleARMBacklight::applyNitsQ16(uint32_t rawQ16)
++{
++	const uint64_t maxQ16 = 625ULL * 65536ULL;
++	uint64_t clamped = rawQ16 > maxQ16 ? maxQ16 : (uint64_t)rawQ16;
++	uint32_t ratioQ16 = (uint32_t)((clamped * 65536ULL) / maxQ16);
++	uint32_t scale256 = sweet_isqrt32(ratioQ16);	/* 0..256 perceptual sRGB scale */
++	if (rawQ16 > 0 && scale256 < 20) {
++		scale256 = 20;				/* ~8% minimum readable floor */
++	}
++	uint32_t alpha = scale256 >= 256 ? 0 : (256u - scale256);
++	if (alpha > 236) {
++		alpha = 236;
++	}
++	fMillinits = (uint32_t)((clamped * 1000ULL) >> 16);
++	if (fMillinits < 2000 && rawQ16 > 0) {
++		fMillinits = 2000;
++	}
++	fRawLevel = (uint32_t)(6u + ((uint64_t)scale256 * 2041ULL) / 256ULL);
++	if (fRawLevel > 2047) {
++		fRawLevel = 2047;
++	}
++	uint32_t prev = sweet_backlight_alpha;
++	sweet_backlight_alpha = alpha;
++	setProperty("brightness-nits", (uint64_t)rawQ16, 32);
++	publishDisplayParams();
++	if (fLogCount < 8) {
++		fLogCount++;
++		IOLog("SWEET BL: nits_q16=%u (%u mNits) -> sRGB %u/256 dim_alpha=%u\n",
++		    rawQ16, fMillinits, scale256, alpha);
++	}
++	if (alpha != prev && gMainFB != NULL) {
++		gMainFB->refreshBrightness();
++	}
++}
++
++bool
++AppleARMBacklight::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fLock = IOLockAlloc();
++	if (fLock == NULL) {
++		return false;
++	}
++	fMillinits = 625000;
++	fRawLevel = 2047;
++	fLogCount = 0;
++	sweet_backlight_alpha = 0;
++	setProperty("backlight-control", kOSBooleanTrue);
++	setProperty("BuiltIn", kOSBooleanTrue);
++	setProperty("brightness-nits", (uint64_t)(625ULL * 65536ULL), 32);
++	publishDisplayParams();
++	registerService();
++	IOLog("SWEET BL: AppleARMBacklight registered on /backlight (max 625 nits)\n");
++	return true;
++}
++
++static bool
++sweet_extract_u32(OSObject *obj, uint32_t *out)
++{
++	OSNumber *num = OSDynamicCast(OSNumber, obj);
++	if (num != NULL) {
++		*out = num->unsigned32BitValue();
++		return true;
++	}
++	OSDictionary *d = OSDynamicCast(OSDictionary, obj);
++	if (d != NULL) {
++		OSNumber *v = OSDynamicCast(OSNumber, d->getObject("value"));
++		if (v != NULL) {
++			*out = v->unsigned32BitValue();
++			return true;
++		}
++	}
++	return false;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	uint32_t v = 0;
++	if (sweet_extract_u32(dict->getObject("brightness-nits"), &v)) {
++		applyNitsQ16(v);
++	} else if (sweet_extract_u32(dict->getObject("BrightnessMilliNits"), &v)) {
++		applyNitsQ16((uint32_t)(((uint64_t)v << 16) / 1000ULL));
++	} else if (sweet_extract_u32(dict->getObject("brightness"), &v)) {
++		uint32_t lvl = v > 2047 ? 2047 : v;
++		uint64_t lin = ((uint64_t)lvl * (uint64_t)lvl * 625ULL * 65536ULL) / (2047ULL * 2047ULL);
++		applyNitsQ16((uint32_t)lin);
++	} else {
++		OSDictionary *dp = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
++		if (dp != NULL) {
++			if (sweet_extract_u32(dp->getObject("BrightnessMilliNits"), &v)) {
++				applyNitsQ16((uint32_t)(((uint64_t)v << 16) / 1000ULL));
++			} else if (sweet_extract_u32(dp->getObject("brightness"), &v)) {
++				uint32_t lvl = v > 2047 ? 2047 : v;
++				uint64_t lin = ((uint64_t)lvl * (uint64_t)lvl * 625ULL * 65536ULL) / (2047ULL * 2047ULL);
++				applyNitsQ16((uint32_t)lin);
++			}
++		}
++	}
++	IOLockUnlock(fLock);
++	return kIOReturnSuccess;
++}
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 423042f..6c2f4aa 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -43,7 +43,9 @@
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceSetYCbCrMatrix     = 5,
+ 	kSweetSurfaceLimits             = 13,
++	kSweetSurfaceSetBulkAttachments = 27,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
+ };
+@@ -65,6 +67,11 @@ enum {
+ #define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
++#define SWEET_SURFACE_STATE_YCBCR       0x24    /* u32 YCbCr matrix in the state page */
++#define SWEET_SURFACE_STATE_BULK        0x30    /* 112-byte bulk attachments in the state page */
++#define SWEET_SURFACE_BULK_SIZE         112u
++#define SWEET_SURFACE_BULK_IN_SIZE      0x88u   /* 112B data + u64 size + u64 mask + u32 id */
++#define SWEET_SURFACE_MAX_EXT           4096u
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+ static IOLock       *sweet_surface_lock;
+@@ -317,18 +324,30 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 		s->pixelFormat = 0x42475241u;
+ 		one_plane = true;
+ 	}
++	uint32_t topExtL = sweet_dict_u32(props, "IOSurfaceExtendedPixelsOnLeft", 0);
++	uint32_t topExtR = sweet_dict_u32(props, "IOSurfaceExtendedPixelsOnRight", 0);
++	uint32_t topExtT = sweet_dict_u32(props, "IOSurfaceExtendedPixelsOnTop", 0);
++	uint32_t topExtB = sweet_dict_u32(props, "IOSurfaceExtendedPixelsOnBottom", 0);
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
++	    topExtL > SWEET_SURFACE_MAX_EXT || topExtR > SWEET_SURFACE_MAX_EXT ||
++	    topExtT > SWEET_SURFACE_MAX_EXT || topExtB > SWEET_SURFACE_MAX_EXT ||
+ 	    s->bytesPerElement > 64 || s->elementWidth == 0 || s->elementHeight == 0) {
+ 		return kIOReturnBadArgument;
+ 	}
++	uint32_t effTopW = s->width + topExtL + topExtR;
++	uint32_t effTopH = s->height + topExtT + topExtB;
+ 	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
+-	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
++	    sweet_row_bytes(effTopW, s->elementWidth, s->bytesPerElement));
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(effTopH, s->elementHeight);
++	s->planes[0].extLeft = topExtL;
++	s->planes[0].extRight = topExtR;
++	s->planes[0].extTop = topExtT;
++	s->planes[0].extBottom = topExtB;
+ 
+ 	OSArray *planes = one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+@@ -345,19 +364,38 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			}
+ 			p->width = sweet_dict_u32(pd, "IOSurfacePlaneWidth", s->width);
+ 			p->height = sweet_dict_u32(pd, "IOSurfacePlaneHeight", s->height);
++			p->extLeft = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnLeft", topExtL);
++			p->extRight = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnRight", topExtR);
++			p->extTop = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnTop", topExtT);
++			p->extBottom = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnBottom", topExtB);
+ 			p->bytesPerElement = (uint16_t)sweet_dict_u32(pd, "IOSurfacePlaneBytesPerElement", 1);
+ 			p->elementWidth = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementWidth", 1);
+ 			p->elementHeight = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementHeight", 1);
+ 			if (p->width > SWEET_SURFACE_MAX_DIM || p->height > SWEET_SURFACE_MAX_DIM ||
++			    p->extLeft > SWEET_SURFACE_MAX_EXT || p->extRight > SWEET_SURFACE_MAX_EXT ||
++			    p->extTop > SWEET_SURFACE_MAX_EXT || p->extBottom > SWEET_SURFACE_MAX_EXT ||
+ 			    p->bytesPerElement > 64 || p->elementWidth == 0 || p->elementHeight == 0) {
+ 				return kIOReturnBadArgument;
+ 			}
++			uint32_t effW = p->width + p->extLeft + p->extRight;
++			uint32_t effH = p->height + p->extTop + p->extBottom;
+ 			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
+-			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
++			    sweet_row_bytes(effW, p->elementWidth, p->bytesPerElement));
++			if (p->bytesPerRow < (uint64_t)sweet_div_up(p->width, p->elementWidth) * p->bytesPerElement) {
++				return kIOReturnBadArgument;
++			}
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+-			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+-			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
+-			next = round_page((uint64_t)p->offset + p->size);
++			uint64_t minSize = (uint64_t)p->bytesPerRow * sweet_div_up(effH, p->elementHeight);
++			uint64_t reqSize = sweet_dict_u32(pd, "IOSurfacePlaneSize", (uint32_t)minSize);
++			if (reqSize < minSize) {
++				reqSize = minSize;
++			}
++			if (reqSize > SWEET_SURFACE_MAX_ALLOC) {
++				return kIOReturnNoMemory;
++			}
++			p->size = (uint32_t)reqSize;
++			/* Leave a guard slack page between kernel-placed planes for codec macroblock overhang. */
++			next = round_page((uint64_t)p->offset + p->size) + page_size;
+ 			if ((uint64_t)p->offset + p->size > end) {
+ 				end = (uint64_t)p->offset + p->size;
+ 			}
+@@ -392,7 +430,9 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	if (alloc < end) {
+ 		alloc = end;
+ 	}
+-	alloc = round_page(alloc);
++	/* Keep one writable zeroed slack page past nominal plane end so macroblock
++	 * software decoders (H264SW.videocodec) never fault into ref->state (+0x40). */
++	alloc = round_page(alloc) + page_size;
+ 	if (alloc == 0 || alloc > SWEET_SURFACE_MAX_ALLOC) {
+ 		return kIOReturnNoMemory;
+ 	}
+@@ -637,6 +677,13 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 	put32(out, 0x44, s->cacheMode);
+ 	put32(out, 0x50, s->parentID);
+ 	put32(out, 0x54, 1);
++	if (s->planeCount == 0) {
++		uint8_t *p0 = out + 0x68;
++		put32(p0, 0x70, s->planes[0].extRight);
++		put32(p0, 0x74, s->planes[0].extBottom);
++		put32(p0, 0x78, s->planes[0].extLeft);
++		put32(p0, 0x7c, s->planes[0].extTop);
++	}
+ 	for (uint32_t i = 0; i < s->planeCount; i++) {
+ 		uint8_t *p = out + 0x68 + i * 0x80;
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+@@ -648,6 +695,10 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
+ 		p[0x1b] = pl->elementHeight;
++		put32(p, 0x70, pl->extRight);
++		put32(p, 0x74, pl->extBottom);
++		put32(p, 0x78, pl->extLeft);
++		put32(p, 0x7c, pl->extTop);
+ 	}
+ }
+ 
+@@ -812,6 +863,69 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return ret;
+ 	}
++	case kSweetSurfaceSetYCbCrMatrix: {
++		if (args->scalarInputCount < 2) {
++			return kIOReturnBadArgument;
++		}
++		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
++		if (s == NULL) {
++			return kIOReturnNotFound;
++		}
++		uint32_t matrix = (uint32_t)args->scalarInput[1];
++		IOLockLock(sweet_surface_lock);
++		put32((uint8_t *)s->state->getBytesNoCopy(), SWEET_SURFACE_STATE_YCBCR, matrix);
++		__asm__ volatile("dmb ish" ::: "memory");
++		IOLockUnlock(sweet_surface_lock);
++		s->release();
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
++	case kSweetSurfaceSetBulkAttachments: {
++		uint8_t inBuf[SWEET_SURFACE_BULK_IN_SIZE];
++		if (args->structureInputDescriptor != NULL) {
++			if (args->structureInputDescriptor->getLength() < SWEET_SURFACE_BULK_IN_SIZE) {
++				return kIOReturnBadArgument;
++			}
++			args->structureInputDescriptor->readBytes(0, inBuf, SWEET_SURFACE_BULK_IN_SIZE);
++		} else if (args->structureInput != NULL && args->structureInputSize >= SWEET_SURFACE_BULK_IN_SIZE) {
++			memcpy(inBuf, args->structureInput, SWEET_SURFACE_BULK_IN_SIZE);
++		} else {
++			return kIOReturnBadArgument;
++		}
++		uint64_t bulkSize = 0, mask = 0;
++		uint32_t surfID = 0;
++		memcpy(&bulkSize, inBuf + 0x70, 8);
++		memcpy(&mask, inBuf + 0x78, 8);
++		memcpy(&surfID, inBuf + 0x80, 4);
++		if (bulkSize > SWEET_SURFACE_BULK_SIZE) {
++			return kIOReturnBadArgument;
++		}
++		SweetSurface *s = sweet_surface_copy(surfID);
++		if (s == NULL) {
++			return kIOReturnNotFound;
++		}
++		static const struct { uint8_t off, len; } fields[15] = {
++			{  0, 32 }, { 32, 16 }, { 48,  8 },
++			{ 56,  1 }, { 57,  1 }, { 58,  1 }, { 59,  1 },
++			{ 60,  1 }, { 61,  1 }, { 62,  1 }, { 63,  1 },
++			{ 64, 24 }, { 88,  4 }, { 92,  8 }, { 100, 12 },
++		};
++		uint8_t *dst = (uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_BULK;
++		IOLockLock(sweet_surface_lock);
++		for (unsigned bit = 0; bit < 15; bit++) {
++			if (!(mask & (1ULL << bit)) || fields[bit].off >= bulkSize) {
++				continue;
++			}
++			size_t avail = (size_t)bulkSize - fields[bit].off;
++			size_t n = fields[bit].len < avail ? fields[bit].len : avail;
++			memcpy(dst + fields[bit].off, inBuf + fields[bit].off, n);
++		}
++		__asm__ volatile("dmb ish" ::: "memory");
++		IOLockUnlock(sweet_surface_lock);
++		s->release();
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
+ 	case kSweetSurfaceCreatePort: {
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+ 		if (s == NULL || args->scalarOutputCount < 1) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..4ba58dc 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -20,6 +20,7 @@
+ 
+ struct sweet_surface_plane {
+ 	uint32_t width, height, bytesPerRow, offset, size;
++	uint32_t extLeft, extRight, extTop, extBottom;
+ 	uint16_t bytesPerElement;
+ 	uint8_t  elementWidth, elementHeight;
+ };
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 023dab1..45c002c 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -68,6 +68,11 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'sweet,display';"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleARMBacklight;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'backlight';"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDButtons;"
+diff --git a/osfmk/arm64/locore.s b/osfmk/arm64/locore.s
+index 3f42af8..cf42dcf 100644
+--- a/osfmk/arm64/locore.s
++++ b/osfmk/arm64/locore.s
+@@ -980,6 +980,342 @@ el1_sp1_serror_vector_long:
+ .endmacro
+ 
+ el0_synchronous_vector_64_long:
++#if defined(SWEET)
++	/*
++	 * Fast EL0 ARMv8.3 PAC handler for Kryo 485 (ARMv8.2-A): handles hot
++	 * pacga (libobjc _objc_strhash / cookies) and any remaining bra*/blra*/reta*
++	 * in ~45 cycles on SP_EL1 without spilling 512 B NEON state, switching stacks,
++	 * or bouncing global atomic cache lines across clusters.
++	 */
++	stp		x0, x1, [sp, #-80]!
++	mrs		x0, ESR_EL1
++	lsr		x1, x0, #26
++	cbnz	x1, Lsweet_fast_bail16			// EC != 0 (ESR_EC_UNCATEGORIZED) -> 4-insn exit
++	tbz		x0, #25, Lsweet_fast_bail16		// 16-bit instruction -> slow path
++	mrs		x1, SPSR_EL1
++	tbnz	x1, #21, Lsweet_fast_bail16		// PSR64_SS hardware single-step -> slow path
++	tbnz	x1, #4, Lsweet_fast_bail16		// AArch32 -> slow path
++	adrp	x1, EXT(sweet_emu_fast_off)@page
++	ldr		w1, [x1, EXT(sweet_emu_fast_off)@pageoff]
++	cbnz	w1, Lsweet_fast_bail16
++	mrs		x0, ELR_EL1
++	tst		x0, #3
++	b.ne	Lsweet_fast_bail16
++
++	stp		x2, x3, [sp, #0x10]
++	stp		x4, x5, [sp, #0x20]
++	stp		x8, x9, [sp, #0x30]
++	stp		x10, x30, [sp, #0x40]
++	mov		x3, x0
++
++	at		s1e0r, x3
++	isb
++	mrs		x0, PAR_EL1
++	tbnz	x0, #0, Lsweet_fast_slow
++	and		x0, x0, #0x0000fffffffff000
++	bfxil	x0, x3, #0, #12
++	adrp	x8, EXT(gPhysBase)@page
++	ldr		x8, [x8, EXT(gPhysBase)@pageoff]
++	adrp	x9, EXT(real_phys_size)@page
++	ldr		x9, [x9, EXT(real_phys_size)@pageoff]
++	subs	x10, x0, x8
++	b.lo	Lsweet_fast_slow
++	cmp		x10, x9
++	b.hs	Lsweet_fast_slow
++	bl		EXT(phystokv)
++	ldr		w4, [x0]
++
++	// 1. pacga Xd, Xn, <Xm|SP>: (w4 & 0xffe0fc00) == 0x9ac03000
++	movz	w8, #0xffe0, lsl #16
++	movk	w8, #0xfc00
++	and		w8, w4, w8
++	movz	w9, #0x9ac0, lsl #16
++	movk	w9, #0x3000
++	cmp		w8, w9
++	b.eq	Lsweet_fast_pacga
++
++	// 2. retaa (0xd65f0bff) / retab (0xd65f0fff): (w4 & 0xfffffbff) == 0xd65f0bff
++	bic		w8, w4, #0x400
++	movz	w9, #0xd65f, lsl #16
++	movk	w9, #0x0bff
++	cmp		w8, w9
++	b.eq	Lsweet_fast_reta
++
++	// 3. braaz/brabz ((w4 & 0xfffff81f) == 0xd61f081f) & braa/brab ((w4 & 0xfffff800) == 0xd71f0800)
++	movz	w8, #0xffff, lsl #16
++	movk	w8, #0xf81f
++	and		w8, w4, w8
++	movz	w9, #0xd61f, lsl #16
++	movk	w9, #0x081f
++	cmp		w8, w9
++	b.eq	Lsweet_fast_bra
++	and		w8, w4, #0xfffff800
++	movz	w9, #0xd71f, lsl #16
++	movk	w9, #0x0800
++	cmp		w8, w9
++	b.eq	Lsweet_fast_bra
++
++	// 4. blraaz/blrabz ((w4 & 0xfffff81f) == 0xd63f081f) & blraa/blrab ((w4 & 0xfffff800) == 0xd73f0800)
++	movz	w8, #0xffff, lsl #16
++	movk	w8, #0xf81f
++	and		w8, w4, w8
++	movz	w9, #0xd63f, lsl #16
++	movk	w9, #0x081f
++	cmp		w8, w9
++	b.eq	Lsweet_fast_blra
++	and		w8, w4, #0xfffff800
++	movz	w9, #0xd73f, lsl #16
++	movk	w9, #0x0800
++	cmp		w8, w9
++	b.eq	Lsweet_fast_blra
++	b		Lsweet_fast_slow
++
++Lsweet_fast_pacga:
++	and		w5, w4, #31
++	cmp		w5, #31
++	b.eq	Lsweet_fast_pacga_done
++	ubfx	w8, w4, #5, #5
++	adr		x9, Lsweet_read_gpr
++	add		x9, x9, x8, lsl #3
++	blr		x9
++	mov		x1, x0
++	ubfx	w8, w4, #16, #5
++	cmp		w8, #31
++	b.eq	Lsweet_fast_pacga_sp
++	adr		x9, Lsweet_read_gpr
++	add		x9, x9, x8, lsl #3
++	blr		x9
++	mov		x2, x0
++	b		Lsweet_fast_pacga_hash
++Lsweet_fast_pacga_sp:
++	mrs		x2, SP_EL0
++Lsweet_fast_pacga_hash:
++	movz	x8, #0x7c15
++	movk	x8, #0x7f4a, lsl #16
++	movk	x8, #0x79b9, lsl #32
++	movk	x8, #0x9e37, lsl #48
++	add		x8, x2, x8
++	add		x8, x8, x1, lsl #6
++	add		x8, x8, x1, lsr #2
++	eor		x0, x1, x8
++	eor		x0, x0, x0, lsr #30
++	movz	x8, #0xe5b9
++	movk	x8, #0x1ce4, lsl #16
++	movk	x8, #0x476d, lsl #32
++	movk	x8, #0xbf58, lsl #48
++	mul		x0, x0, x8
++	eor		x0, x0, x0, lsr #27
++	movz	x8, #0x11eb
++	movk	x8, #0x1331, lsl #16
++	movk	x8, #0x49bb, lsl #32
++	movk	x8, #0x94d0, lsl #48
++	mul		x0, x0, x8
++	eor		x0, x0, x0, lsr #31
++	lsr		x8, x0, #32
++	eor		w0, w0, w8
++	cbnz	w0, 1f
++	movz	w0, #0x5a5a, lsl #16
++	movk	w0, #0x5a5a
++1:
++	lsl		x0, x0, #32
++	mov		w8, w5
++	adr		x9, Lsweet_write_gpr
++	add		x9, x9, x8, lsl #3
++	blr		x9
++Lsweet_fast_pacga_done:
++	add		x3, x3, #4
++	b		Lsweet_fast_eret
++
++Lsweet_fast_reta:
++	ldr		x0, [sp, #0x48]
++	tbnz	x0, #55, 1f
++	and		x0, x0, #0x0000ffffffffffff
++1:
++	mov		x3, x0
++	b		Lsweet_fast_eret
++
++Lsweet_fast_bra:
++	ubfx	w8, w4, #5, #5
++	adr		x9, Lsweet_read_gpr
++	add		x9, x9, x8, lsl #3
++	blr		x9
++	tbnz	x0, #55, 1f
++	and		x0, x0, #0x0000ffffffffffff
++1:
++	mov		x3, x0
++	b		Lsweet_fast_eret
++
++Lsweet_fast_blra:
++	ubfx	w8, w4, #5, #5
++	adr		x9, Lsweet_read_gpr
++	add		x9, x9, x8, lsl #3
++	blr		x9
++	add		x8, x3, #4
++	str		x8, [sp, #0x48]
++	tbnz	x0, #55, 1f
++	and		x0, x0, #0x0000ffffffffffff
++1:
++	mov		x3, x0
++
++Lsweet_fast_eret:
++	msr		ELR_EL1, x3
++	ldp		x10, x30, [sp, #0x40]
++	ldp		x8, x9, [sp, #0x30]
++	ldp		x4, x5, [sp, #0x20]
++	ldp		x2, x3, [sp, #0x10]
++	ldp		x0, x1, [sp], #80
++	ERET_NO_STRAIGHT_LINE_SPECULATION
++
++	.align 3
++Lsweet_read_gpr:
++	ldr		x0, [sp, #0x00]
++	ret
++	ldr		x0, [sp, #0x08]
++	ret
++	ldr		x0, [sp, #0x10]
++	ret
++	ldr		x0, [sp, #0x18]
++	ret
++	ldr		x0, [sp, #0x20]
++	ret
++	ldr		x0, [sp, #0x28]
++	ret
++	mov		x0, x6
++	ret
++	mov		x0, x7
++	ret
++	ldr		x0, [sp, #0x30]
++	ret
++	ldr		x0, [sp, #0x38]
++	ret
++	ldr		x0, [sp, #0x40]
++	ret
++	mov		x0, x11
++	ret
++	mov		x0, x12
++	ret
++	mov		x0, x13
++	ret
++	mov		x0, x14
++	ret
++	mov		x0, x15
++	ret
++	mov		x0, x16
++	ret
++	mov		x0, x17
++	ret
++	mov		x0, x18
++	ret
++	mov		x0, x19
++	ret
++	mov		x0, x20
++	ret
++	mov		x0, x21
++	ret
++	mov		x0, x22
++	ret
++	mov		x0, x23
++	ret
++	mov		x0, x24
++	ret
++	mov		x0, x25
++	ret
++	mov		x0, x26
++	ret
++	mov		x0, x27
++	ret
++	mov		x0, x28
++	ret
++	mov		x0, x29
++	ret
++	ldr		x0, [sp, #0x48]
++	ret
++	mov		x0, #0
++	ret
++Lsweet_read_gpr_end:
++.if (Lsweet_read_gpr_end - Lsweet_read_gpr) != 256
++	.err
++.endif
++
++	.align 3
++Lsweet_write_gpr:
++	str		x0, [sp, #0x00]
++	ret
++	str		x0, [sp, #0x08]
++	ret
++	str		x0, [sp, #0x10]
++	ret
++	str		x0, [sp, #0x18]
++	ret
++	str		x0, [sp, #0x20]
++	ret
++	str		x0, [sp, #0x28]
++	ret
++	mov		x6, x0
++	ret
++	mov		x7, x0
++	ret
++	str		x0, [sp, #0x30]
++	ret
++	str		x0, [sp, #0x38]
++	ret
++	str		x0, [sp, #0x40]
++	ret
++	mov		x11, x0
++	ret
++	mov		x12, x0
++	ret
++	mov		x13, x0
++	ret
++	mov		x14, x0
++	ret
++	mov		x15, x0
++	ret
++	mov		x16, x0
++	ret
++	mov		x17, x0
++	ret
++	mov		x18, x0
++	ret
++	mov		x19, x0
++	ret
++	mov		x20, x0
++	ret
++	mov		x21, x0
++	ret
++	mov		x22, x0
++	ret
++	mov		x23, x0
++	ret
++	mov		x24, x0
++	ret
++	mov		x25, x0
++	ret
++	mov		x26, x0
++	ret
++	mov		x27, x0
++	ret
++	mov		x28, x0
++	ret
++	mov		x29, x0
++	ret
++	str		x0, [sp, #0x48]
++	ret
++	nop
++	ret
++Lsweet_write_gpr_end:
++.if (Lsweet_write_gpr_end - Lsweet_write_gpr) != 256
++	.err
++.endif
++
++Lsweet_fast_slow:
++	ldp		x10, x30, [sp, #0x40]
++	ldp		x8, x9, [sp, #0x30]
++	ldp		x4, x5, [sp, #0x20]
++	ldp		x2, x3, [sp, #0x10]
++Lsweet_fast_bail16:
++	ldp		x0, x1, [sp], #80
++#endif /* SWEET */
+ 	EL0_64_VECTOR	sync
+ 	EL0_64_VECTOR_SWITCH_TO_KERN_STACK
+ 	adrp	x1, EXT(fleh_synchronous)@page			// Load address for fleh
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index cd53189..be5f2fc 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -195,8 +195,13 @@ enum sweet_emu_cat {
+ 	SWEET_EMU_CAT_COUNT
+ };
+ 
+-static uint64_t sweet_emu_total = 0;
+-static uint64_t sweet_emu_counts[SWEET_EMU_CAT_COUNT];
++uint32_t sweet_emu_fast_off = 0;
++struct __attribute__((aligned(64))) sweet_emu_pcpu_slot {
++	uint64_t total;
++	uint64_t counts[SWEET_EMU_CAT_COUNT];
++};
++static struct sweet_emu_pcpu_slot sweet_emu_pcpu[16];
++static uint32_t sweet_emu_first_seen;
+ size_t sweet_emu_format_stats(char *buf, size_t buflen);
+ 
+ static const char *const sweet_emu_cat_names[SWEET_EMU_CAT_COUNT] = {
+@@ -213,54 +218,79 @@ static const char *const sweet_emu_cat_names[SWEET_EMU_CAT_COUNT] = {
+ 	"sha3",
+ };
+ 
++static inline void
++sweet_emu_sum(uint64_t *tot_out, uint64_t sums[SWEET_EMU_CAT_COUNT])
++{
++	uint64_t tot = 0;
++	for (unsigned k = 0; k < SWEET_EMU_CAT_COUNT; k++) {
++		sums[k] = 0;
++	}
++	for (unsigned c = 0; c < 16; c++) {
++		tot += sweet_emu_pcpu[c].total;
++		for (unsigned k = 0; k < SWEET_EMU_CAT_COUNT; k++) {
++			sums[k] += sweet_emu_pcpu[c].counts[k];
++		}
++	}
++	*tot_out = tot;
++}
++
+ static inline void
+ sweet_emu_record(enum sweet_emu_cat cat, uint64_t pc, uint32_t insn)
+ {
+-	uint64_t prev_cat = os_atomic_inc_orig(&sweet_emu_counts[cat], relaxed);
+-	uint64_t prev_tot = os_atomic_inc_orig(&sweet_emu_total, relaxed);
+-
+-	if (__improbable(prev_cat == 0)) {
+-		printf("SWEET EMU: first %s emulated (pid=%d pc=0x%llx insn=0x%08x)\n",
+-		    sweet_emu_cat_names[cat], task_pid(current_task()),
+-		    (unsigned long long)pc, insn);
+-	} else if (__improbable(((prev_tot + 1ULL) & 0xFFFFFULL) == 0)) {
++	unsigned cpu = (unsigned)getCpuDatap()->cpu_number & 15u;
++	sweet_emu_pcpu[cpu].counts[cat]++;
++	uint64_t cpu_tot = ++sweet_emu_pcpu[cpu].total;
++	uint32_t bit = 1u << (unsigned)cat;
++
++	if (__improbable((os_atomic_load(&sweet_emu_first_seen, relaxed) & bit) == 0)) {
++		uint32_t prev = os_atomic_or_orig(&sweet_emu_first_seen, bit, relaxed);
++		if ((prev & bit) == 0) {
++			printf("SWEET EMU: first %s emulated (pid=%d pc=0x%llx insn=0x%08x)\n",
++			    sweet_emu_cat_names[cat], task_pid(current_task()),
++			    (unsigned long long)pc, insn);
++		}
++	} else if (__improbable((cpu_tot & 0xFFFFFULL) == 0)) {
++		uint64_t tot, sums[SWEET_EMU_CAT_COUNT];
++		sweet_emu_sum(&tot, sums);
+ 		printf("SWEET EMU: total=%llu pac_ret=%llu pac_br=%llu sign_auth=%llu "
+ 		    "strip=%llu pacga=%llu ldraa=%llu jscvt=%llu fcma=%llu "
+ 		    "lrcpc2=%llu flagm_dit=%llu sha3=%llu\n",
+-		    (unsigned long long)(prev_tot + 1ULL),
+-		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_RET], relaxed),
+-		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_BR], relaxed),
+-		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_SIGN_AUTH], relaxed),
+-		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_STRIP], relaxed),
+-		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PACGA], relaxed),
+-		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_LDRAA], relaxed),
+-		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_JSCVT], relaxed),
+-		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_FCMA], relaxed),
+-		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_LRCPC2], relaxed),
+-		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_FLAGM_DIT], relaxed),
+-		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_SHA3], relaxed));
++		    (unsigned long long)tot,
++		    (unsigned long long)sums[SWEET_EMU_PAC_RET],
++		    (unsigned long long)sums[SWEET_EMU_PAC_BR],
++		    (unsigned long long)sums[SWEET_EMU_PAC_SIGN_AUTH],
++		    (unsigned long long)sums[SWEET_EMU_PAC_STRIP],
++		    (unsigned long long)sums[SWEET_EMU_PACGA],
++		    (unsigned long long)sums[SWEET_EMU_LDRAA],
++		    (unsigned long long)sums[SWEET_EMU_JSCVT],
++		    (unsigned long long)sums[SWEET_EMU_FCMA],
++		    (unsigned long long)sums[SWEET_EMU_LRCPC2],
++		    (unsigned long long)sums[SWEET_EMU_FLAGM_DIT],
++		    (unsigned long long)sums[SWEET_EMU_SHA3]);
+ 	}
+ }
+ 
+ size_t
+ sweet_emu_format_stats(char *buf, size_t buflen)
+ {
++	uint64_t tot, sums[SWEET_EMU_CAT_COUNT];
++	sweet_emu_sum(&tot, sums);
+ 	int n = snprintf(buf, buflen,
+ 	    "total=%llu pac_ret=%llu pac_br=%llu pac_sign_auth=%llu "
+ 	    "pac_strip=%llu pacga=%llu ldraa=%llu jscvt=%llu fcma=%llu "
+ 	    "lrcpc2=%llu flagm_dit=%llu sha3=%llu",
+-	    (unsigned long long)os_atomic_load(&sweet_emu_total, relaxed),
+-	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_RET], relaxed),
+-	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_BR], relaxed),
+-	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_SIGN_AUTH], relaxed),
+-	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_STRIP], relaxed),
+-	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PACGA], relaxed),
+-	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_LDRAA], relaxed),
+-	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_JSCVT], relaxed),
+-	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_FCMA], relaxed),
+-	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_LRCPC2], relaxed),
+-	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_FLAGM_DIT], relaxed),
+-	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_SHA3], relaxed));
++	    (unsigned long long)tot,
++	    (unsigned long long)sums[SWEET_EMU_PAC_RET],
++	    (unsigned long long)sums[SWEET_EMU_PAC_BR],
++	    (unsigned long long)sums[SWEET_EMU_PAC_SIGN_AUTH],
++	    (unsigned long long)sums[SWEET_EMU_PAC_STRIP],
++	    (unsigned long long)sums[SWEET_EMU_PACGA],
++	    (unsigned long long)sums[SWEET_EMU_LDRAA],
++	    (unsigned long long)sums[SWEET_EMU_JSCVT],
++	    (unsigned long long)sums[SWEET_EMU_FCMA],
++	    (unsigned long long)sums[SWEET_EMU_LRCPC2],
++	    (unsigned long long)sums[SWEET_EMU_FLAGM_DIT],
++	    (unsigned long long)sums[SWEET_EMU_SHA3]);
+ 	if (n < 0) {
+ 		return 0;
+ 	}
+-- 
+2.43.0
+
