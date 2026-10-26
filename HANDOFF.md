@@ -1,25 +1,28 @@
 # Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-26, 07:32 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-26, 08:25 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
 
-### HACKIOS PERIPHERALS, RUNTIME FIXES, AUDIO HAL & MEDIA/SYSFIX DYLIBS MERGED INTO `master` (Kernel 0130, 2026-10-26, 07:32)
-- **Merged `feat/hackios-port` (`0ad8f81`, `245f27e`, `8c4d8a5`) onto `master` (`6bf4b1c`, kernel `0129`)**:
-  - **Kernel `0130` (`xnu/patches/0130-rmx1931-hackios-peripherals.patch`)**:
+### BOOT #9 LAUNCHED ON RMX1931: KERNEL 0130 (0129 + HACKIOS PERIPHERALS, AUDIO HAL & MEDIA/SYSFIX DYLIBS) (2026-10-26, 08:25)
+- **Merged `feat/hackios-port` into `master` (`8ef41c8`) & built combined artifacts on GitHub Actions `macos-15`**:
+  - **Kernel `0130` (`xnu/patches/0130-rmx1931-hackios-peripherals.patch`, CI run `40257176135`, `work/boot/kernel-0130` `d745800a8ca8e666d8623e63348d3877f70f3cfc79bee7fd64aa52a38a0f5b29`)**:
     - **AMFI & Sandbox (`bsd/kern/sweet_amfi.c`)**: AMFI `0x5a` (`0xffULL` unless FairPlay-encrypted, allowing `DYLD_INSERT_LIBRARIES` on `__RESTRICT` daemons), AMFI `0x60` (`0x86ULL` for ExtensionKit/PlugInKit/Shortcuts), Sandbox op `4` (`CFFIXED_USER_HOME=` stack lookup returning `0` on match and `ENOENT` when absent), and entitlement-matched `sweet_sandbox_priv_grant` table (`privs=0` disables).
     - **Process & exec injection (`bsd/kern/kern_exec.c`, `bsd/kern/bsd_init.c`)**: `kern.exec_inject` sysctl + boot-time `sweet_exec_inject_init()` running right after `sweet_apply_overlay()` (`/private/var/local/inject.conf` or auto-detected `/usr/local/lib/libsweet_*.dylib`, gated on `sweetinject=1`), `xpcproxy` `pidversion` preservation across `exec` (`xpcproxy_idversion=1` restores stock), and persona-less `posix_spawn` credential adoption (`spawn_validate_persona` / `spawn_persona_adopt`).
     - **RMX1931 Battery (`bsd/dev/rmx1931_battery.{c,h}`, `bsd/dev/sweet_spmi.c`, `iokit/Kernel/arm/SweetBattery.cpp`)**: strictly read-only TI `BQ28Z610`/`BQ27541` (`0x55`, `EAST` TLMM `0x03500000` `GPIO 27/28`, 2S SuperVOOC pack normalization, pin restore on non-RMX1931 boards) + read-only `PM8150B` SID `2` SMB5 observer (`0x1310`/`0x1006`) feeding `IOPMPowerSource` via `SweetBatteryReport()` + `kern.rmx1931.battery_*` sysctls (`rmxbattery=0` disables).
     - **RMX1931 Audio Sink (`bsd/dev/rmx1931_audio.c`)**: `/dev/hakios-audio` (`0666`) non-blocking 48 kHz 16-bit stereo sink + `HAKIOS_AUDIO_SET_VOLUME` ioctl + playback stretch logger (`rmxaudio=0` disables).
     - **RMX1931 Flashlight (`bsd/dev/rmx1931_torch.c`)**: `/dev/hakios-torch` (`0666`) driving `PM8150L` SID `5` `0xd300` (`PPID 0x5d3`, `qpnp-flash-led-v2` channel 0), capped at `125 mA` and `30 s` continuous on-time (`rmxtorch_max_s=N`), with `PM8150L` SID `4` `0x2400` temp-alarm, battery `>= 45 C`, and VPH droop/fault cutoffs (`rmxtorch=0` disables).
     - **RMX1931 Haptics (`bsd/dev/rmx1931_haptic.c`)**: `/dev/hakios-haptic` (`0666`) driving Awinic `AW8697` (`0x5a`, `SOUTH` TLMM `0x03d00000` `GPIO 98/99`, reset `GPIO 116`) in closed-loop `170 Hz` (`LRA_0619`) `CONT` mode with zero-crossing `AUTO_BRK` braking, `97` drive ceiling, `1000 ms` max activation + cooldown, and `SYSINT` fault cutoff (`rmxhaptic=0` disables).
-  - **Userland & Host Tooling**:
-    - `phone/media/` (`libsweet_media.dylib` for `mediaserverd`: skips `BWCoreImageFilterRenderer` portrait GLES prewarm, registers `VCPHEVC.videocodec` software HEVC encoder, bridges `FigFlashlight` on `20H392`/`20F66` to `/dev/hakios-torch`, and prepares CMCapture graph shims; `libsweet_sysfix.dylib` for `containermanagerd` `personasAreSupported -> NO` and `SpringBoard` JPEG/PNG app snapshots).
-    - `phone/audio/` (`HakiosAudio.driver` CoreAudio HAL plug-in presenting `"Speaker"`, `"Hawking"`, `"Actuator"` -> `/dev/hakios-haptic`, and `"Codec"`).
-    - `tools/mkadt.py` (combines `0129`'s `/backlight` node with recursive `/product` subnodes `camera` `flash=1`, `haptics` `closed-loop=1`, `audio`, `facetime`, `maps`), `tools/sweet-root-tweaks.py`, and `tools/rmx1931-install-hackios.sh`.
-- **Open (next)**:
-  1. Download combined `kernel-0130` (`0129` + `0130`) and `ios-userland`, regenerate `work/boot/rmx1931-hi.adt --highmem`, stage `libsweet_media.dylib` + `libsweet_sysfix.dylib` + `HakiosAudio.driver` + `inject.conf` + `VirtualAudio.plugin` + `StartRecorderServer=true` into `work/boot/rmx1931-overlay.tar`, pack `shim/out/shim-rmx1931-ios.img`, and boot-test **Boot #9** (`sweetinject=1`) on RMX1931 hardware.
+  - **Userland (`userland.yml` run `40257176027`), ADT (`work/boot/rmx1931-hi.adt`, `16,752 B`), & Overlay (`work/boot/rmx1931-overlay.tar`, `9,482,240 B`, FNV-1a stamp `509db87570b94c7c`)**:
+    - Combines `0129`'s `/backlight` node with recursive `D22AP` `/product` subnodes (`camera` `flash=0x1`, `haptics` `closed-loop=0x1`, `audio`, `facetime`, `maps`).
+    - Pre-`launchd` overlay installs `libsweet_media.dylib`, `libsweet_sysfix.dylib`, `HakiosAudio.driver`, `/private/var/local/inject.conf`, `wland`, restored `VirtualAudio.plugin`, and `StartRecorderServer = true` in `MediaToolbox.framework/{D22,D221,Default}/SubServerConfiguration.plist` (without `.sweet-rm`, preserving Boot #8's `preferences.plist` `en0` DHCP service and wallpaper).
+  - **Boot #9 (`shim/out/shim-rmx1931-ios.img`, `b3c9ce4c232271b2a0dcf7c1b9df6a0823141726cd5a06b6982a3ea0616129b2`)**:
+    - Archived `work/boot/boot8-ios.log` (`1,371,591 B`, 853 flushes) before flashing.
+    - Boot-args: `debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 sweetfb_direct=1 ufslogsecs=2 sweetgpu=1 sweetgpufreq=6 sweetmtl=2 sweetusb=2 sweetusbframes=0 sweetrtcoff=1792944948 rmxtouchdelay=2 sweetinject=1 flamereboot=7200`.
+- **Open (awaiting Boot #9 interactive check & `boot9-ios.log` pull)**:
+  1. Check live behavior on the phone: real battery percentage & charging icon, Control Center flashlight toggle (`PM8150L` LED), UIKit haptics (`AW8697` LRA), volume HUD / media playback clock (`HakiosAudio.driver`), app switcher snapshots, and Wi-Fi + brightness slider from `0129`.
+  2. Pull `work/boot/boot9-ios.log` from TWRP recovery after testing to inspect `RMX BATTERY`, `RMX TORCH`, `RMX HAPTIC`, `RMX AUDIO`, and `EXEC_INJECT` telemetry.
 
 ### BOOT #8 CONFIRMED WORKING ON HARDWARE (kernel 0129: Wi-Fi + Brightness + Direct Present + Overlay) (2026-10-26, 06:56)
 - **Boot #8 (`shim/out/shim-rmx1931-ios.img`, `48beeccd...`, kernel `0129` `6e04eba2...`) — user confirmed working (`"all good"`)**:
