@@ -22,11 +22,11 @@ def red(text): return f"\033[91m{text}\033[0m"
 def bold(text): return f"\033[1m{text}\033[0m"
 
 
-def validate_patches(verbose=False):
-    patch_dir = os.path.join(REPO_ROOT, 'xnu/patches')
+def validate_patch_dir(rel_dir, folded, verbose=False):
+    patch_dir = os.path.join(REPO_ROOT, rel_dir)
     patch_files = sorted(glob.glob(os.path.join(patch_dir, '*.patch')))
     if not patch_files:
-        print(red("[-] Error: No patch files found in xnu/patches/"))
+        print(red(f"[-] Error: No patch files found in {rel_dir}/"))
         return False
 
     errors = []
@@ -49,14 +49,14 @@ def validate_patches(verbose=False):
             errors.append(f"Patch is empty: {fname}")
             continue
 
-        with open(path, 'r', errors='ignore') as f:
-            head = f.read(2048)
-            if not ('--- ' in head or 'diff ' in head or 'Index:' in head):
-                errors.append(f"Patch missing standard diff header: {fname}")
+        with open(path, 'rb') as bf:
+            raw = bf.read()
+            if b'\r\n' in raw:
+                errors.append(f"Patch contains CRLF line endings: {fname}")
+        head = raw[:2048].decode('utf-8', errors='ignore')
+        if not ('--- ' in head or 'diff ' in head or 'Index:' in head):
+            errors.append(f"Patch missing standard diff header: {fname}")
 
-    # Check contiguous sequence. flame folded a few numbers into the patch before them:
-    # 0090 into 0089, 0092-0093 into 0091, 0101 into 0100 (one commit each in the xnu tree).
-    folded = {90, 92, 93, 101}
     if seen_numbers:
         sorted_nums = sorted(seen_numbers.keys())
         expected = 1
@@ -64,19 +64,29 @@ def validate_patches(verbose=False):
             while expected in folded and expected != num:
                 expected += 1
             if num != expected:
-                errors.append(f"Gap in patch sequence: expected {expected:04d}, found {num:04d} ({seen_numbers[num]})")
+                errors.append(f"Gap in {rel_dir} sequence: expected {expected:04d}, found {num:04d} ({seen_numbers[num]})")
                 expected = num + 1
             else:
                 expected += 1
 
     if errors:
-        print(red(f"[-] Patch validation failed with {len(errors)} error(s):"))
+        print(red(f"[-] Patch validation for {rel_dir} failed with {len(errors)} error(s):"))
         for err in errors:
             print(f"    - {err}")
         return False
 
-    print(green(f"[✓] Validated {len(patch_files)} patches (0001-{max(seen_numbers):04d} contiguous, format OK)"))
+    print(green(f"[✓] Validated {len(patch_files)} patches in {rel_dir} ({min(seen_numbers):04d}-{max(seen_numbers):04d} contiguous, LF & format OK)"))
     return True
+
+
+def validate_patches(verbose=False):
+    # Legacy xnu-11215 series: 0090->0089, 0092-0093->0091, 0101->0100.
+    ok16 = validate_patch_dir('xnu/patches', {90, 92, 93, 101}, verbose)
+    ok26 = True
+    if os.path.isdir(os.path.join(REPO_ROOT, 'xnu/patches-26')):
+        # xnu-12377 series drops upstreamed {1, 2, 5, 82} while keeping 1:1 patch numbers.
+        ok26 = validate_patch_dir('xnu/patches-26', {1, 2, 5, 82, 90, 92, 93, 101}, verbose)
+    return ok16 and ok26
 
 
 def validate_python_scripts(verbose=False):
@@ -107,7 +117,8 @@ def validate_shell_scripts(verbose=False):
     sh_files = sorted(
         glob.glob(os.path.join(REPO_ROOT, 'tools/*.sh')) +
         glob.glob(os.path.join(REPO_ROOT, 'shim/*.sh')) +
-        glob.glob(os.path.join(REPO_ROOT, 'xnu/patches/*.sh'))
+        glob.glob(os.path.join(REPO_ROOT, 'xnu/patches/*.sh')) +
+        glob.glob(os.path.join(REPO_ROOT, 'xnu/patches-26/*.sh'))
     )
     errors = []
 

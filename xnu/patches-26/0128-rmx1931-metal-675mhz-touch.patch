@@ -1,0 +1,168 @@
+diff --git a/bsd/dev/rmx1931_touch.c b/bsd/dev/rmx1931_touch.c
+index 38fefa4..89481fa 100644
+--- a/bsd/dev/rmx1931_touch.c
++++ b/bsd/dev/rmx1931_touch.c
+@@ -1025,13 +1025,13 @@ rmx_thread(void *arg, wait_result_t result)
+ 	if (!rmx_rmi_init()) {
+ 		goto out;
+ 	}
+-	printf("RMX TOUCH: Synaptics S3706 ready (%ux%u, 10 fingers, poll=8ms)\n",
++	printf("RMX TOUCH: Synaptics S3706 ready (%ux%u, 10 fingers, poll=4ms/8ms)\n",
+ 	    RMX_PANEL_W, RMX_PANEL_H);
+ 
+ 	unsigned errors = 0, logged_events = 0, ticks = 0;
+ 	while (!rt.dead) {
+ 		bool irq_low = (rmx_rd(rt.gpio, RMX_GPIO_IO(RMX_PIN_IRQ)) & 1u) == 0;
+-		bool periodic = (++ticks % 12u) == 0;
++		bool periodic = (++ticks % 125u) == 0;
+ 		if (irq_low || rt.active || periodic) {
+ 			err = rmx_poll_once(&logged_events);
+ 			if (err) {
+@@ -1045,7 +1045,7 @@ rmx_thread(void *arg, wait_result_t result)
+ 				errors = 0;
+ 			}
+ 		}
+-		rmx_wait(8);
++		rmx_wait((irq_low || rt.active) ? 4 : 8);
+ 	}
+ 	rmx_release_all();
+ out:
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 7fde442..64c9240 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -485,9 +485,10 @@ static int gmu_boot(struct a6_gpu *g)
+ #define LVL_SVS_L1	192
+ #define LVL_SVS_L2	224
+ #define LVL_NOM		256
++#define LVL_NOM_L1	320
+ 
+-static const uint32_t gpu_khz[] = { 0, 257000, 345000, 427000, 499200, 585000 };
+-static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS_L2, LVL_NOM };
++static const uint32_t gpu_khz[] = { 0, 257000, 345000, 427000, 499200, 585000, 675000 };
++static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS_L2, LVL_NOM, LVL_NOM_L1 };
+ static const uint32_t gmu_khz[] = { 0, 200000 };
+ static const uint32_t gmu_lvl[] = { 0, LVL_MIN_SVS };
+ 
+@@ -594,15 +595,23 @@ static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dword
+ static int gmu_hfi(struct a6_gpu *g)
+ {
+ 	static uint32_t msg[256];
+-	uint32_t gx[6], cx[2];
+-	if (arc_votes(gx, gpu_lvl, 6, "gfx.lvl", "mx.lvl") || arc_votes(cx, gmu_lvl, 2, "cx.lvl", "mx.lvl")) {
+-		a6_log("hfi: cmd-db levels not found\n");
++	uint32_t gx[7], cx[2];
++	int ngpu = 7;
++	if (arc_votes(gx, gpu_lvl, ngpu, "gfx.lvl", "mx.lvl")) {
++		ngpu = 6;
++		if (arc_votes(gx, gpu_lvl, ngpu, "gfx.lvl", "mx.lvl")) {
++			a6_log("hfi: cmd-db levels not found\n");
++			return -1;
++		}
++	}
++	if (arc_votes(cx, gmu_lvl, 2, "cx.lvl", "mx.lvl")) {
++		a6_log("hfi: cmd-db cx levels not found\n");
+ 		return -1;
+ 	}
+ 	memset(msg, 0, sizeof(msg));
+-	msg[1] = 6;
++	msg[1] = (uint32_t)ngpu;
+ 	msg[2] = 2;
+-	for (int i = 0; i < 6; i++) {
++	for (int i = 0; i < ngpu; i++) {
+ 		msg[3 + 3 * i] = gx[i];
+ 		msg[4 + 3 * i] = 0xffffffff;
+ 		msg[5 + 3 * i] = gpu_khz[i];
+@@ -626,7 +635,8 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	msg[1] = 0;
+ 	rc |= hfi_send(g, 14, msg, 2);
+ 	rc |= hfi_send(g, 10, msg, 1);
+-	uint32_t lvl = g->perf_level >= 1 && g->perf_level <= 5 ? g->perf_level : 1;
++	uint32_t max_lvl = (uint32_t)(ngpu - 1);
++	uint32_t lvl = g->perf_level >= 1 ? (g->perf_level <= max_lvl ? g->perf_level : max_lvl) : 1;
+ 	msg[1] = 1;
+ 	msg[2] = lvl;			/* index into gpu_khz */
+ 	msg[3] = 0;
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index b3a49b7..e4f04ef 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -61,7 +61,7 @@ struct a6_gpu {
+ 	uint32_t fence;			/* last fence value submitted */
+ 	uint32_t hfi_seq;
+ 	uint32_t pt_next;		/* next free table in the arena */
+-	uint32_t perf_level;		/* GMU perf vote: 1 (257 MHz) .. 5 (585 MHz); 0 = 1 */
++	uint32_t perf_level;		/* GMU perf vote: 1 (257 MHz) .. 6 (675 MHz); 0 = 1 */
+ };
+ 
+ /* ---- environment ---- */
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index f475ff2..e4419bf 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -286,7 +286,7 @@ sweet_gpu_init(void)
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+ 	a6_init_state(&gpu, ptoa_64(pn));
+-	uint32_t lvl = 4;	/* 499 MHz; boot-arg sweetgpufreq=1 (257) .. 5 (585) */
++	uint32_t lvl = 6;	/* 675 MHz on SM8150-AC (585 on SM8150); boot-arg sweetgpufreq=1..6 */
+ 	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
+ 	gpu.perf_level = lvl;
+ 	pool_kva = va;
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index d97be0a..f009205 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1128,6 +1128,18 @@ bsdinit_task(void)
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (!bsd_rooted_ramdisk() && mountlist.tqh_first != NULL &&
++	    !(mountlist.tqh_first->mnt_flag & MNT_RDONLY)) {
++		extern int sweet_ensure_dir_mode(const char *path, mode_t mode);
++		int e1 = sweet_ensure_dir_mode("/private/var/local", 0777);
++		int e2 = sweet_ensure_dir_mode("/private/var/local/m2v-cache", 0777);
++		int e3 = sweet_ensure_dir_mode("/private/etc/dropbear", 0700);
++		printf("SWEET: local dirs ready (var/local=%d m2v-cache=%d dropbear=%d)\n",
++		    e1, e2, e3);
++	}
++#endif
++
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index ba63685..a7240d8 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -10643,6 +10643,29 @@ mkdirat(proc_t p, struct mkdirat_args *uap, __unused int32_t *retval)
+ 	           UIO_USERSPACE);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++int sweet_ensure_dir_mode(const char *path, mode_t mode);
++int
++sweet_ensure_dir_mode(const char *path, mode_t mode)
++{
++	vfs_context_t ctx = vfs_context_current();
++	struct vnode_attr va;
++	vnode_t vp = NULLVP;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++	(void)mkdir1at(ctx, CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++	if (vnode_lookup(path, 0, &vp, ctx) == 0) {
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++		int err = vnode_setattr(vp, &va, ctx);
++		vnode_put(vp);
++		return err;
++	}
++	return ENOENT;
++}
++#endif
++
+ static int
+ rmdirat_internal(vfs_context_t ctx, int fd, user_addr_t dirpath,
+     enum uio_seg segflg, int unlink_flags)

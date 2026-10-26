@@ -30,8 +30,8 @@ IDENT = b'org.sweet.init\0'
 
 
 def text_of(obj):
-    """Return (__text bytes, _start offset); refuse anything that needs linking."""
-    magic, cpu, _, ftype, ncmds, _, _, _ = struct.unpack_from('<8I', obj, 0)
+    """Return (__text bytes, _start offset, cpusubtype); refuse anything that needs linking."""
+    magic, cpu, cpusub, ftype, ncmds, _, _, _ = struct.unpack_from('<8I', obj, 0)
     assert magic == MH_MAGIC_64 and cpu == CPU_TYPE_ARM64 and ftype == 1, 'not an arm64 object'
     text, symtab, off = None, None, 32
     for _ in range(ncmds):
@@ -55,7 +55,7 @@ def text_of(obj):
     for i in range(nsyms):
         strx, ntype, _, _, value = struct.unpack_from('<IBBHQ', obj, symoff + 16 * i)
         if obj[stroff + strx:].split(b'\0')[0] == b'_start' and ntype & 1:	# N_EXT
-            return bytes(text), value
+            return bytes(text), value, cpusub
     raise SystemExit('no global _start')
 
 
@@ -98,7 +98,9 @@ def code_signature(image, code_limit, text_size, entitlements=None):
 
 
 def build(obj, entitlements=None):
-    code, start = text_of(obj)
+    code, start, cpusub = text_of(obj)
+    if (cpusub & 0xff) == 2:		# CPU_SUBTYPE_ARM64E -> add CPU_SUBTYPE_PTRAUTH_ABI as ld64 does
+        cpusub |= 0x80000000
     assert CODE_OFF + len(code) <= SEG, 'code does not fit in one __TEXT page'
     sect = struct.pack('<16s16sQQIIIIIIII', b'__text', b'__TEXT', BASE + CODE_OFF, len(code),
                        CODE_OFF, 3, 0, 0, S_ATTR_CODE, 0, 0, 0)
@@ -117,7 +119,7 @@ def build(obj, entitlements=None):
         struct.pack('<4I', LC_CODE_SIGNATURE, 16, SEG, sig_size),
     ]
     lc = b''.join(cmds)
-    header = struct.pack('<8I', MH_MAGIC_64, CPU_TYPE_ARM64, 0, MH_EXECUTE, len(cmds), len(lc),
+    header = struct.pack('<8I', MH_MAGIC_64, CPU_TYPE_ARM64, cpusub, MH_EXECUTE, len(cmds), len(lc),
                          MH_NOUNDEFS, 0)
     assert 32 + len(lc) <= CODE_OFF
     image = bytearray(SEG)

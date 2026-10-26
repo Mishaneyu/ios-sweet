@@ -13,42 +13,73 @@
 #include "ramlog.h"
 #include "log.h"
 
-#define BOOT_LINE_LENGTH	608
+#define BOOT_LINE_LENGTH_V1	608
+#define BOOT_LINE_LENGTH_V2	1024
 #define PAGE_16K		0x4000UL
 
 struct payload_seg {
 	uint64_t vmaddr, vmsize, file_off, file_size;
 };
 
-struct payload {
+struct payload_hdr {
 	char magic[8];
 	uint32_t version, nsegs;
 	uint64_t virt_base, entry_va, adt_off, adt_size, kernel_end;
 	uint64_t phys_base, mem_size;
-	char cmdline[BOOT_LINE_LENGTH];
+};
+
+struct payload_v1 {
+	struct payload_hdr h;
+	char cmdline[BOOT_LINE_LENGTH_V1];
 	struct payload_seg segs[];
 };
 
-/* pexpert/pexpert/arm64/boot.h, Revision/Version 2 */
+struct payload_v2 {
+	struct payload_hdr h;
+	char cmdline[BOOT_LINE_LENGTH_V2];
+	struct payload_seg segs[];
+};
+
+/* pexpert/pexpert/arm64/boot.h, Revision/Version 2 (v1 = xnu-8796 608B, v2 = xnu-12377 1024B) */
 struct boot_video {
 	uint64_t v_baseAddr, v_display, v_rowBytes, v_width, v_height, v_depth;
 };
 
-struct boot_args {
+struct boot_args_v1 {
 	uint16_t Revision, Version;
 	uint64_t virtBase, physBase, memSize, topOfKernelData;
 	struct boot_video Video;
 	uint32_t machineType;
 	uint64_t deviceTreeP;
 	uint32_t deviceTreeLength;
-	char CommandLine[BOOT_LINE_LENGTH];
+	char CommandLine[BOOT_LINE_LENGTH_V1];
 	uint64_t bootFlags, memSizeActual;
 };
 
-_Static_assert(__builtin_offsetof(struct payload, segs) == 0x2a8, "payload header layout");
-_Static_assert(__builtin_offsetof(struct boot_args, Video) == 40, "boot_args layout");
-_Static_assert(__builtin_offsetof(struct boot_args, CommandLine) == 108, "boot_args layout");
-_Static_assert(sizeof(struct boot_args) == 736, "boot_args layout");
+struct boot_args_v2 {
+	uint16_t Revision, Version;
+	uint64_t virtBase, physBase, memSize, topOfKernelData;
+	struct boot_video Video;
+	uint32_t machineType;
+	uint64_t deviceTreeP;
+	uint32_t deviceTreeLength;
+	char CommandLine[BOOT_LINE_LENGTH_V2];
+	uint64_t bootFlags, memSizeActual;
+};
+
+_Static_assert(sizeof(struct payload_hdr) == 0x48, "payload common header layout");
+_Static_assert(__builtin_offsetof(struct payload_v1, segs) == 0x2a8, "payload v1 header layout");
+_Static_assert(__builtin_offsetof(struct payload_v2, segs) == 0x448, "payload v2 header layout");
+_Static_assert(__builtin_offsetof(struct boot_args_v1, Video) == 40, "boot_args v1 Video layout");
+_Static_assert(__builtin_offsetof(struct boot_args_v1, CommandLine) == 108, "boot_args v1 CommandLine layout");
+_Static_assert(__builtin_offsetof(struct boot_args_v1, bootFlags) == 0x2d0, "boot_args v1 bootFlags layout");
+_Static_assert(__builtin_offsetof(struct boot_args_v1, memSizeActual) == 0x2d8, "boot_args v1 memSizeActual layout");
+_Static_assert(sizeof(struct boot_args_v1) == 736, "boot_args v1 size");
+_Static_assert(__builtin_offsetof(struct boot_args_v2, Video) == 40, "boot_args v2 Video layout");
+_Static_assert(__builtin_offsetof(struct boot_args_v2, CommandLine) == 108, "boot_args v2 CommandLine layout");
+_Static_assert(__builtin_offsetof(struct boot_args_v2, bootFlags) == 0x470, "boot_args v2 bootFlags layout");
+_Static_assert(__builtin_offsetof(struct boot_args_v2, memSizeActual) == 0x478, "boot_args v2 memSizeActual layout");
+_Static_assert(sizeof(struct boot_args_v2) == 1152, "boot_args v2 size");
 
 /* MMU off: everything is Device memory, so copy in aligned 8-byte words. */
 static void copy64(uintptr_t dst, uintptr_t src, uint64_t n)
@@ -81,7 +112,7 @@ int loader_has_payload(uintptr_t dtb)
 {
 	uint64_t rd_start;
 	return fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) &&
-	       magic_ok(((const struct payload *)rd_start)->magic);
+	       magic_ok(((const struct payload_hdr *)rd_start)->magic);
 }
 
 const char *loader_boot(uintptr_t dtb, const struct loader_fb *fb)
@@ -93,22 +124,37 @@ const char *loader_boot(uintptr_t dtb, const struct loader_fb *fb)
 		return "no initrd in /chosen";
 	log_printf("loader: initrd %lx-%lx\n", rd_start, rd_end);
 
-	const struct payload *p = (const struct payload *)rd_start;
+	const struct payload_hdr *p = (const struct payload_hdr *)rd_start;
 	if (!magic_ok(p->magic))
 		return "no SWEETXNU payload";
-	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
+	if ((p->version != 1 && p->version != 2) || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 
+	const char *p_cmdline;
+	const struct payload_seg *segs;
+	uint32_t boot_line_len;
+	if (p->version == 1) {
+		const struct payload_v1 *p1 = (const struct payload_v1 *)rd_start;
+		p_cmdline = p1->cmdline;
+		segs = p1->segs;
+		boot_line_len = BOOT_LINE_LENGTH_V1;
+	} else {
+		const struct payload_v2 *p2 = (const struct payload_v2 *)rd_start;
+		p_cmdline = p2->cmdline;
+		segs = p2->segs;
+		boot_line_len = BOOT_LINE_LENGTH_V2;
+	}
+
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
-	log_printf("loader: phys %lx size %lx virt %lx entry %lx\n", p->phys_base, p->mem_size,
-		   p->virt_base, p->entry_va);
+	log_printf("loader: v%u phys %lx size %lx virt %lx entry %lx\n", p->version,
+		   p->phys_base, p->mem_size, p->virt_base, p->entry_va);
 
 	/* The payload must not overlap where the kernel goes. */
 	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
 		return "ramdisk overlaps kernel memory";
 
 	for (uint32_t i = 0; i < p->nsegs; i++) {
-		const struct payload_seg *s = &p->segs[i];
+		const struct payload_seg *s = &segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;
 		copy64(dst, rd_start + s->file_off, s->file_size);
 		if (s->vmsize > s->file_size)
@@ -123,7 +169,7 @@ const char *loader_boot(uintptr_t dtb, const struct loader_fb *fb)
 	uintptr_t top = ba_pa + PAGE_16K;
 
 	zero64(ba_pa, PAGE_16K);
-	volatile struct boot_args *ba = (volatile struct boot_args *)ba_pa;
+	volatile struct boot_args_v2 *ba = (volatile struct boot_args_v2 *)ba_pa;
 	ba->Revision = 2;
 	ba->Version = 2;
 	ba->virtBase = p->virt_base;
@@ -138,15 +184,18 @@ const char *loader_boot(uintptr_t dtb, const struct loader_fb *fb)
 	ba->Video.v_depth = 32;
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
-	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
-		ba->CommandLine[i] = p->cmdline[i];
-	ba->memSizeActual = p->mem_size;
-	log_printf("loader: boot_args %lx top %lx\n", (uint64_t)ba_pa, (uint64_t)top);
+	for (uint32_t i = 0; i < boot_line_len; i++)
+		ba->CommandLine[i] = p_cmdline[i];
+	if (p->version == 1)
+		((volatile struct boot_args_v1 *)ba_pa)->memSizeActual = p->mem_size;
+	else
+		ba->memSizeActual = p->mem_size;
+	log_printf("loader: boot_args (v%u) %lx top %lx\n", p->version, (uint64_t)ba_pa, (uint64_t)top);
 
 	/* ring_va, total_va in the last 16 bytes of the cmdline field (mkpayload.py) */
 	uint64_t ring_va, total_va;
-	__builtin_memcpy(&ring_va, &p->cmdline[BOOT_LINE_LENGTH - 16], 8);
-	__builtin_memcpy(&total_va, &p->cmdline[BOOT_LINE_LENGTH - 8], 8);
+	__builtin_memcpy(&ring_va, &p_cmdline[boot_line_len - 16], 8);
+	__builtin_memcpy(&total_va, &p_cmdline[boot_line_len - 8], 8);
 	if (ring_va && total_va)
 		ramlog_arm(ring_va + pa_of_va_base, total_va + pa_of_va_base);
 

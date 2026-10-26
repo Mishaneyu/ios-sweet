@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 0155304..7fde442 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -647,7 +647,7 @@ static int gmu_hfi(struct a6_gpu *g)
+ /* ---- zap shader through TrustZone PAS ---- */
+ 
+ #define PAS_GPU		13
+-#define ZAP_REGION	0x9a915000ull	/* reserved-memory pil_gpu_region */
++#define ZAP_REGION	0x99515000ull	/* RMX1931 reserved-memory pil_gpu_region */
+ #define ZAP_SIZE	0x2000u
+ #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
+ 

@@ -22,11 +22,15 @@ An undecodable or blank screen returns 3 with --fail-on-panic.
 """
 import argparse, json, os, shutil, socket, struct, subprocess, sys, time, zlib
 
-FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import adt  # noqa: E402
+
+FB_BASE, FB_W, FB_H = 0x9d000000, 1080, 2400
 FB_STRIDE = FB_W * 4
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
-BOOT_LINE_LENGTH = 608
+BOOT_LINE_LENGTH_V1 = 608
+BOOT_LINE_LENGTH_V2 = 1024
 
 
 def check_qemu_dependency(cpu='cortex-a76'):
@@ -74,29 +78,56 @@ def check_kernel_tools(kernel_path):
     return True
 
 
-def build_image(payload):
-    """Return (phys_base, ram_image, boot_args_pa, entry_pa)."""
+def payload_layout(payload):
+    """Return (ver, nsegs, boot_line_len, seg_table_off, ba_size) for v1 or v2 payloads."""
     magic, ver, nsegs = struct.unpack_from('<8sII', payload, 0)
-    assert magic == b'SWEETXNU' and ver == 1, 'not a SWEETXNU v1 payload'
+    assert magic == b'SWEETXNU' and ver in (1, 2), f'not a SWEETXNU v1/v2 payload (ver={ver})'
+    boot_line_len = BOOT_LINE_LENGTH_V1 if ver == 1 else BOOT_LINE_LENGTH_V2
+    seg_table_off = 0x48 + boot_line_len
+    ba_size = 108 + boot_line_len + 4 + 16	# 736 (v1) or 1152 (v2)
+    return ver, nsegs, boot_line_len, seg_table_off, ba_size
+
+
+def payload_fbcon(payload):
+    """Return (fb_base, fb_w, fb_h, fb_stride) from /sweet-fbcon in the payload ADT, or defaults."""
+    adt_off, adt_size = struct.unpack_from('<2Q', payload, 0x20)
+    try:
+        root, _ = adt.parse(payload[adt_off:adt_off + adt_size])
+        fb = next((c for c in root.children if c.name == 'sweet-fbcon'), None)
+        if fb and fb.prop('reg') and fb.prop('width') and fb.prop('height') and fb.prop('stride'):
+            base, _ = struct.unpack_from('<2Q', fb.prop('reg'), 0)
+            w, = struct.unpack_from('<I', fb.prop('width'), 0)
+            h, = struct.unpack_from('<I', fb.prop('height'), 0)
+            stride, = struct.unpack_from('<I', fb.prop('stride'), 0)
+            return base, w, h, stride
+    except Exception:
+        pass
+    return FB_BASE, FB_W, FB_H, FB_STRIDE
+
+
+def build_image(payload):
+    """Return (phys_base, ram_image, boot_args_pa, entry_pa, fb_geom)."""
+    ver, nsegs, boot_line_len, seg_table_off, ba_size = payload_layout(payload)
     virt_base, entry_va, adt_off, adt_size, kernel_end, phys_base, mem_size = \
         struct.unpack_from('<7Q', payload, 0x10)
-    cmdline = payload[0x48:0x48 + BOOT_LINE_LENGTH]
+    cmdline = payload[0x48:0x48 + boot_line_len]
+    fb_base, fb_w, fb_h, fb_stride = payload_fbcon(payload)
     delta = phys_base - virt_base
     adt_pa = kernel_end + delta
     ba_pa = (adt_pa + adt_size + PAGE - 1) & ~(PAGE - 1)
     top = ba_pa + PAGE
     img = bytearray(top - phys_base)
     for i in range(nsegs):
-        vmaddr, vmsize, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
+        vmaddr, vmsize, foff, fsize = struct.unpack_from('<4Q', payload, seg_table_off + 32 * i)
         o = vmaddr + delta - phys_base
         img[o:o + fsize] = payload[foff:foff + fsize]
     img[adt_pa - phys_base:adt_pa - phys_base + adt_size] = payload[adt_off:adt_off + adt_size]
     ba = struct.pack('<HH4x4Q6QI4xQI', 2, 2, virt_base, phys_base, mem_size, top,
-                     FB_BASE, 1, FB_STRIDE, FB_W, FB_H, 32, 0, adt_pa - delta, adt_size)
+                     fb_base, 1, fb_stride, fb_w, fb_h, 32, 0, adt_pa - delta, adt_size)
     ba += cmdline + b'\0' * 4 + struct.pack('<QQ', 0, mem_size)
-    assert len(ba) == 736
+    assert len(ba) == ba_size, (len(ba), ba_size)
     img[ba_pa - phys_base:ba_pa - phys_base + len(ba)] = ba
-    return phys_base, bytes(img), ba_pa, entry_va + delta
+    return phys_base, bytes(img), ba_pa, entry_va + delta, (fb_base, fb_w, fb_h, fb_stride)
 
 
 def stub(ba_pa, entry_pa):
@@ -104,40 +135,40 @@ def stub(ba_pa, entry_pa):
     return struct.pack('<4I2Q', 0x58000080, 0x580000a1, 0xd61f0020, 0xd503201f, ba_pa, entry_pa)
 
 
-def write_png(path, raw):
+def write_png(path, raw, fb_w=FB_W, fb_h=FB_H, fb_stride=FB_STRIDE):
     rows = []
-    for y in range(FB_H):
-        line = raw[y * FB_STRIDE:(y + 1) * FB_STRIDE]
-        rgb = bytearray(FB_W * 3)	# a8r8g8b8 little endian = B G R A in memory
+    for y in range(fb_h):
+        line = raw[y * fb_stride:(y + 1) * fb_stride]
+        rgb = bytearray(fb_w * 3)	# a8r8g8b8 little endian = B G R A in memory
         rgb[0::3], rgb[1::3], rgb[2::3] = line[2::4], line[1::4], line[0::4]
         rows.append(b'\0' + bytes(rgb))
     chunk = lambda t, d: struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d))
-    png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', FB_W, FB_H, 8, 2, 0, 0, 0))
+    png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', fb_w, fb_h, 8, 2, 0, 0, 0))
     png += chunk(b'IDAT', zlib.compress(b''.join(rows), 6)) + chunk(b'IEND', b'')
     open(path, 'wb').write(png)
 
 
 def payload_data(payload, va, size):
     """Read initialized segment bytes by VA (the payload has no slide)."""
-    nsegs = struct.unpack_from('<I', payload, 12)[0]
+    _, nsegs, _, seg_table_off, _ = payload_layout(payload)
     for i in range(nsegs):
-        vmaddr, _, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
+        vmaddr, _, foff, fsize = struct.unpack_from('<4Q', payload, seg_table_off + 32 * i)
         if vmaddr <= va and va + size <= vmaddr + fsize:
             offset = foff + va - vmaddr
             return payload[offset:offset + size]
     raise ValueError(f'VA {va:#x}+{size:#x} not in initialized payload segments')
 
 
-def decode_screen(raw, font):
+def decode_screen(raw, font, fb_w=FB_W, fb_h=FB_H, fb_stride=FB_STRIDE):
     """Exact glyph matching for pe_serial.c's 2x, white-on-black fbcon."""
     glyphs = {font[c * 16:(c + 1) * 16]: chr(c) for c in range(32, 127)}
     rows, unknown = [], 0
-    for row in range(FB_H // 32):
+    for row in range(fb_h // 32):
         chars = []
-        for col in range(FB_W // 16):
+        for col in range(fb_w // 16):
             glyph = bytearray(16)
             for y in range(16):
-                offset = (row * 32 + y * 2) * FB_STRIDE + col * 16 * 4
+                offset = (row * 32 + y * 2) * fb_stride + col * 16 * 4
                 for x in range(8):
                     if raw[offset + x * 8:offset + x * 8 + 4] == b'\xff' * 4:
                         glyph[y] |= 1 << x
@@ -262,10 +293,10 @@ def main():
     os.makedirs(a.outdir, exist_ok=True)
     out = os.path.abspath(a.outdir)
 
-    phys_base, img, ba_pa, entry_pa = build_image(payload)
+    phys_base, img, ba_pa, entry_pa, (fb_base, fb_w, fb_h, fb_stride) = build_image(payload)
     open(f'{out}/ram.bin', 'wb').write(img)
     open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
-    print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
+    print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x} fb={fb_base:#x} ({fb_w}x{fb_h})', file=sys.stderr)
 
     mon = f'{out}/mon.sock'
     if os.path.exists(mon):
@@ -304,15 +335,15 @@ def main():
 
         result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode}
         if p.poll() is None:
-            _, regs, *extra = qmp(mon, 'stop', 'info registers', *a.hmp, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
+            _, regs, *extra = qmp(mon, 'stop', 'info registers', *a.hmp, pmemsave=(fb_base, fb_stride * fb_h, f'{out}/fb.raw'))
             open(f'{out}/regs.txt', 'w').write(regs + ''.join(f'\n(qemu) {c}\n{r}' for c, r in zip(a.hmp, extra)))
             p.kill()
             p.wait()
             raw = open(f'{out}/fb.raw', 'rb').read()
-            write_png(f'{out}/fb.png', raw)
+            write_png(f'{out}/fb.png', raw, fb_w, fb_h, fb_stride)
             result = {'status': 'not_decoded'}
             if font is not None:
-                screen, unknown = decode_screen(raw, font)
+                screen, unknown = decode_screen(raw, font, fb_w, fb_h, fb_stride)
                 open(f'{out}/fb.txt', 'w').write(screen)
                 result = screen_result(screen, unknown)
             os.unlink(f'{out}/fb.raw')

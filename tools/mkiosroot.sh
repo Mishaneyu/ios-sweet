@@ -19,7 +19,13 @@
 set -euo pipefail
 
 [[ $# -ge 4 ]] || { sed -n '2,12p' "$0"; exit 2; }
-os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${5:-16G}
+script_dir=$(cd "$(dirname "$0")" && pwd)
+os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4
+default_size=16G
+if [[ "$os" == *.aea || "$sysos" == *.aea || "$appos" == *.aea ]]; then
+	default_size=28G
+fi
+size=${5:-$default_size}
 [[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
 
 # Pre-flight tool check
@@ -27,6 +33,11 @@ missing_tools=()
 for tool in apfs-fuse mkfs.hfsplus rsync; do
 	command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
 done
+if [[ "$os" == *.aea || "$sysos" == *.aea || "$appos" == *.aea ]]; then
+	if ! command -v ipsw >/dev/null 2>&1 && ! command -v aea >/dev/null 2>&1; then
+		missing_tools+=("ipsw (for .dmg.aea decryption)")
+	fi
+fi
 
 if [[ ${#missing_tools[@]} -gt 0 ]]; then
 	echo "Error: missing required host utilities: ${missing_tools[*]}" >&2
@@ -57,11 +68,36 @@ cleanup() {
 }
 trap cleanup EXIT
 
+decrypt_if_aea() {
+	local src=$1
+	if [[ "$src" != *.aea ]]; then
+		printf '%s\n' "$src"
+		return
+	fi
+	local dst=${src%.aea}
+	if [[ -f "$dst" ]]; then
+		echo "reusing decrypted $dst" >&2
+		printf '%s\n' "$dst"
+		return
+	fi
+	echo "decrypting $src -> $dst ..." >&2
+	if command -v ipsw >/dev/null 2>&1; then
+		ipsw fw aea "$src" -o "$(dirname "$dst")" >&2
+	else
+		echo "error: ipsw is required to decrypt $src" >&2
+		exit 1
+	fi
+	[[ -f "$dst" ]] || { echo "error: expected decrypted DMG at $dst" >&2; exit 1; }
+	printf '%s\n' "$dst"
+}
+
 # apfs-fuse splits its options on ',' (e.g. in iPhone10,3 paths): use links.
 # Keep the .dmg name: apfs-fuse only parses UDIF images (the OS one is UDIF,
 # the cryptexes are raw APFS) when the file name ends in .dmg.
 apfs_mount() {
-	ln -s "$1" "$work/$2.dmg"
+	local img
+	img=$(decrypt_if_aea "$1")
+	ln -s "$img" "$work/$2.dmg"
 	mkdir "$work/$2"
 	# As root: a user's FUSE mount is unreadable to the root rsync below.
 	sudo "$(command -v apfs-fuse)" "$work/$2.dmg" "$work/$2"
@@ -126,6 +162,20 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
 	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
 	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$work/root/private/var/keybags/systembag.kb"
+
+# Ensure /System/Cryptexes/{OS,App} point to the merged cryptex trees.
+sudo mkdir -p "$work/root/System/Cryptexes"
+for c in OS App; do
+	if ! sudo test -e "$work/root/System/Cryptexes/$c" && ! sudo test -L "$work/root/System/Cryptexes/$c"; then
+		sudo ln -s "../../private/preboot/Cryptexes/$c" "$work/root/System/Cryptexes/$c"
+	fi
+done
+
+# Strip non-hint arm64e PAC opcodes in-place so ARMv8.2-A hardware runs userland natively.
+if compgen -G "$work/root/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e*" >/dev/null; then
+	echo "rewriting arm64e PAC instructions across root image and dyld shared cache..."
+	sudo python3 "$script_dir/de-pac-arm64e.py" --root "$work/root"
+fi
 
 df -h "$work/root"
 sudo umount "$work/root"

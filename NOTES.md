@@ -124,3 +124,5 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
   `GENI_IF_DISABLE_RO` (`0x64`) reports `FIFO_IF_DISABLE` (`rmxtouchgpio=1` forces it).
 - 0127 RMX1931 GPU: set Adreno 640 `ZAP_REGION` to `0x99515000` (`pil_gpu_region` in `RMX1931` FDT).
 - 0128 RMX1931 Metal/GPU/touch: ensure `/private/var/local` + `m2v-cache` (`0777`) and `/private/etc/dropbear` (`0700`) before `launchd`, unlock SM8150-AC `675 MHz` Adreno 640 OPP (`sweetgpufreq=6`), and 4 ms active touch polling.
+- 0129 iOS 26 (`xnu-12377.121.6` in `xnu/patches-26/`): grade `arm64e` slices on `ARM64_V8`, pass `ptrauth_disabled=1`, unify `arm64`/`arm64e` shared region + `v3`/`v5` auth rebase `memcpy`, and unsigned `DYLD_CHAINED_PTR_ARM64E*` page-in fixups.
+- 0130 iOS 26 (`xnu/patches-26/`): EL1 `sleh.c` user-mode emulator for `arm64e` PAC (`reta*`, `bra*`/`blra*`, `pac*`/`aut*`/`xpac*`, `pacga`, `ldra*`) and ARMv8.3/v8.4 ISA (`fjcvtzs`, `fcadd`/`fcmla`, `stlur*`/`ldapur*`, `FlagM`/`DIT`, `SHA3`).

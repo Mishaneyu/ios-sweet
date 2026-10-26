@@ -1,0 +1,1007 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a23a146..16071dd 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_fts.c			standard
++bsd/dev/rmx1931_touch.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_poke.c			standard
+ bsd/dev/sweet_files.c			standard
+diff --git a/bsd/dev/rmx1931_touch.c b/bsd/dev/rmx1931_touch.c
+new file mode 100644
+index 0000000..2b89df4
+--- /dev/null
++++ b/bsd/dev/rmx1931_touch.c
+@@ -0,0 +1,863 @@
++/*
++ * Realme X2 Pro (RMX1931 / samurai, SM8150-AC) touchscreen driver:
++ * Synaptics S3706 (RMI4 over GENI I2C SE0 on QUPv3 wrapper 2, /soc/i2c@c80000,
++ * 7-bit address 0x20). Call once after the scheduler is running; all work runs
++ * on one kernel thread.
++ *
++ * Hardware facts (from RMX1931 live FDT /soc/i2c@c80000/synaptics19081@20 and
++ * OPPO synaptics_drivers_s3706.c):
++ *   - I2C SE:    0x00c80000 (QUPv3 wrapper 2 SE0 = qup17), SDA=GPIO55, SCL=GPIO56
++ *   - GCC:       0x00100000, vote 0x52014 |= 0x1f, RCG 0x1e148, CBCRs 0x1e008/0x1e004/0x1e144
++ *   - TLMM:      SOUTH tile 0x03d00000: reset=GPIO54 (active low), irq=GPIO122 (active low)
++ *   - Rails:     vdd_2v8 = PM8150 L17A ("ldoa17") @ 3000 mV via RPMh;
++ *                vcc_1v8 = PM8150L (SPMI SID 4) GPIO5 (0xc400, PPID 0x4c4) output HIGH
++ *   - IC:        S3706 boots autonomously from internal flash (8-bit RMI4 regs,
++ *                10 fingers, 1080x2400 panel coordinates).
++ *
++ * Boot-args:
++ *   rmxtouch=0       disable driver (default 1)
++ *   rmxtouchdelay=N  startup delay in seconds (default 5)
++ *   rmxtouchlog=1    log every touch event (first 32 logged automatically)
++ *   rmxtouch100k=1   use 100 kHz I2C instead of 400 kHz
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void rmx1931_touch_init(void);
++
++/* QUPv3 wrapper 2 SE0 (/soc/i2c@0xc80000), GCC, and TLMM SOUTH tile */
++#define RMX_SE_PA       0x00c80000u
++#define RMX_GCC_PA      0x00100000u
++#define RMX_SOUTH_PA    0x03d00000u
++#define RMX_GCC_VOTE    0x52014u        /* APCS_CLOCK_BRANCH_ENA_VOTE_3 */
++#define RMX_GCC_BITS    0x1fu           /* wrap2 core, s_ahb, m_ahb, core_2x, s0 */
++#define RMX_RCG         0x1e148u        /* gcc_qupv3_wrap2_s0_clk_src */
++
++#define RMX_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
++#define RMX_GPIO_IO(n)  (RMX_GPIO_CFG(n) + 4u)
++#define RMX_PIN_RESET   54u             /* active-low reset */
++#define RMX_PIN_SDA     55u             /* qup17 function 1 */
++#define RMX_PIN_SCL     56u             /* qup17 function 1 */
++#define RMX_PIN_IRQ     122u            /* active-low ATTN */
++
++/* SPMI Arbiter v5 for PM8150L (SID 4) GPIO5 (0xc400, PPID 0x4c4 = enable1v8_gpio) */
++#define RMX_SPMI_CORE   0x0c440000u
++#define RMX_SPMI_CHNLS  0x0c600000u
++#define RMX_SPMI_OBS    0x0e600000u
++#define RMX_SPMI_CNFG   0x0c40a000u
++#define RMX_1V8_SID     4u
++#define RMX_1V8_BASE    0xc400u
++#define RMX_1V8_PPID    ((RMX_1V8_SID << 8) | (RMX_1V8_BASE >> 8)) /* 0x4c4 */
++
++/* GENI SE I2C FIFO registers (matching sweet_touch.c + 0063 packing) */
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_DMA          0x258u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SCL          0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_TX_WM        0x80cu
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_DONE         (1u << 0)
++#define SE_NACK         (1u << 10)
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | \
++                         (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++/* Synaptics RMI4 constants */
++#define RMX_I2C_ADDR    0x20u
++#define RMX_MAX_FINGERS 10u
++#define RMX_PANEL_W     1080
++#define RMX_PANEL_H     2400
++
++struct rmi_fn {
++	uint8_t query_base;
++	uint8_t cmd_base;
++	uint8_t ctrl_base;
++	uint8_t data_base;
++	uint8_t irq_mask;
++	bool present;
++};
++
++static struct {
++	vm_offset_t se, gcc, gpio;
++	vm_offset_t sp_core, sp_cnfg, sp_obs, sp_ch;
++	uint16_t sp_apid;
++	bool started, dead;
++	int log, i2c_100k;
++	uint32_t irq_status, irq_last, active;
++	unsigned sent, got;
++	struct rmi_fn f01, f12, f34;
++	uint8_t f12_data01_off;
++	uint8_t f12_data15_off;
++	int x[RMX_MAX_FINGERS], y[RMX_MAX_FINGERS];
++} rt;
++static int rmx_sleep_chan;
++
++static uint32_t
++rmx_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++rmx_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++rmx_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&rmx_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++rmx_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(rmx_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM: [1:0] pull, [5:2] mux, [8:6] drive (mA/2 - 1), [9] output enable. */
++static void
++rmx_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	uint32_t off = RMX_GPIO_CFG(pin);
++	if (out) {
++		rmx_wr(rt.gpio, RMX_GPIO_IO(pin),
++		    (rmx_rd(rt.gpio, RMX_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	uint32_t cfg = rmx_rd(rt.gpio, off) & ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	rmx_wr(rt.gpio, off, cfg);
++}
++
++/* ---- Guarded SPMI access strictly for PM8150L (SID 4) GPIO5 (0xc400) ---- */
++
++static bool
++rmx_spmi_read_1v8(uint16_t addr, uint8_t *out)
++{
++	if ((addr & 0xff00u) != RMX_1V8_BASE) {
++		return false;
++	}
++	uint32_t off = 0x80u * (uint32_t)rt.sp_apid;
++	rmx_wr(rt.sp_obs, off, (1u << 27) | ((uint32_t)(addr & 0xffu) << 4));
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t st = rmx_rd(rt.sp_obs, off + 0x08u);
++		if (st & 1u) {
++			if (st & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)rmx_rd(rt.sp_obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++rmx_spmi_write_1v8(uint16_t addr, uint8_t val)
++{
++	if ((addr & 0xff00u) != RMX_1V8_BASE || !rt.sp_ch) {
++		return false;
++	}
++	rmx_wr(rt.sp_ch, 0x10u, val);
++	rmx_wr(rt.sp_ch, 0x00u, (0u << 27) | ((uint32_t)(addr & 0xffu) << 4));
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t st = rmx_rd(rt.sp_ch, 0x08u);
++		if (st & 1u) {
++			return (st & 0x0eu) == 0;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++rmx_enable_1v8_gpio(void)
++{
++	rt.sp_core = ml_io_map(RMX_SPMI_CORE, 0x2000);
++	rt.sp_cnfg = ml_io_map(RMX_SPMI_CNFG, 0x1000);
++	rt.sp_obs = ml_io_map(RMX_SPMI_OBS, 0x10000);
++	if (!rt.sp_core || !rt.sp_cnfg || !rt.sp_obs) {
++		printf("RMX TOUCH: SPMI mapping failed\n");
++		return false;
++	}
++	uint32_t ver = rmx_rd(rt.sp_core, 0);
++	uint32_t napids = rmx_rd(rt.sp_core, 4u) & 0x7ffu;
++	if (ver < 0x50000000u || ver >= 0x70000000u || napids == 0 || napids > 512u) {
++		printf("RMX TOUCH: unsupported SPMI arb=%#x apids=%u\n", ver, napids);
++		return false;
++	}
++	uint16_t found = 0xffffu;
++	uint32_t owner = 7u;
++	for (uint32_t i = 0; i < napids; ++i) {
++		uint32_t map = rmx_rd(rt.sp_core, 0x900u + 4u * i);
++		if (!map || ((map >> 8) & 0xfffu) != RMX_1V8_PPID) {
++			continue;
++		}
++		uint32_t own = rmx_rd(rt.sp_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == 0xffffu || own == 0) {
++			found = (uint16_t)i;
++			owner = own;
++		}
++	}
++	if (found == 0xffffu || owner != 0) {
++		printf("RMX TOUCH: PM8150L GPIO5 (ppid=%#x) unavailable apid=%#x owner=%u\n",
++		    RMX_1V8_PPID, found, owner);
++		return false;
++	}
++	rt.sp_apid = found;
++	/* Map only the single 64 KB-aligned channel page for this APID. */
++	rt.sp_ch = ml_io_map((vm_offset_t)(RMX_SPMI_CHNLS + 0x10000ul * (uintptr_t)found), 0x1000);
++	if (!rt.sp_ch) {
++		printf("RMX TOUCH: SPMI channel map failed for apid=%u\n", found);
++		return false;
++	}
++	uint8_t type = 0, subtype = 0, pre_mode = 0, pre_src = 0, pre_en = 0;
++	if (!rmx_spmi_read_1v8(RMX_1V8_BASE + 0x04u, &type) ||
++	    !rmx_spmi_read_1v8(RMX_1V8_BASE + 0x05u, &subtype) ||
++	    type != 0x10u) {
++		printf("RMX TOUCH: PM8150L GPIO5 unexpected type=%#x subtype=%#x\n", type, subtype);
++		return false;
++	}
++	(void)rmx_spmi_read_1v8(RMX_1V8_BASE + 0x40u, &pre_mode);
++	(void)rmx_spmi_read_1v8(RMX_1V8_BASE + 0x44u, &pre_src);
++	(void)rmx_spmi_read_1v8(RMX_1V8_BASE + 0x46u, &pre_en);
++
++	/* PMIC5 LV/MV GPIO (subtype 0x10/0x11): output level is bit 7 of 0x44! */
++	bool ok = rmx_spmi_write_1v8(RMX_1V8_BASE + 0x41u, 0x00u) && /* DIG_VIN_CTL: VIN0 */
++	    rmx_spmi_write_1v8(RMX_1V8_BASE + 0x42u, 0x05u) &&       /* DIG_PULL_CTL: no pull */
++	    rmx_spmi_write_1v8(RMX_1V8_BASE + 0x45u, 0x03u) &&       /* DIG_OUT_CTL: CMOS, high drive */
++	    rmx_spmi_write_1v8(RMX_1V8_BASE + 0x43u, 0x00u);        /* DIG_IN_CTL */
++	if (ok) {
++		if (subtype == 0x10u || subtype == 0x11u) {
++			ok = rmx_spmi_write_1v8(RMX_1V8_BASE + 0x40u, 0x01u) && /* MODE_OUTPUT */
++			    rmx_spmi_write_1v8(RMX_1V8_BASE + 0x44u, 0x80u);    /* OUT_SOURCE_CTL: HIGH */
++		} else {
++			ok = rmx_spmi_write_1v8(RMX_1V8_BASE + 0x40u, 0x11u);
++		}
++	}
++	if (ok) {
++		ok = rmx_spmi_write_1v8(RMX_1V8_BASE + 0x46u, 0x80u); /* EN_CTL: MASTER_EN */
++	}
++	uint8_t post_rt = 0, post_en = 0;
++	(void)rmx_spmi_read_1v8(RMX_1V8_BASE + 0x08u, &post_rt);
++	(void)rmx_spmi_read_1v8(RMX_1V8_BASE + 0x46u, &post_en);
++	printf("RMX TOUCH: PM8150L GPIO5 apid=%u sub=%#x pre=%02x/%02x/%02x post en=%02x rt=%02x ok=%d\n",
++	    found, subtype, pre_mode, pre_src, pre_en, post_en, post_rt, ok);
++	return ok;
++}
++
++/* ---- QUPv3 wrapper 2 SE0 clocks and GENI FIFO I2C ---- */
++
++static bool
++rmx_clocks(void)
++{
++	rmx_wr(rt.gcc, RMX_GCC_VOTE, rmx_rd(rt.gcc, RMX_GCC_VOTE) | RMX_GCC_BITS);
++	uint32_t cmd = rmx_rd(rt.gcc, RMX_RCG);
++	uint32_t cfg = rmx_rd(rt.gcc, RMX_RCG + 4u);
++	uint32_t dfs = rmx_rd(rt.gcc, RMX_RCG + 0x14u);
++	printf("RMX TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    rmx_rd(rt.gcc, RMX_GCC_VOTE), cmd, cfg, dfs);
++	if (dfs & 1u) {
++		cfg = rmx_rd(rt.gcc, RMX_RCG + 0x1cu);
++		printf("RMX TOUCH: DFS level0 cfg=%#x\n", cfg);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("RMX TOUCH: DFS level 0 is not XO/1; stopping\n");
++			return false;
++		}
++	} else {
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		rmx_wr(rt.gcc, RMX_RCG + 4u, cfg);
++		rmx_wr(rt.gcc, RMX_RCG, rmx_rd(rt.gcc, RMX_RCG) | 1u);
++		if (!rmx_wait_clear(rt.gcc, RMX_RCG, 1u)) {
++			printf("RMX TOUCH: RCG update timeout\n");
++			return false;
++		}
++	}
++	/* Skip halt wait on HW clock-gated branches (bit 1), as in Linux & sweet_fts.c. */
++	const uint32_t branches[] = {0x1e004u, 0x1e008u, 0x1e144u};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		uint32_t cbcr = rmx_rd(rt.gcc, branches[i]);
++		printf("RMX TOUCH: GCC branch %#x = %#x\n", branches[i], cbcr);
++		if (cbcr & 2u) {
++			continue;
++		}
++		if (!rmx_wait_clear(rt.gcc, branches[i], 1u << 31)) {
++			printf("RMX TOUCH: GCC branch %#x halted (%#x)\n",
++			    branches[i], rmx_rd(rt.gcc, branches[i]));
++			return false;
++		}
++	}
++	return true;
++}
++
++static void rmx_abort(void);
++
++static bool
++rmx_se_init(void)
++{
++	uint32_t fw = rmx_rd(rt.se, SE_FW);
++	uint32_t tx = rmx_rd(rt.se, SE_HW_TX), rx = rmx_rd(rt.se, SE_HW_RX);
++	printf("RMX TOUCH: SE0 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
++	    fw, (fw >> 8) & 0xffu, rmx_rd(rt.se, SE_STATUS), tx, rx,
++	    rmx_rd(rt.se, 0x908u));
++	if (((fw >> 8) & 0xffu) != 3u || (rmx_rd(rt.se, 0x64u) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
++		printf("RMX TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; stopping\n");
++		return false;
++	}
++	if (rmx_rd(rt.se, SE_STATUS) & 1u) {
++		rmx_abort();
++	}
++	if (rmx_rd(rt.se, SE_STATUS) & 0x1001u) {
++		printf("RMX TOUCH: SE0 busy; stopping\n");
++		return false;
++	}
++	while (rmx_rd(rt.se, SE_RX_COUNT) & 0x1ffffffu) {
++		(void)rmx_rd(rt.se, SE_RX);
++	}
++	rmx_wr(rt.se, 0xe18u, 0);
++	rmx_wr(rt.se, 0xe1cu, 0);
++	rmx_wr(rt.se, 0x644u, 0);
++	rmx_wr(rt.se, SE_IRQ_CLR, 0xffffffffu);
++	rmx_wr(rt.se, 0x648u, 0xffffffffu);
++	rmx_wr(rt.se, SE_DMA, 0);
++	rmx_wr(rt.se, 0x028u, rmx_rd(rt.se, 0x028u) | 0x7fu);
++	rmx_wr(rt.se, 0xe30u, rmx_rd(rt.se, 0xe30u) | 0x0fu);
++	rmx_wr(rt.se, 0x024u, 0x7fu);
++	rmx_wr(rt.se, 0x020u, 1u);
++	rmx_wr(rt.se, SE_CLK_SEL, 0);
++	if (rt.i2c_100k) {
++		rmx_wr(rt.se, SE_MCLK, (7u << 4) | 1u);
++		rmx_wr(rt.se, SE_SCL, (10u << 20) | (11u << 10) | 26u);
++	} else {
++		/* 400 kHz from 19.2 MHz XO (i2c-qcom-geni.c table) */
++		rmx_wr(rt.se, SE_MCLK, (2u << 4) | 1u);
++		rmx_wr(rt.se, SE_SCL, (5u << 20) | (12u << 10) | 24u);
++	}
++	rmx_wr(rt.se, 0x254u, 0);
++	rmx_wr(rt.se, 0x260u, SE_PACK0);
++	rmx_wr(rt.se, 0x264u, SE_PACK1);
++	rmx_wr(rt.se, 0x284u, SE_PACK0);
++	rmx_wr(rt.se, 0x288u, SE_PACK1);
++	rmx_wr(rt.se, SE_TX_WM, 0);
++	rmx_wr(rt.se, 0x810u, 0);
++	rmx_wr(rt.se, 0x814u, ((rx >> 16) & 0x3fu) - 1u);
++	rmx_wr(rt.se, SE_IRQ_EN, SE_EVENTS);
++	if (rmx_rd(rt.se, 0x260u) != SE_PACK0 || rmx_rd(rt.se, 0x264u) != SE_PACK1 ||
++	    rmx_rd(rt.se, 0x284u) != SE_PACK0 || rmx_rd(rt.se, 0x288u) != SE_PACK1) {
++		printf("RMX TOUCH: packing readback mismatch; stopping\n");
++		return false;
++	}
++	return true;
++}
++
++static void
++rmx_abort(void)
++{
++	rmx_wr(rt.se, SE_CTRL, 2u);
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (rmx_rd(rt.se, SE_IRQ) & (1u << 5)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || !rmx_wait_clear(rt.se, SE_STATUS, 1u)) {
++		rt.dead = true;
++		printf("RMX TOUCH: abort failed status=%#x irq=%#x; stopping\n",
++		    rmx_rd(rt.se, SE_STATUS), rmx_rd(rt.se, SE_IRQ));
++	}
++	while (rmx_rd(rt.se, SE_RX_COUNT) & 0x1ffffffu) {
++		(void)rmx_rd(rt.se, SE_RX);
++	}
++	rmx_wr(rt.se, SE_IRQ_CLR, 0xffffffffu);
++	if (rmx_rd(rt.se, SE_TX_COUNT) & 0xfffffffu) {
++		rt.dead = true;
++		printf("RMX TOUCH: TX FIFO not empty after abort; stopping\n");
++	}
++}
++
++static uint32_t
++rmx_irq(void)
++{
++	rt.irq_last = rmx_rd(rt.se, SE_IRQ);
++	rt.irq_status |= rt.irq_last;
++	return rt.irq_last;
++}
++
++static bool
++rmx_drain_rx(uint8_t *rx, unsigned nr)
++{
++	uint32_t count = rmx_rd(rt.se, SE_RX_COUNT) & 0x1ffffffu;
++	if (count > 64u || count > (nr - rt.got + 3u) / 4u) {
++		return false;
++	}
++	while (count--) {
++		uint32_t word = rmx_rd(rt.se, SE_RX);
++		for (unsigned j = 0; j < 4u && rt.got < nr; ++j) {
++			rx[rt.got++] = (uint8_t)(word >> (8u * j));
++		}
++	}
++	return true;
++}
++
++static int
++rmx_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	if (rt.dead || nt > 4u || nr > 90u || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	if (!rmx_wait_clear(rt.se, SE_STATUS, 1u)) {
++		rt.dead = true;
++		return EBUSY;
++	}
++	rt.irq_status = rt.irq_last = 0;
++	rt.sent = rt.got = 0;
++	rmx_wr(rt.se, SE_IRQ_CLR, 0xffffffffu);
++	rmx_wr(rt.se, SE_TX_WM, nt ? 1u : 0u);
++	rmx_wr(rt.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	rmx_wr(rt.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
++	    (RMX_I2C_ADDR << 9) | (stretch ? 4u : 0u));
++
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 20000u; ++i) {
++		uint32_t irq = rmx_irq();
++		if (irq & SE_ERRORS) {
++			err = (irq & SE_NACK) ? ENXIO : EIO;
++			for (unsigned j = 0; j < 5000u && !(irq & SE_DONE); ++j) {
++				delay(1);
++				irq = rmx_irq();
++			}
++			if ((irq & SE_DONE) && !(rmx_rd(rt.se, SE_STATUS) & 1u) &&
++			    !(rmx_rd(rt.se, SE_TX_COUNT) & 0xfffffffu) &&
++			    !(rmx_rd(rt.se, SE_RX_COUNT) & 0x1ffffffu)) {
++				rmx_wr(rt.se, SE_IRQ_CLR, irq);
++				return err;
++			}
++			break;
++		}
++		if (nt && !rt.sent && (irq & SE_TX_WM_IRQ)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < nt; ++j) {
++				word |= (uint32_t)tx[j] << (8u * j);
++			}
++			rmx_wr(rt.se, SE_TX, word);
++			rt.sent = nt;
++			rmx_wr(rt.se, SE_TX_WM, 0);
++		}
++		if (nr && !rmx_drain_rx(rx, nr)) {
++			err = EIO;
++			break;
++		}
++		if (irq & SE_DONE) {
++			irq = rmx_irq();
++			if (irq & SE_ERRORS) {
++				continue;
++			}
++			if (nr && !rmx_drain_rx(rx, nr)) {
++				err = EIO;
++				break;
++			}
++			rmx_wr(rt.se, SE_IRQ_CLR, irq);
++			if (rt.got == nr && rt.sent == nt) {
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		rmx_wr(rt.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	rmx_abort();
++	return err;
++}
++
++static int
++rmx_rmi_read(uint8_t reg, uint8_t *buf, unsigned len)
++{
++	int err = rmx_msg(&reg, 1u, NULL, 0, true);
++	if (err) {
++		return err;
++	}
++	return rmx_msg(NULL, 0, buf, len, false);
++}
++
++static int
++rmx_rmi_write1(uint8_t reg, uint8_t val)
++{
++	uint8_t buf[2] = {reg, val};
++	return rmx_msg(buf, 2u, NULL, 0, false);
++}
++
++/* ---- Synaptics RMI4 initialization & F12 touch reporting ---- */
++
++static unsigned
++rmx_popcount8(uint8_t v)
++{
++	unsigned c = 0;
++	while (v) {
++		c += v & 1u;
++		v >>= 1;
++	}
++	return c;
++}
++
++static int
++rmx_f01_configure(void)
++{
++	uint8_t ctrl0 = 0, dummy = 0;
++	int err = rmx_rmi_read(rt.f01.ctrl_base, &ctrl0, 1u);
++	if (err) {
++		return err;
++	}
++	/* Normal operation (sleep_mode = 0) + Configured (bit 7). */
++	err = rmx_rmi_write1(rt.f01.ctrl_base, (uint8_t)((ctrl0 & 0xf8u) | 0x80u));
++	if (err) {
++		return err;
++	}
++	(void)rmx_rmi_read((uint8_t)(rt.f01.data_base + 1u), &dummy, 1u);
++	return rmx_rmi_write1((uint8_t)(rt.f01.ctrl_base + 1u), 0x7fu);
++}
++
++static bool
++rmx_rmi_init(void)
++{
++	/* Select RMI4 Page 0 (holds F34, F01, F12). */
++	int err = rmx_rmi_write1(0xffu, 0x00u);
++	if (err) {
++		printf("RMX TOUCH: page 0 select failed err=%d irq=%#x\n", err, rt.irq_status);
++		return false;
++	}
++	unsigned intr_bit = 0;
++	for (int addr = 0xe9; addr >= 0x05; addr -= 6) {
++		uint8_t fd[6] = {0};
++		err = rmx_rmi_read((uint8_t)addr, fd, sizeof(fd));
++		if (err) {
++			printf("RMX TOUCH: PDT read @%#x failed err=%d\n", (unsigned)addr, err);
++			return false;
++		}
++		if (fd[5] == 0x00u || fd[5] == 0xffu) {
++			break;
++		}
++		unsigned nsrc = fd[4] & 0x07u;
++		uint8_t mask = 0;
++		for (unsigned b = 0; b < nsrc && (intr_bit + b) < 8u; ++b) {
++			mask |= (uint8_t)(1u << (intr_bit + b));
++		}
++		intr_bit += nsrc;
++		printf("RMX TOUCH: PDT @%#x F%02x q=%#x c=%#x ctrl=%#x data=%#x irq=%#x\n",
++		    (unsigned)addr, fd[5], fd[0], fd[1], fd[2], fd[3], mask);
++		struct rmi_fn fn = {
++			.query_base = fd[0],
++			.cmd_base = fd[1],
++			.ctrl_base = fd[2],
++			.data_base = fd[3],
++			.irq_mask = mask,
++			.present = true,
++		};
++		if (fd[5] == 0x01u) {
++			rt.f01 = fn;
++		} else if (fd[5] == 0x12u) {
++			rt.f12 = fn;
++		} else if (fd[5] == 0x34u) {
++			rt.f34 = fn;
++		}
++	}
++	if (!rt.f01.present || !rt.f12.present) {
++		printf("RMX TOUCH: missing required RMI4 functions (F01=%d F12=%d)\n",
++		    rt.f01.present, rt.f12.present);
++		return false;
++	}
++
++	char prod[11] = {0};
++	if (rmx_rmi_read((uint8_t)(rt.f01.query_base + 11u), (uint8_t *)prod, 10u) == 0) {
++		for (unsigned i = 0; i < 10u; ++i) {
++			if ((uint8_t)prod[i] < 0x20u || (uint8_t)prod[i] > 0x7eu) {
++				prod[i] = '\0';
++				break;
++			}
++		}
++	}
++	uint32_t fwid = 0;
++	if (rt.f34.present) {
++		uint8_t fw[4] = {0};
++		if (rmx_rmi_read(rt.f34.ctrl_base, fw, 4u) == 0) {
++			fwid = ((uint32_t)fw[0] << 24) | ((uint32_t)fw[1] << 16) |
++			    ((uint32_t)fw[2] << 8) | fw[3];
++		}
++	}
++	uint8_t f01_status = 0;
++	err = rmx_rmi_read(rt.f01.data_base, &f01_status, 1u);
++	printf("RMX TOUCH: product=\"%s\" fwid=%#x f01_status=%#x (err=%d)\n",
++	    prod, fwid, f01_status, err);
++	if (err || (f01_status & 0x40u)) {
++		printf("RMX TOUCH: IC in bootloader or unreadable; stopping\n");
++		return false;
++	}
++
++	/* Default S3706 F12 packet-register offsets, refined from F12_2D_QUERY08 if available. */
++	rt.f12_data01_off = 0u;
++	rt.f12_data15_off = 3u;
++	uint8_t q5 = 0, q8[4] = {0};
++	if (rmx_rmi_read((uint8_t)(rt.f12.query_base + 7u), &q5, 1u) == 0 && q5 >= 3u &&
++	    rmx_rmi_read((uint8_t)(rt.f12.query_base + 8u), q8, 3u) == 0) {
++		if ((q8[1] & (1u << 1)) && (q8[2] & (1u << 7))) {
++			rt.f12_data01_off = (uint8_t)(q8[1] & 1u);
++			rt.f12_data15_off = (uint8_t)(rmx_popcount8(q8[1]) +
++			    rmx_popcount8((uint8_t)(q8[2] & 0x7fu)));
++		}
++		printf("RMX TOUCH: F12 query5=%u query8=%02x:%02x:%02x -> data01=+%u data15=+%u\n",
++		    q5, q8[0], q8[1], q8[2], rt.f12_data01_off, rt.f12_data15_off);
++	}
++
++	err = rmx_f01_configure();
++	if (err) {
++		printf("RMX TOUCH: F01 configure failed err=%d\n", err);
++		return false;
++	}
++	return true;
++}
++
++static void
++rmx_release_all(void)
++{
++	for (unsigned id = 0; id < RMX_MAX_FINGERS; ++id) {
++		if (rt.active & (1u << id)) {
++			sweet_hid_touch((int)id, 0, rt.x[id], rt.y[id]);
++		}
++	}
++	rt.active = 0;
++}
++
++static int
++rmx_poll_once(unsigned *logged_events)
++{
++	uint8_t f01[2] = {0};
++	int err = rmx_rmi_read(rt.f01.data_base, f01, 2u);
++	if (err) {
++		return err;
++	}
++	if ((f01[0] & 0x0fu) == 1u) {
++		/* Unexpected IC reset: restore Configured + interrupt mask. */
++		(void)rmx_f01_configure();
++	}
++
++	uint8_t att[2] = {0};
++	err = rmx_rmi_read((uint8_t)(rt.f12.data_base + rt.f12_data15_off), att, 2u);
++	if (err) {
++		return err;
++	}
++	uint32_t obj_att = (((uint32_t)att[1] << 8) | att[0]) & 0x03ffu;
++	if (obj_att == 0) {
++		if (rt.active) {
++			if (rt.log || *logged_events < 32u) {
++				(*logged_events)++;
++				printf("RMX TOUCH: lift all (was=%#x)\n", rt.active);
++			}
++			rmx_release_all();
++		}
++		return 0;
++	}
++
++	unsigned top = RMX_MAX_FINGERS;
++	while (top > 1u && !(obj_att & (1u << (top - 1u)))) {
++		--top;
++	}
++	uint8_t buf[RMX_MAX_FINGERS * 8u];
++	err = rmx_rmi_read((uint8_t)(rt.f12.data_base + rt.f12_data01_off), buf, top * 8u);
++	if (err) {
++		return err;
++	}
++
++	uint32_t new_active = 0;
++	for (unsigned id = 0; id < RMX_MAX_FINGERS; ++id) {
++		bool down = false;
++		int x = rt.x[id], y = rt.y[id];
++		if (id < top && ((obj_att >> id) & 1u)) {
++			const uint8_t *p = &buf[id * 8u];
++			/* p[0]: 0x01 = finger, 0x02 = stylus, 0x06 = glove */
++			if (p[0] == 0x01u || p[0] == 0x02u || p[0] == 0x06u) {
++				x = (int)(((unsigned)(p[2] & 0x0fu) << 8) | p[1]);
++				y = (int)(((unsigned)(p[4] & 0x0fu) << 8) | p[3]);
++				if (x >= 0 && x < RMX_PANEL_W && y >= 0 && y < RMX_PANEL_H) {
++					down = true;
++				}
++			}
++		}
++		if (down) {
++			new_active |= (1u << id);
++			if (rt.log || (!(rt.active & (1u << id)) && *logged_events < 32u)) {
++				(*logged_events)++;
++				printf("RMX TOUCH: slot=%u down x=%d y=%d\n", id, x, y);
++			}
++			rt.x[id] = x;
++			rt.y[id] = y;
++			sweet_hid_touch((int)id, 1, x, y);
++		} else if (rt.active & (1u << id)) {
++			if (rt.log || *logged_events < 32u) {
++				(*logged_events)++;
++				printf("RMX TOUCH: slot=%u up x=%d y=%d\n", id, rt.x[id], rt.y[id]);
++			}
++			sweet_hid_touch((int)id, 0, rt.x[id], rt.y[id]);
++		}
++	}
++	rt.active = new_active;
++	return 0;
++}
++
++static void
++rmx_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 5;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("rmxtouchdelay", &delay_s, sizeof(delay_s));
++	printf("RMX TOUCH: starting in %u s\n", delay_s);
++	rmx_wait(delay_s * 1000u);
++
++	rt.gcc = ml_io_map(RMX_GCC_PA, 0x60000);
++	rt.gpio = ml_io_map(RMX_SOUTH_PA, 0x81000);
++	rt.se = ml_io_map(RMX_SE_PA, 0x4000);
++	if (!rt.gcc || !rt.gpio || !rt.se) {
++		printf("RMX TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("RMX TOUCH: TLMM pre reset=%#x/%#x sda=%#x scl=%#x irq=%#x/%#x\n",
++	    rmx_rd(rt.gpio, RMX_GPIO_CFG(RMX_PIN_RESET)), rmx_rd(rt.gpio, RMX_GPIO_IO(RMX_PIN_RESET)),
++	    rmx_rd(rt.gpio, RMX_GPIO_CFG(RMX_PIN_SDA)), rmx_rd(rt.gpio, RMX_GPIO_CFG(RMX_PIN_SCL)),
++	    rmx_rd(rt.gpio, RMX_GPIO_CFG(RMX_PIN_IRQ)), rmx_rd(rt.gpio, RMX_GPIO_IO(RMX_PIN_IRQ)));
++
++	/* 1. IRQ input with pull-up; hold reset LOW during rail power-up. */
++	rmx_gpio(RMX_PIN_IRQ, 0, 3, 3, false, false);
++	rmx_gpio(RMX_PIN_RESET, 0, 0, 3, true, false);
++
++	/* 2. Enable vdd_2v8 (L17A @ 3000 mV) and vcc_1v8 (PM8150L GPIO5 HIGH). */
++	int err = sweet_rpmh_vreg_enable("ldoa17", 3000);
++	if (err) {
++		printf("RMX TOUCH: ldoa17 enable failed %d; stopping\n", err);
++		goto out;
++	}
++	if (!rmx_enable_1v8_gpio()) {
++		printf("RMX TOUCH: PM8150L GPIO5 1.8V enable failed; stopping\n");
++		goto out;
++	}
++	rmx_wait(10);
++
++	/* 3. Enable QUPv3 wrap2 SE0 clocks, mux GPIO 55/56 to qup17, init GENI I2C. */
++	if (!rmx_clocks()) {
++		goto out;
++	}
++	rmx_gpio(RMX_PIN_SDA, 1, 0, 0, false, false);
++	rmx_gpio(RMX_PIN_SCL, 1, 0, 0, false, false);
++	if (!rmx_se_init()) {
++		goto out;
++	}
++
++	/* 4. Release active-low reset and wait 100 ms for S3706 internal flash boot. */
++	rmx_wait(10);
++	rmx_gpio(RMX_PIN_RESET, 0, 0, 3, true, true);
++	rmx_wait(100);
++
++	if (!rmx_rmi_init()) {
++		goto out;
++	}
++	printf("RMX TOUCH: Synaptics S3706 ready (%ux%u, 10 fingers, poll=8ms)\n",
++	    RMX_PANEL_W, RMX_PANEL_H);
++
++	unsigned errors = 0, logged_events = 0, ticks = 0;
++	while (!rt.dead) {
++		bool irq_low = (rmx_rd(rt.gpio, RMX_GPIO_IO(RMX_PIN_IRQ)) & 1u) == 0;
++		bool periodic = (++ticks % 12u) == 0;
++		if (irq_low || rt.active || periodic) {
++			err = rmx_poll_once(&logged_events);
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("RMX TOUCH: poll err=%d irq=%#x\n", err, rt.irq_status);
++				}
++				if (errors == 10u) {
++					rmx_release_all();
++				}
++			} else {
++				errors = 0;
++			}
++		}
++		rmx_wait(8);
++	}
++	rmx_release_all();
++out:
++	printf("RMX TOUCH: thread exits\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++rmx1931_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (rt.started) {
++		return;
++	}
++	rt.started = true;
++	(void)PE_parse_boot_argn("rmxtouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("rmxtouchlog", &rt.log, sizeof(rt.log));
++	(void)PE_parse_boot_argn("rmxtouch100k", &rt.i2c_100k, sizeof(rt.i2c_100k));
++	if (!enabled) {
++		printf("RMX TOUCH: disabled (rmxtouch=0)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(rmx_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("RMX TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index d9d7860..b3a49b7 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -48,7 +48,7 @@
+ #define A6_RING_SIZE		0x8000u
+ #define A6_RING_DW		(A6_RING_SIZE / 4)
+ 
+-#define A6_FB_PA		0x9c400000ull
++#define A6_FB_PA		0x9d000000ull
+ #define A6_FB_SIZE		0xa00000ull	/* mapped for the GPU: 5 x 2 MB */
+ 
+ #define A6_GPU_ID		640
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 7d77ffd..7ee003e 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -572,7 +572,7 @@ out:
+ void
+ sweet_fts_init(void)
+ {
+-	int enabled = 1;
++	int enabled = 0;
+ 	thread_t thread;
+ 	if (ft.started) {
+ 		return;
+@@ -581,7 +581,7 @@ sweet_fts_init(void)
+ 	(void)PE_parse_boot_argn("flametouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("flametouchlog", &ft.log, sizeof(ft.log));
+ 	if (!enabled) {
+-		printf("SWEET FTS: disabled (flametouch=0)\n");
++		printf("SWEET FTS: disabled (Pixel 4 driver; flametouch=1 forces it)\n");
+ 		return;
+ 	}
+ 	kern_return_t kr = kernel_thread_start(fts_thread, NULL, &thread);
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index c87ed5d..f475ff2 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -546,7 +546,7 @@ present_wait_locked(uint32_t k, const char *why)
+ 	return 0;
+ }
+ #define PANEL_W         1080
+-#define PANEL_H         2280
++#define PANEL_H         2400
+ #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
+ #define DISPLAY_MASK_SIDE       256u
+ #define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 99a9c87..eee65bd 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_fts_init(void);
++extern void rmx1931_touch_init(void);
+ extern void sweet_cpufreq_init(void);
+ extern void sweet_pmem_init(void);
+ extern void flame_wlan_init(void);
+@@ -669,6 +670,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_fts_init();
++	rmx1931_touch_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index f876fb0..a9f0b6c 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -361,7 +361,7 @@ extern "C" int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sw
+ 
+ /* Touch reports panel pixels; flame's panel is 1080x2280 (SWEET.h). */
+ #define SWEET_PANEL_W 1080
+-#define SWEET_PANEL_H 2280
++#define SWEET_PANEL_H 2400
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 833d522..09eb181 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -810,6 +810,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
+ 		*oflags = 0;
+ 		goto iofrootx;
++	} else {
++		int sweetprobe = 0;
++		if (PE_parse_boot_argn("sweetprobe", &sweetprobe, sizeof(sweetprobe)) && sweetprobe) {
++			extern int sweet_ufs_rootdev(dev_t *dev);
++			dev_t dummy_dev = 0;
++			int ufs_error = sweet_ufs_rootdev(&dummy_dev);
++			IOLog("IOFindBSDRoot: sweetprobe=%d ufs/input/usb probe rc=%d\n", sweetprobe, ufs_error);
++		}
+ 	}
+ #endif
+ 
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 9150ead..1a66c73 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -52,15 +52,15 @@
+ #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
+ /*
+- * Pixel 4 (flame): splash framebuffer ABL scans out (cont_splash_region;
+- * ABL leaves the command-mode panel autorefreshing), 1080x2280 a8r8g8b8,
+- * 4320-byte rows. The bootstrap console uses it before the ADT is parsed.
+- * SWEET_EARLY_FB_BLOCK_PA is the 32MB L2 block holding it.
++ * Realme X2 Pro (RMX1931 / samurai): splash framebuffer ABL scans out
++ * (cont_splash_region @ 0x9d000000, Samsung SOFEF03F-M 1080x2400 cmd-mode
++ * panel, 4320-byte rows). SWEET_EARLY_FB_BLOCK_PA is the 32MB L2 block
++ * [0x9c000000, 0x9e000000) mapped Device-GRE holding it.
+  */
+-#define SWEET_EARLY_FB_PA         0x9c400000
++#define SWEET_EARLY_FB_PA         0x9d000000
+ #define SWEET_EARLY_FB_BLOCK_PA   0x9c000000
+ #define SWEET_EARLY_FB_WIDTH      1080
+-#define SWEET_EARLY_FB_HEIGHT     2280
++#define SWEET_EARLY_FB_HEIGHT     2400
+ #define SWEET_EARLY_FB_STRIDE     4320
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt

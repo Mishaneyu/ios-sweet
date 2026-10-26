@@ -29,8 +29,18 @@ screen (image versions v8-v14 in NOTES.md):
 """
 import glob, os, plistlib, shutil, sys
 
-BUILD, VERSION = '20H392', '16.7.16'
+DEFAULT_BUILD, DEFAULT_VERSION = '20H392', '16.7.16'
 MOBILE = 501
+
+
+def detect_system_version(root):
+    for rel in ('System/Library/CoreServices/SystemVersion.plist',
+                'private/preboot/Cryptexes/OS/System/Library/CoreServices/SystemVersion.plist'):
+        p = os.path.join(root, rel)
+        if os.path.exists(p):
+            sv = load(p)
+            return sv.get('ProductBuildVersion', DEFAULT_BUILD), sv.get('ProductVersion', DEFAULT_VERSION)
+    return DEFAULT_BUILD, DEFAULT_VERSION
 
 
 def load(path):
@@ -64,11 +74,17 @@ def launchd(root):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
+    skip_labels = {
+        'com.apple.CommCenter',
+        'com.apple.aneuserd',
+        'com.apple.modelcatalogd',
+        'com.apple.generativeexperiencesd',
+    }
+    removed = [k for k, j in jobs.items() if j.get('Label') in skip_labels]
     for k in removed:
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} unsupported hw/ANE jobs removed')
 
 
 def containers(root):
@@ -94,7 +110,7 @@ def find_container(root, kind, identifier):
     return None
 
 
-def activation(root):
+def activation(root, build, version):
     c = find_container(root, 'Data/System', 'com.apple.mobileactivationd')
     if c is None:
         print('warning: no mobileactivationd system container in the image; skipped data ark')
@@ -105,10 +121,10 @@ def activation(root):
     os.chmod(d, 0o755)
     save(os.path.join(d, 'data_ark.plist'), {
         '-ActivationState': 'Activated', '-BrickState': False,
-        '-BuildVersion': BUILD, '-ProductVersion': VERSION,
+        '-BuildVersion': build, '-ProductVersion': version,
         '-DataMigrationCompleted': True, '-PreSydroDataMigrationCompleted': True,
     }, MOBILE, MOBILE, 0o600)
-    print('data ark', d)
+    print('data ark', d, build, version)
 
 
 def audio(root):
@@ -130,19 +146,24 @@ def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = sys.argv[1]
+    build, version = detect_system_version(root)
+    major = int(version.split('.')[0]) if version.split('.')[0].isdigit() else 16
+    setup_ver = 26 if major >= 26 else 11
+    print(f'target root: iOS {version} ({build}), SetupVersion={setup_ver}')
     launchd(root)
     containers(root)
-    activation(root)
+    activation(root, build, version)
     audio(root)
     merge_pref(root, 'com.apple.migration', {
-        'LastSystemVersion': BUILD,
-        'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
+        'LastSystemVersion': build,
+        'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': build}})
     merge_pref(root, 'com.apple.springboard', {
         'BKNoWatchdogs': True,
         'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},
         'MCForceShowCloudConfigurationUI': False})
     merge_pref(root, 'com.apple.purplebuddy', {
-        'SetupDone': True, 'SetupFinishedAllSteps': True, 'SetupVersion': 11,
+        'SetupDone': True, 'SetupFinishedAllSteps': True, 'SetupVersion': setup_ver,
+        'LastSystemVersion': build,
         'daemonizeNeedsToRun': False})
     merge_pref(root, 'com.apple.purplebuddy.notbackedup', {
         k: False for k in ('ShouldRunDiagnosticsMiniBuddy', 'ShouldRunHSA2MiniBuddy',

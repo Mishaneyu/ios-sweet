@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack an xnu kernel Mach-O + ADT into the payload the sweet shim boots.
 
-  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE]
+  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--bootargs-v1]
 
 The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
 (no kmutil, no iBoot) resolves those for us, and xnu only rebases static
@@ -10,16 +10,19 @@ rewritten to its unslid target. The shim then only copies flat segments.
 
 Payload layout (little endian, all offsets from payload start):
   0x000  char  magic[8] = "SWEETXNU"
-  0x008  u32   version = 1, nsegs
+  0x008  u32   version = 2 (or 1 with --bootargs-v1), nsegs
   0x010  u64   virt_base      kernel VA that maps to phys_base
   0x018  u64   entry_va       LC_UNIXTHREAD pc
   0x020  u64   adt_off, adt_size
   0x030  u64   kernel_end_va  end of the highest segment (page aligned)
   0x038  u64   phys_base      kernel-managed RAM (same values as the ADT's dram-base/size)
   0x040  u64   mem_size
-  0x048  char  cmdline[608]   (the last 16 bytes, 0x298: u64 ring_va, total_va of
-                              the kernel's console ring, for the shim's RAM log rescue)
-  0x2a8  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
+  v2 (default, xnu-12377 / iOS 26 BOOT_LINE_LENGTH = 1024):
+    0x048  char  cmdline[1024]  (last 16 bytes, 0x438: u64 ring_va, total_va)
+    0x448  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
+  v1 (--bootargs-v1, legacy xnu-8796 / iOS 16 BOOT_LINE_LENGTH = 608):
+    0x048  char  cmdline[608]   (last 16 bytes, 0x298: u64 ring_va, total_va)
+    0x2a8  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
 
 --ramdisk appends IMAGE as one more segment right after the kernel and moves
 kernel_end past it, so the shim needs no changes: the image lands below the
@@ -34,10 +37,12 @@ import adt  # noqa: E402
 
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
 PAGE = 0x4000
-BOOT_LINE_LENGTH = 608
+BOOT_LINE_LENGTH_V1 = 608
+BOOT_LINE_LENGTH_V2 = 1024
+BOOT_LINE_LENGTH = BOOT_LINE_LENGTH_V2
 CMDLINE = 0x48
-SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
-RAMLOG = CMDLINE + BOOT_LINE_LENGTH - 16	# 0x298: ring_va, total_va
+SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x448 (v2 default; 0x2a8 for v1)
+RAMLOG = CMDLINE + BOOT_LINE_LENGTH - 16	# 0x438 (v2 default; 0x298 for v1)
 
 
 def kernel_symbols(path, *names):
@@ -183,7 +188,12 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, poke_path=None, gpufw_dir=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, poke_path=None, gpufw_dir=None, bootargs_v1=False):
+    ver = 1 if bootargs_v1 else 2
+    boot_line_len = BOOT_LINE_LENGTH_V1 if bootargs_v1 else BOOT_LINE_LENGTH_V2
+    seg_table_off = CMDLINE + boot_line_len
+    ramlog_off = CMDLINE + boot_line_len - 16
+
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -215,7 +225,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, poke_path=None, gpu
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
 
-    hdr_size = SEG_TABLE + 32 * len(pieces)
+    hdr_size = seg_table_off + 32 * len(pieces)
     out = bytearray(hdr_size)
     seg_table = []
     for vmaddr, vmsize, data in pieces:
@@ -227,18 +237,19 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, poke_path=None, gpu
     out += adt_blob
     out += b'\0' * (-len(out) & 0xf)
 
-    struct.pack_into('<8sII', out, 0, b'SWEETXNU', 1, len(pieces))
+    struct.pack_into('<8sII', out, 0, b'SWEETXNU', ver, len(pieces))
     struct.pack_into('<7Q', out, 0x10, virt_base, m['entry'], adt_off, len(adt_blob), kernel_end,
                      PHYS_BASE, MEM_SIZE)
     cl = cmdline.encode()
-    assert len(cl) < BOOT_LINE_LENGTH - 16, 'cmdline too long (the last 16 bytes hold the ramlog VAs)'
+    assert len(cl) < boot_line_len - 16, 'cmdline too long (the last 16 bytes hold the ramlog VAs)'
     out[CMDLINE:CMDLINE + len(cl)] = cl
     ring_va, total_va = kernel_symbols(kernel_path, '_sweet_log_ring', '_sweet_log_total')
-    struct.pack_into('<2Q', out, RAMLOG, ring_va, total_va)
+    struct.pack_into('<2Q', out, ramlog_off, ring_va, total_va)
     for i, t in enumerate(seg_table):
-        struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
-    info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
-                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, size=len(out),
+        struct.pack_into('<4Q', out, seg_table_off + 32 * i, *t)
+    info = dict(version=ver, cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix,
+                virt_base=hex(virt_base), entry=hex(m['entry']), kernel_end=hex(kernel_end),
+                ramdisk=ramdisk, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -250,8 +261,10 @@ if __name__ == '__main__':
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     ap.add_argument('--poke', help='register script for bsd/dev/sweet_poke.c (/chosen/sweet-poke)')
     ap.add_argument('--gpufw', help='Adreno firmware directory for bsd/dev/sweet_gpu.c (/chosen/gpufw,*)')
+    ap.add_argument('--bootargs-v1', action='store_true',
+                    help='emit legacy v1 payload (608-byte boot_args CommandLine for xnu-8796 / iOS 16)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.poke, a.gpufw)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.poke, a.gpufw, a.bootargs_v1)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

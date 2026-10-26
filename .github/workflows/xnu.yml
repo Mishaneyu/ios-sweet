@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       macos_version:
-        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
-        default: "13.5"
+        description: macOS release whose xnu to build (26.5 = xnu-12377.121.6, iOS 26 era)
+        default: "26.5"
       kernel_config:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
@@ -16,8 +16,9 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main, master]
+    branches: [main, master, upgrade_ios_version_target]
     paths:
+      - "xnu/patches-26/**"
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
 
@@ -27,15 +28,14 @@ concurrency:
 
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
-  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
-  MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
+  DXB_SHA: bd88697145b2d8008bbed951fef99795308262f0
+  MACOS_VERSION: ${{ inputs.macos_version || '26.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
 
 jobs:
   build:
-    # 0082-flame-iig-kernelcontent.patch adds IORPC.kernelContent for Xcode 16+ on macos-15
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -45,33 +45,76 @@ jobs:
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
-          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("dxb/build.sh")
+          s = p.read_text()
+
+          # 1. Honor preset KDKROOT (fake-kdk) instead of downloading the 1.2 GB KDK DMG
+          s, n_kdk = re.subn(
+              r"KDKROOT='(/Library/Developer/KDKs/[^']+)'",
+              r'KDKROOT="${KDKROOT:-\1}"',
+              s,
+          )
+          assert n_kdk > 0, "Failed to patch KDKROOT in dxb/build.sh"
+
+          # 2. libfirehose_kernel is built arm64e-only upstream; SWEET kernel is plain arm64
+          old_arch = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
+          new_arch = 'ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"'
+          assert old_arch in s, "Failed to find libfirehose_kernel ARCHS in dxb/build.sh"
+          s = s.replace(old_arch, new_arch, 1)
+
+          # 3. Keep dxb's own conditional check loop for dxb/patches/26.0 (which has commented-out/26.0-only
+          #    patches), then stage & apply all xnu/patches-26 scripts and patches fail-fast
+          old_patches = """        for PATCH in "${PATCH_DIR}"/*.patch; do
+            if git apply --check "$PATCH" 2> /dev/null; then
+                running "Applying patch: ${PATCH}"
+                git apply "$PATCH"
+            fi
+        done"""
+          new_patches = old_patches + """
+        SWEET_PATCH_DIR="${GITHUB_WORKSPACE}/xnu/patches-26"
+        for SCRIPT in "${SWEET_PATCH_DIR}"/*.sh; do
+            running "Running sweet stage script: ${SCRIPT}"
+            bash "${SCRIPT}"
+        done
+        for PATCH in "${SWEET_PATCH_DIR}"/*.patch; do
+            running "Applying sweet patch: ${PATCH}"
+            git apply --verbose "$PATCH"
+        done"""
+          assert old_patches in s, "Failed to find patch loop in dxb/build.sh"
+          s = s.replace(old_patches, new_patches, 1)
+
+          p.write_text(s)
+          PY
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
-          ls dxb/patches
+          ls dxb/patches/26.0 xnu/patches-26
 
       - name: Deps
         run: |
-          brew install jq gum bash cmake ninja
+          for pkg in jq gum bash cmake ninja; do
+            command -v "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+          done
           # build.sh checks command -v xcodes; only install stub if xcodes is not already preinstalled
           if ! command -v xcodes >/dev/null 2>&1; then
             printf '#!/bin/sh\nexit 0\n' | sudo tee "$(brew --prefix)/bin/xcodes" >/dev/null
             sudo chmod +x "$(brew --prefix)/bin/xcodes"
           fi
-          # SWEET links no closed KDK archives (tools/build-xnu.sh); skip 1.2 GB KDK dmg download
+          # SWEET links no closed KDK archives (tools/build-xnu.sh); populate fake-kdk with CoreEntitlements V2 headers
           mkdir -p "$PWD/fake-kdk"
+          KDKROOT="$PWD/fake-kdk" bash xnu/patches-26/0000-stage-coreentitlements-v2.sh
           echo "KDKROOT=$PWD/fake-kdk" >> "$GITHUB_ENV"
           sw_vers
           ls -d /Applications/Xcode*.app
-          DEV_DIR=$(xcode-select -p 2>/dev/null || true)
-          if [ -z "$DEV_DIR" ] || [ ! -d "$DEV_DIR" ]; then
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$XC" ]; then
             XC=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)
-            [ -n "$XC" ] || XC=/Applications/Xcode.app
-            sudo xcode-select -s "$XC"
-            DEV_DIR="$XC/Contents/Developer"
           fi
+          [ -n "$XC" ] || XC=/Applications/Xcode.app
+          sudo xcode-select -s "$XC"
+          DEV_DIR="$XC/Contents/Developer"
           echo "DEVELOPER_DIR=$DEV_DIR" >> "$GITHUB_ENV"
           xcodebuild -version
           xcrun --find iig

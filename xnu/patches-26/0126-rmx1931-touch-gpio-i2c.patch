@@ -1,0 +1,285 @@
+diff --git a/bsd/dev/rmx1931_touch.c b/bsd/dev/rmx1931_touch.c
+index 2b89df4..38fefa4 100644
+--- a/bsd/dev/rmx1931_touch.c
++++ b/bsd/dev/rmx1931_touch.c
+@@ -111,8 +111,8 @@ static struct {
+ 	vm_offset_t se, gcc, gpio;
+ 	vm_offset_t sp_core, sp_cnfg, sp_obs, sp_ch;
+ 	uint16_t sp_apid;
+-	bool started, dead;
+-	int log, i2c_100k;
++	bool started, dead, bitbang;
++	int log, i2c_100k, force_gpio;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+ 	struct rmi_fn f01, f12, f34;
+@@ -341,15 +341,18 @@ static bool
+ rmx_se_init(void)
+ {
+ 	uint32_t fw = rmx_rd(rt.se, SE_FW);
++	uint32_t fifo_off = rmx_rd(rt.se, 0x64u);
+ 	uint32_t tx = rmx_rd(rt.se, SE_HW_TX), rx = rmx_rd(rt.se, SE_HW_RX);
+-	printf("RMX TOUCH: SE0 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+-	    fw, (fw >> 8) & 0xffu, rmx_rd(rt.se, SE_STATUS), tx, rx,
++	printf("RMX TOUCH: SE0 fw=%#x proto=%u status=%#x fifo_off=%#x tx=%#x rx=%#x ios=%#x\n",
++	    fw, (fw >> 8) & 0xffu, rmx_rd(rt.se, SE_STATUS), fifo_off, tx, rx,
+ 	    rmx_rd(rt.se, 0x908u));
+-	if (((fw >> 8) & 0xffu) != 3u || (rmx_rd(rt.se, 0x64u) & 1u) ||
++	if (rt.force_gpio || ((fw >> 8) & 0xffu) != 3u || (fifo_off & 1u) ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+-		printf("RMX TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; stopping\n");
+-		return false;
++		rt.bitbang = true;
++		printf("RMX TOUCH: SE0 FIFO unavailable (fifo_off=%#x force=%d); switching GPIO55/56 to open-drain I2C\n",
++		    fifo_off, rt.force_gpio);
++		return true;
+ 	}
+ 	if (rmx_rd(rt.se, SE_STATUS) & 1u) {
+ 		rmx_abort();
+@@ -519,9 +522,217 @@ rmx_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
+ 	return err;
+ }
+ 
++/* ---- Open-drain TLMM GPIO I2C fallback (GPIO55=SDA, GPIO56=SCL) ---- */
++
++static inline void
++rmx_bb_delay(void)
++{
++	delay(rt.i2c_100k ? 3 : 1);
++}
++
++static inline void
++rmx_sda_hi(void)
++{
++	rmx_wr(rt.gpio, RMX_GPIO_CFG(RMX_PIN_SDA), 0x003u | (2u << 6));
++}
++
++static inline void
++rmx_sda_lo(void)
++{
++	rmx_wr(rt.gpio, RMX_GPIO_CFG(RMX_PIN_SDA), 0x203u | (2u << 6));
++}
++
++static inline bool
++rmx_sda_in(void)
++{
++	return (rmx_rd(rt.gpio, RMX_GPIO_IO(RMX_PIN_SDA)) & 1u) != 0;
++}
++
++static inline void
++rmx_scl_lo(void)
++{
++	rmx_wr(rt.gpio, RMX_GPIO_CFG(RMX_PIN_SCL), 0x203u | (2u << 6));
++}
++
++static bool
++rmx_scl_hi(void)
++{
++	rmx_wr(rt.gpio, RMX_GPIO_CFG(RMX_PIN_SCL), 0x003u | (2u << 6));
++	for (unsigned i = 0; i < 4000u; ++i) {
++		if (rmx_rd(rt.gpio, RMX_GPIO_IO(RMX_PIN_SCL)) & 1u) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++rmx_bb_stop(void)
++{
++	rmx_sda_lo();
++	rmx_bb_delay();
++	(void)rmx_scl_hi();
++	rmx_bb_delay();
++	rmx_sda_hi();
++	rmx_bb_delay();
++}
++
++static bool
++rmx_bb_start(void)
++{
++	rmx_sda_hi();
++	rmx_bb_delay();
++	if (!rmx_scl_hi()) {
++		return false;
++	}
++	rmx_bb_delay();
++	rmx_sda_lo();
++	rmx_bb_delay();
++	rmx_scl_lo();
++	rmx_bb_delay();
++	return true;
++}
++
++static void
++rmx_bb_init(void)
++{
++	rmx_wr(rt.gpio, RMX_GPIO_IO(RMX_PIN_SDA),
++	    rmx_rd(rt.gpio, RMX_GPIO_IO(RMX_PIN_SDA)) & ~2u);
++	rmx_wr(rt.gpio, RMX_GPIO_IO(RMX_PIN_SCL),
++	    rmx_rd(rt.gpio, RMX_GPIO_IO(RMX_PIN_SCL)) & ~2u);
++	rmx_sda_hi();
++	(void)rmx_scl_hi();
++	delay(5);
++	if (!rmx_sda_in()) {
++		for (unsigned i = 0; i < 9u && !rmx_sda_in(); ++i) {
++			rmx_scl_lo();
++			delay(5);
++			(void)rmx_scl_hi();
++			delay(5);
++		}
++		rmx_bb_stop();
++	}
++	printf("RMX TOUCH: GPIO I2C bus idle sda=%u scl=%u\n",
++	    rmx_sda_in() ? 1u : 0u,
++	    (rmx_rd(rt.gpio, RMX_GPIO_IO(RMX_PIN_SCL)) & 1u) ? 1u : 0u);
++}
++
++static bool
++rmx_bb_tx_byte(uint8_t b, bool *got_ack)
++{
++	*got_ack = false;
++	for (int bit = 7; bit >= 0; --bit) {
++		if ((b >> (unsigned)bit) & 1u) {
++			rmx_sda_hi();
++		} else {
++			rmx_sda_lo();
++		}
++		rmx_bb_delay();
++		if (!rmx_scl_hi()) {
++			return false;
++		}
++		rmx_bb_delay();
++		rmx_scl_lo();
++	}
++	rmx_sda_hi();
++	rmx_bb_delay();
++	if (!rmx_scl_hi()) {
++		return false;
++	}
++	*got_ack = !rmx_sda_in();
++	rmx_bb_delay();
++	rmx_scl_lo();
++	return true;
++}
++
++static bool
++rmx_bb_rx_byte(uint8_t *out, bool send_ack)
++{
++	uint8_t val = 0;
++	rmx_sda_hi();
++	for (int bit = 7; bit >= 0; --bit) {
++		rmx_bb_delay();
++		if (!rmx_scl_hi()) {
++			return false;
++		}
++		if (rmx_sda_in()) {
++			val |= (uint8_t)(1u << (unsigned)bit);
++		}
++		rmx_bb_delay();
++		rmx_scl_lo();
++	}
++	if (send_ack) {
++		rmx_sda_lo();
++	} else {
++		rmx_sda_hi();
++	}
++	rmx_bb_delay();
++	if (!rmx_scl_hi()) {
++		return false;
++	}
++	rmx_bb_delay();
++	rmx_scl_lo();
++	rmx_sda_hi();
++	*out = val;
++	return true;
++}
++
++static int
++rmx_bb_read(uint8_t reg, uint8_t *buf, unsigned len)
++{
++	bool ack = false;
++	if (!len) {
++		return 0;
++	}
++	if (!rmx_bb_start()) {
++		rmx_bb_stop();
++		return EBUSY;
++	}
++	if (!rmx_bb_tx_byte((uint8_t)(RMX_I2C_ADDR << 1), &ack) || !ack ||
++	    !rmx_bb_tx_byte(reg, &ack) || !ack) {
++		rmx_bb_stop();
++		return ack ? ETIMEDOUT : ENXIO;
++	}
++	if (!rmx_bb_start() ||
++	    !rmx_bb_tx_byte((uint8_t)((RMX_I2C_ADDR << 1) | 1u), &ack) || !ack) {
++		rmx_bb_stop();
++		return ack ? ETIMEDOUT : ENXIO;
++	}
++	for (unsigned i = 0; i < len; ++i) {
++		if (!rmx_bb_rx_byte(&buf[i], (i + 1u) < len)) {
++			rmx_bb_stop();
++			return ETIMEDOUT;
++		}
++	}
++	rmx_bb_stop();
++	return 0;
++}
++
++static int
++rmx_bb_write1(uint8_t reg, uint8_t val)
++{
++	bool ack = false;
++	if (!rmx_bb_start()) {
++		rmx_bb_stop();
++		return EBUSY;
++	}
++	if (!rmx_bb_tx_byte((uint8_t)(RMX_I2C_ADDR << 1), &ack) || !ack ||
++	    !rmx_bb_tx_byte(reg, &ack) || !ack ||
++	    !rmx_bb_tx_byte(val, &ack) || !ack) {
++		rmx_bb_stop();
++		return ack ? ETIMEDOUT : ENXIO;
++	}
++	rmx_bb_stop();
++	return 0;
++}
++
+ static int
+ rmx_rmi_read(uint8_t reg, uint8_t *buf, unsigned len)
+ {
++	if (rt.bitbang) {
++		return rmx_bb_read(reg, buf, len);
++	}
+ 	int err = rmx_msg(&reg, 1u, NULL, 0, true);
+ 	if (err) {
+ 		return err;
+@@ -532,6 +743,9 @@ rmx_rmi_read(uint8_t reg, uint8_t *buf, unsigned len)
+ static int
+ rmx_rmi_write1(uint8_t reg, uint8_t val)
+ {
++	if (rt.bitbang) {
++		return rmx_bb_write1(reg, val);
++	}
+ 	uint8_t buf[2] = {reg, val};
+ 	return rmx_msg(buf, 2u, NULL, 0, false);
+ }
+@@ -804,6 +1018,9 @@ rmx_thread(void *arg, wait_result_t result)
+ 	rmx_wait(10);
+ 	rmx_gpio(RMX_PIN_RESET, 0, 0, 3, true, true);
+ 	rmx_wait(100);
++	if (rt.bitbang) {
++		rmx_bb_init();
++	}
+ 
+ 	if (!rmx_rmi_init()) {
+ 		goto out;
+@@ -849,6 +1066,7 @@ rmx1931_touch_init(void)
+ 	(void)PE_parse_boot_argn("rmxtouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("rmxtouchlog", &rt.log, sizeof(rt.log));
+ 	(void)PE_parse_boot_argn("rmxtouch100k", &rt.i2c_100k, sizeof(rt.i2c_100k));
++	(void)PE_parse_boot_argn("rmxtouchgpio", &rt.force_gpio, sizeof(rt.force_gpio));
+ 	if (!enabled) {
+ 		printf("RMX TOUCH: disabled (rmxtouch=0)\n");
+ 		return;
