@@ -6,9 +6,11 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 ## Start here (next session)
 
 ### Existing kmem RNG fallback was compiled out (kernel 0135, 2026-10-26)
-- While 0134 builds, an explicitly temporary local binary diagnostic corrected only the Firehose copy destination and booted with `firehose_chunk_count=16 firehose_io_pages=8`. Logging then initialized successfully; this is diagnostic evidence, not a Gate 1 pass or a substitute for testing the CI artifact.
-- Next observed panic: `_crypto_random_kmem_ctx_size+0xc`, FAR `0x150`, called by `vm_map_store_crypto_init`; `g_crypto_funcs` is NULL. Patch 0013 already supplies an allocator RNG fallback, but guards it with `SWEET`, which is unavailable in this translation unit. CI's actual compile command defines `ARM64_BOARD_CONFIG_SWEET`.
-- 0135 changes those five guards to `ARM64_BOARD_CONFIG_SWEET`, matching adjacent SWEET crypto wrappers. It does not introduce a new generator or bypass the VM initialization. Pending fresh CI and Gate 1 on the untouched artifact.
+- CI [40287156631](https://github.com/nithinyadavamaraboina-online/ios-rmx1931/actions/runs/40287156631) (`c1788f5`, kernel 0134) PASSED compilation, final link and packaging.
+- While 0134 built, an explicitly temporary local binary diagnostic corrected only the Firehose copy destination and booted with `firehose_chunk_count=16 firehose_io_pages=8`. Logging then initialized successfully; this is diagnostic evidence, not a Gate 1 pass or a substitute for testing the CI artifact.
+- Next observed panic: `_crypto_random_kmem_ctx_size+0xc`, FAR `0x150`, called by `vm_map_store_crypto_init`; `g_crypto_funcs` is NULL. Patch 0013 already supplies an allocator RNG fallback, but guards it with `SWEET`, which is unavailable in `libkern` (`SWEET` comes from `<pexpert/arm64/board_config.h>`, whereas `libkern` only receives `-DARM64_BOARD_CONFIG_SWEET` on the compiler command line).
+- Initial 0135 push (`378e3b6`, CI [40288196080](https://github.com/nithinyadavamaraboina-online/ios-rmx1931/actions/runs/40288196080)) failed with a single compile error in `libkern/crypto/corecrypto_rand.c:148`: `call to undeclared function 'early_random'`, because in `xnu-12377` `early_random(void)` is declared in `osfmk/kern/misc_protos.h` (not exported to `libkern`) rather than `<prng/random.h>`.
+- Updated `0135-ios26-kmem-rng-board-guard.patch` changes the five guards to `ARM64_BOARD_CONFIG_SWEET` and declares `extern uint64_t early_random(void);` (`osfmk/prng/prng_random.c`), and adds `com.apple.aned` to `skip_labels` in `tools/sweet-root-tweaks.py`. Pending fresh CI and Gate 1 on the untouched artifact.
 
 
 ### Gate 1 boot fixes: entropy and Firehose header (kernel 0134, 2026-10-26)

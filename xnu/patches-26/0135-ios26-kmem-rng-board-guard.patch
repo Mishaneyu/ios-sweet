@@ -1,27 +1,33 @@
-From 8f1485bb02a51b34f040a73a3dbce772fa60a978 Mon Sep 17 00:00:00 2001
-From: Nithin Amaraboina <48430674+nithinpain@users.noreply.github.com>
-Date: Mon, 26 Oct 2026 13:16:03 +0530
-Subject: [PATCH] Use compiler board define for existing SWEET allocator RNG
- fallback
+From 30ceb6ab3ff638ce1a58fb73da80de4734a5c0cf Mon Sep 17 00:00:00 2001
+From: XNU 26 Rebase <rebase@local>
+Date: Mon, 26 Oct 2026 08:56:08 +0000
+Subject: [PATCH] 0135-ios26-kmem-rng-board-guard.patch: activate SWEET kmem
+ RNG fallback and declare early_random
 
 ---
- libkern/crypto/corecrypto_rand.c | 12 ++++++------
- 1 file changed, 6 insertions(+), 6 deletions(-)
+ libkern/crypto/corecrypto_rand.c | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
 
 diff --git a/libkern/crypto/corecrypto_rand.c b/libkern/crypto/corecrypto_rand.c
-index b4ddac1..3006ec6 100644
+index b4ddac1..7577743 100644
 --- a/libkern/crypto/corecrypto_rand.c
 +++ b/libkern/crypto/corecrypto_rand.c
-@@ -29,7 +29,7 @@
+@@ -29,11 +29,12 @@
  #include <libkern/crypto/crypto_internal.h>
  #include <corecrypto/ccrng.h>
  #include <libkern/crypto/rand.h>
 -#if defined(SWEET)
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <kern/assert.h>
- #include <prng/random.h>
+-#include <prng/random.h>
  #include <string.h>
-@@ -67,7 +67,7 @@ sweet_kmem_uniform(struct sweet_kmem_rng *rng, uint64_t bound)
+ 
++extern uint64_t early_random(void); /* osfmk/prng/prng_random.c */
++
+ /*
+  * No corecrypto kext is loaded on SWEET. VM/allocator callers (such as
+  * vm_map_store) require a lock-free per-CPU generator seeded during EARLY_BOOT
+@@ -67,7 +68,7 @@ sweet_kmem_uniform(struct sweet_kmem_rng *rng, uint64_t bound)
  	} while (value < threshold);
  	return value % bound;
  }
@@ -30,7 +36,7 @@ index b4ddac1..3006ec6 100644
  
  int
  cc_rand_generate(void *out, size_t outlen)
-@@ -97,7 +97,7 @@ crypto_random_generate(
+@@ -97,7 +98,7 @@ crypto_random_generate(
  	void *random,
  	size_t random_size)
  {
@@ -39,7 +45,7 @@ index b4ddac1..3006ec6 100644
  	if (g_crypto_funcs == NULL) {
  		uint8_t *dst = (uint8_t *)random;
  		while (random_size > 0) {
-@@ -119,7 +119,7 @@ crypto_random_uniform(
+@@ -119,7 +120,7 @@ crypto_random_uniform(
  	uint64_t bound,
  	uint64_t *random)
  {
@@ -48,7 +54,7 @@ index b4ddac1..3006ec6 100644
  	if (g_crypto_funcs == NULL) {
  		*random = sweet_kmem_uniform((struct sweet_kmem_rng *)ctx, bound);
  		return;
-@@ -131,7 +131,7 @@ crypto_random_uniform(
+@@ -131,7 +132,7 @@ crypto_random_uniform(
  size_t
  crypto_random_kmem_ctx_size(void)
  {
@@ -57,7 +63,7 @@ index b4ddac1..3006ec6 100644
  	if (g_crypto_funcs == NULL) {
  		return sizeof(struct sweet_kmem_rng);
  	}
-@@ -143,7 +143,7 @@ void
+@@ -143,7 +144,7 @@ void
  crypto_random_kmem_init(
  	crypto_random_ctx_t ctx)
  {
@@ -67,5 +73,5 @@ index b4ddac1..3006ec6 100644
  		((struct sweet_kmem_rng *)ctx)->state = early_random();
  		return;
 -- 
-2.53.0.windows.1
+2.43.0
 

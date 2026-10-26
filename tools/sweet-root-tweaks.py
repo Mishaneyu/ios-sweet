@@ -76,6 +76,7 @@ def launchd(root):
             renamed += 1
     skip_labels = {
         'com.apple.CommCenter',
+        'com.apple.aned',
         'com.apple.aneuserd',
         'com.apple.modelcatalogd',
         'com.apple.generativeexperiencesd',

@@ -135,4 +135,4 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 
 - iOS 26 patch 0134: match Firehose chunk-count configuration and ABI to libdispatch; prevent early-boot log copy from corrupting buffer header.
 
-- 0135 iOS 26: use ARM64_BOARD_CONFIG_SWEET to activate the existing allocator RNG fallback without a registered corecrypto provider.
+- 0135 iOS 26: use `ARM64_BOARD_CONFIG_SWEET` and declare `early_random` in `corecrypto_rand.c` to activate the existing allocator RNG fallback without a registered corecrypto provider.
