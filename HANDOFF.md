@@ -5,6 +5,15 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### iOS 26 CI follow-up: kernel 0132 (2026-10-26, 12:25 IST)
+- Pushed 0131 as `ff19da6`; CI run `40280680389` applied the stage scripts and patch series and compiled past the original TrustCache, CE private API, allocator, Apple core-type and stale sysreg errors. Kernel linking was not reached.
+- The complete compressed CI log exposed remaining SWEET diagnostic API issues: old interrupt-debug macro names, relocated shared-region declarations, removed whole-map read-lock/lookup APIs, and a missing `disableConsoleOutput` declaration.
+- `0132-ios26-diagnostics-and-browser-entitlements.patch` uses the current `ml_interrupt_masked_debug_start/end` wrappers, `vm_shared_region_xnu.h` / `vm_map_internal.h`, the region-query API for fault mapping diagnostics, and the existing console flag declaration.
+- Corrects 0131's incomplete NECP header workaround: `necp_client.c` does use `kCSWebBrowserNetworkEntitlement`. Restore the include and supply the four browser-engine entitlement strings already present in the pinned dxb `patches/15.0/entitlements.patch`; this also supplies `kern_exec.c`'s missing CodeSignature header. No entitlement check is bypassed by this compatibility header.
+- All 124 iOS 26 patches apply sequentially to the staged baseline. Fresh TrustCache staging, repeated staging, and refusing to overwrite conflicting headers were tested successfully. QEMU 8.2.2 with `cortex-a76` and `llvm-nm` is available in WSL; copied the existing `qemu-d421ap.adt` and `sweet-init-v84.macho` into this checkout's ignored `work/boot` directory.
+- Pending: CI build for 0132, then Gate 1 with the resulting kernel. No phone partitions have been accessed or changed during this work.
+
+
 ### iOS 26 CI compilation fixes staged: kernel 0131 (2026-10-26, 12:04 IST)
 - Branch: `upgrade_ios_version_target`; starting repository commit `96662ac`.
 - Inspected the saved full log from GitHub Actions run `40265518489` and the local `xnu-12377.121.6` source through patch 0130.
