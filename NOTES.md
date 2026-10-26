@@ -130,3 +130,5 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 - 0131 iOS 26 (`xnu/patches-26/`): stage pinned dxb TrustCache headers, expose internal kmem APIs, opt SWEET into the private CE API, suppress reserved-identifier noise, and fix unused CodeSignature / Apple core-type / stale sysreg_restore build diagnostics.
 
 - 0132 iOS 26: use current interrupt-debug / VM region APIs in SWEET diagnostics, declare the existing console flag, and supply pinned dxb browser-engine entitlement constants for NECP and exec.
+
+- 0133 iOS 26: supply `ml_device_is_prod_fused` for SWEET using XNU's conservative x86 fallback (TRUE), resolving the sole remaining kernel 0132 link error.

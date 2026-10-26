@@ -5,6 +5,12 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### iOS 26 compiles; final link query supplied: kernel 0133 (2026-10-26, 12:41 IST)
+- CI `40283186822` (`8fa7188`, kernel 0132) compiled all kernel translation units successfully. Final link failed only on `_ml_device_is_prod_fused`, referenced by `sysctl_load_devicetree_entries` in `kern_mib.o`.
+- `0133-ios26-production-fuse-query.patch` supplies the missing query under `#if defined(SWEET)` in `osfmk/arm64/machine_routines.c`. It returns TRUE, matching XNU's conservative x86 fallback instead of inventing an Apple fuse-controller probe on Qualcomm. This does not inspect or modify Qualcomm fuse state.
+- Full patch series through 0133 applies to the staged baseline. Pending: CI link/package result, then Gate 1 (explicit nine-suite success required).
+
+
 ### iOS 26 CI follow-up: kernel 0132 (2026-10-26, 12:25 IST)
 - Pushed 0131 as `ff19da6`; CI run `40280680389` applied the stage scripts and patch series and compiled past the original TrustCache, CE private API, allocator, Apple core-type and stale sysreg errors. Kernel linking was not reached.
 - The complete compressed CI log exposed remaining SWEET diagnostic API issues: old interrupt-debug macro names, relocated shared-region declarations, removed whole-map read-lock/lookup APIs, and a missing `disableConsoleOutput` declaration.
