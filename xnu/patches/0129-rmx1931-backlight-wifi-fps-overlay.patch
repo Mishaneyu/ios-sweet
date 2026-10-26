@@ -1,0 +1,960 @@
+From 762586f385ca2496bb95d071dab309dfb2e8d426 Mon Sep 17 00:00:00 2001
+From: RMX1931 Port <port@local>
+Date: Mon, 26 Oct 2026 00:32:49 +0000
+Subject: [PATCH] rmx1931: AppleARMBacklight OLED dimming, direct SwapEnd GPU
+ present, Wi-Fi join/auth fixes, pre-launchd overlay
+
+---
+ bsd/dev/flame_sta.c                   |  39 ++-
+ bsd/dev/redwood_apple80211.c          |   4 +-
+ bsd/dev/sweet_gpu.c                   |  92 ++++++-
+ bsd/kern/bsd_init.c                   |   3 +
+ bsd/vfs/vfs_syscalls.c                | 255 ++++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 335 ++++++++++++++++++++++++--
+ iokit/KernelConfigTables.cpp          |   5 +
+ 7 files changed, 692 insertions(+), 41 deletions(-)
+
+diff --git a/bsd/dev/flame_sta.c b/bsd/dev/flame_sta.c
+index 7e40bda..8abc042 100644
+--- a/bsd/dev/flame_sta.c
++++ b/bsd/dev/flame_sta.c
+@@ -103,20 +103,35 @@ sta_join(const struct redwood_sta_join *what)
+ 	sta_last_error = error;
+ 	bzero(&sta_joined_bss, sizeof(sta_joined_bss));
+ 	if (error == 0) {
+-		for (unsigned i = 0; flame_wlan_heard(i, &t); i++) {
+-			if (t.ssid_length == what->ssid_length && memcmp(t.ssid, what->ssid, t.ssid_length) == 0) {
+-				memcpy(sta_joined_bss.bssid, t.bssid, 6);
+-				memcpy(sta_joined_bss.ssid, t.ssid, t.ssid_length);
+-				sta_joined_bss.ssid_length = t.ssid_length;
+-				sta_joined_bss.frequency = t.frequency;
+-				sta_joined_bss.rssi = t.rssi;
+-				sta_joined_bss.beacon_interval = t.beacon_interval;
+-				sta_joined_bss.capability = t.capability;
+-				sta_joined_bss.elements_length = t.elements_length < REDWOOD_STA_ELEMENTS_MOST ? t.elements_length : REDWOOD_STA_ELEMENTS_MOST;
+-				memcpy(sta_joined_bss.elements, t.elements, sta_joined_bss.elements_length);
+-				break;
++		bool found = flame_wlan_link_bss(&t) && t.frequency != 0;
++		if (!found) {
++			for (unsigned i = 0; flame_wlan_heard(i, &t); i++) {
++				if (any && memcmp(t.bssid, what->bssid, 6) == 0) {
++					found = true;
++					break;
++				}
++				if (t.ssid_length == what->ssid_length && memcmp(t.ssid, what->ssid, t.ssid_length) == 0) {
++					found = true;
++					if (!any) {
++						break;
++					}
++				}
+ 			}
+ 		}
++		if (!found) {
++			found = flame_wlan_link_bss(&t);
++		}
++		if (found) {
++			memcpy(sta_joined_bss.bssid, t.bssid, 6);
++			memcpy(sta_joined_bss.ssid, t.ssid, t.ssid_length);
++			sta_joined_bss.ssid_length = t.ssid_length;
++			sta_joined_bss.frequency = t.frequency;
++			sta_joined_bss.rssi = t.rssi;
++			sta_joined_bss.beacon_interval = t.beacon_interval;
++			sta_joined_bss.capability = t.capability;
++			sta_joined_bss.elements_length = t.elements_length < REDWOOD_STA_ELEMENTS_MOST ? t.elements_length : REDWOOD_STA_ELEMENTS_MOST;
++			memcpy(sta_joined_bss.elements, t.elements, sta_joined_bss.elements_length);
++		}
+ 	}
+ 	printf("flame wifi: join -> %d\n", error);
+ 	return error;
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index e2674ee..5d744a9 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -436,10 +436,10 @@ get(struct apple80211req *request)
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
+-	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
++	case 2: {				/* how it was joined: open system, then WPA2 when Privacy cap bit set */
+ 		struct {
+ 			uint32_t version, lower, upper, extended;
+-		} answer = { .version = 1, .lower = 1, .upper = 8 };
++		} answer = { .version = 1, .lower = 1, .upper = (state->bss.capability & 0x0010) ? 8 : 0 };
+ 
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index e4419bf..cdb1adc 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -56,6 +56,8 @@ int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms
+ 
+ /* Panel mapping for touch (SweetHID.cpp): zero extents = CPU crop, otherwise the GPU's fitted rectangle. */
+ int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
++/* Software AMOLED brightness dim alpha (0 = full brightness, 1..238 = translucent black overlay). */
++volatile uint32_t sweet_backlight_alpha;
+ 
+ static struct a6_gpu gpu;
+ static vm_offset_t pool_kva;
+@@ -545,15 +547,34 @@ present_wait_locked(uint32_t k, const char *why)
+ 	}
+ 	return 0;
+ }
+-#define PANEL_W         1080
+-#define PANEL_H         2400
+-#define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
+-#define DISPLAY_MASK_SIDE       256u
+-#define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
+-#define DISPLAY_MASK_PITCH      (DISPLAY_MASK_DIM * 4)
+-#define DISPLAY_STAGE_OFF       0x600000ULL     /* panel-sized; only the corner bands are used */
++#define PANEL_W		1080
++#define PANEL_H		2400
++#define DISPLAY_DIM_OFF		0x410000ULL	/* 256 x 16x16 (64B pitch) black alpha tiles for backlight dimming */
++#define DISPLAY_DIM_TILE	16u
++#define DISPLAY_DIM_PITCH	(DISPLAY_DIM_TILE * 4)
++#define DISPLAY_DIM_STRIDE	(DISPLAY_DIM_PITCH * DISPLAY_DIM_TILE)
++#define DISPLAY_MASK_OFF	0x500000ULL	/* 2x2 corner mattes, one per corner */
++#define DISPLAY_MASK_SIDE	256u
++#define DISPLAY_MASK_DIM	(DISPLAY_MASK_SIDE * 2)
++#define DISPLAY_MASK_PITCH	(DISPLAY_MASK_DIM * 4)
++#define DISPLAY_STAGE_OFF	0x600000ULL	/* panel-sized staging image */
+ 
+ static uint32_t display_mask_radius;
++static bool display_dim_built;
++
++static void
++display_dim_build(void)
++{
++	for (uint32_t a = 0; a < 256; a++) {
++		uint32_t *tile = (uint32_t *)(pool_kva + DISPLAY_DIM_OFF + (size_t)a * DISPLAY_DIM_STRIDE);
++		uint32_t px = a << 24;
++		for (uint32_t i = 0; i < DISPLAY_DIM_TILE * DISPLAY_DIM_TILE; i++) {
++			tile[i] = px;
++		}
++	}
++	flush_dcache64((addr64_t)(pool_kva + DISPLAY_DIM_OFF), 256u * DISPLAY_DIM_STRIDE, FALSE);
++	display_dim_built = true;
++}
+ 
+ static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
+ 
+@@ -622,10 +643,63 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= frame.dw || 2 * ext >= frame.dh) {
+ 		ext = 0;
+ 	}
+-	static uint32_t ib[10 * A6_BLIT_MAX_DW];
++	static uint32_t ib[16 * A6_BLIT_MAX_DW];
+ 	lck_mtx_lock(&sweet_gpu_lock);
++	uint32_t dim = sweet_backlight_alpha;
++	if (dim > 240) {
++		dim = 240;
++	}
+ 	uint32_t n = 0;
+-	if (ext) {
++	if (dim > 0) {
++		/*
++		 * Tear-free AMOLED software dimming: scale into DISPLAY_STAGE_OFF, blend the
++		 * translucent black dim tile (and optional rounded-corner mattes) off-screen,
++		 * then copy the finished rectangle to A6_GVA_FB in a single pass.
++		 */
++		if (!display_dim_built) {
++			display_dim_build();
++		}
++		if (ext && display_mask_radius != corner_radius) {
++			display_mask_build(corner_radius, ext);
++			display_mask_radius = corner_radius;
++		}
++		struct a6_blit sframe = frame;
++		sframe.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF;
++		n += a6_blit_ib(&gpu, &sframe, ib + n);
++		struct a6_blit dim_blit = {
++			.src_iova = A6_GVA_POOL + DISPLAY_DIM_OFF + (uint64_t)dim * DISPLAY_DIM_STRIDE,
++			.src_w = DISPLAY_DIM_TILE, .src_h = DISPLAY_DIM_TILE, .src_pitch = DISPLAY_DIM_PITCH,
++			.sw = DISPLAY_DIM_TILE, .sh = DISPLAY_DIM_TILE,
++			.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF, .dst_pitch = fb_pitch,
++			.dx = frame.dx, .dy = frame.dy, .dw = frame.dw, .dh = frame.dh,
++			.blend = true,
++		};
++		n += a6_blit_ib(&gpu, &dim_blit, ib + n);
++		if (ext) {
++			uint32_t top = frame.dy, bottom = frame.dy + frame.dh - ext;
++			for (uint32_t corner = 0; corner < 4; corner++) {
++				struct a6_blit matte = {
++					.src_iova = A6_GVA_POOL + DISPLAY_MASK_OFF,
++					.src_w = DISPLAY_MASK_DIM, .src_h = DISPLAY_MASK_DIM, .src_pitch = DISPLAY_MASK_PITCH,
++					.sx = (corner & 1) * DISPLAY_MASK_SIDE, .sy = (corner >> 1) * DISPLAY_MASK_SIDE,
++					.sw = ext, .sh = ext,
++					.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF, .dst_pitch = fb_pitch,
++					.dx = (corner & 1) ? frame.dx + frame.dw - ext : frame.dx,
++					.dy = (corner & 2) ? bottom : top,
++					.dw = ext, .dh = ext, .blend = true,
++				};
++				n += a6_blit_ib(&gpu, &matte, ib + n);
++			}
++		}
++		struct a6_blit copy_all = {
++			.src_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF,
++			.src_w = PANEL_W, .src_h = PANEL_H, .src_pitch = fb_pitch,
++			.sx = frame.dx, .sy = frame.dy, .sw = frame.dw, .sh = frame.dh,
++			.dst_iova = A6_GVA_FB, .dst_pitch = fb_pitch,
++			.dx = frame.dx, .dy = frame.dy, .dw = frame.dw, .dh = frame.dh,
++		};
++		n += a6_blit_ib(&gpu, &copy_all, ib + n);
++	} else if (ext) {
+ 		if (display_mask_radius != corner_radius) {
+ 			display_mask_build(corner_radius, ext);
+ 			display_mask_radius = corner_radius;
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 18d2f18..1e27d11 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1102,6 +1102,9 @@ bsdinit_task(void)
+ 	if (!bsd_rooted_ramdisk() && mountlist.tqh_first != NULL &&
+ 	    !(mountlist.tqh_first->mnt_flag & MNT_RDONLY)) {
+ 		extern int sweet_ensure_dir_mode(const char *path, mode_t mode);
++		extern void sweet_apply_overlay(void);
++		(void)sweet_ensure_dir_mode("/private/var/local", 0777);
++		sweet_apply_overlay();
+ 		int e1 = sweet_ensure_dir_mode("/private/var/local", 0777);
+ 		int e2 = sweet_ensure_dir_mode("/private/var/local/m2v-cache", 0777);
+ 		int e3 = sweet_ensure_dir_mode("/private/etc/dropbear", 0700);
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 1f39147..7df5a53 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -108,6 +108,9 @@
+ #include <sys/fsgetpath.h>
+ #include <machine/cons.h>
+ #include <machine/limits.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/device_tree.h>
++#endif
+ #include <miscfs/specfs/specdev.h>
+ 
+ #include <vfs/vfs_disk_conditioner.h>
+@@ -14709,4 +14712,256 @@ sweet_vfs_unlink(const char *path)
+ {
+ 	return unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
+ }
++
++static uint64_t
++sweet_ov_octal(const uint8_t *p, size_t n)
++{
++	uint64_t v = 0;
++	size_t i = 0;
++	while (i < n && (p[i] == ' ' || p[i] == ' ')) {
++		i++;
++	}
++	for (; i < n && p[i] >= '0' && p[i] <= '7'; i++) {
++		v = (v << 3) | (uint64_t)(p[i] - '0');
++	}
++	return v;
++}
++
++static void
++sweet_ov_setattr(const char *path, int mode, uid_t uid, gid_t gid)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) == 0) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, mode & 07777);
++		VATTR_SET(&va, va_uid, uid);
++		VATTR_SET(&va, va_gid, gid);
++		(void)vnode_setattr(vp, &va, ctx);
++		vnode_put(vp);
++	}
++}
++
++static void
++sweet_ov_mkdirs_parent(char *fullpath)
++{
++	vfs_context_t ctx = vfs_context_current();
++	for (char *p = fullpath + 1; *p != ' '; p++) {
++		if (*p != '/') {
++			continue;
++		}
++		*p = ' ';
++		vnode_t dvp = NULLVP;
++		if (vnode_lookup(fullpath, 0, &dvp, ctx) == 0) {
++			vnode_put(dvp);
++		} else {
++			(void)sweet_vfs_mkdir(fullpath, 0755);
++		}
++		*p = '/';
++	}
++}
++
++static int
++sweet_ov_write_file(const char *path, const uint8_t *data, uint64_t size, int mode, uid_t uid, gid_t gid)
++{
++	static uint8_t chunk_buf[16384];
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++
++	(void)sweet_vfs_unlink(path);
++	int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, mode & 07777, 0, &vp, ctx);
++	if (err == 0) {
++		err = vnode_setsize(vp, 0, 0, ctx);
++	}
++	uint64_t off = 0;
++	while (err == 0 && off < size) {
++		size_t chunk = (size_t)MIN((uint64_t)sizeof(chunk_buf), size - off);
++		memcpy(chunk_buf, data + off, chunk);
++		int resid = 0;
++		err = vn_rdwr(UIO_WRITE, vp, (caddr_t)chunk_buf, (int)chunk, (off_t)off,
++		    UIO_SYSSPACE, IO_UNIT | IO_SYNC, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (err == 0 && resid != 0) {
++			err = EIO;
++		}
++		off += chunk;
++	}
++	if (vp != NULLVP) {
++		(void)vnode_close(vp, FWRITE, ctx);
++	}
++	if (err == 0) {
++		sweet_ov_setattr(path, mode, uid, gid);
++	}
++	return err;
++}
++
++void sweet_apply_overlay(void);
++void
++sweet_apply_overlay(void)
++{
++	static char rel[300], path[320], linktarget[128];
++	DTEntry chosen;
++	void const *blob = NULL;
++	unsigned size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "sweet-overlay", &blob, &size) != kSuccess ||
++	    blob == NULL || size < 512) {
++		return;
++	}
++	const uint8_t *bytes = (const uint8_t *)blob;
++	uint64_t h = 14695981039346656037ULL;
++	for (unsigned i = 0; i < size; i++) {
++		h = (h ^ bytes[i]) * 1099511628211ULL;
++	}
++	char want[20], have[20];
++	snprintf(want, sizeof(want), "%016llx
++", (unsigned long long)h);
++
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t svp = NULLVP;
++	if (vnode_open("/private/var/local/.overlay-stamp", FREAD, 0, 0, &svp, ctx) == 0) {
++		int resid = 0;
++		bzero(have, sizeof(have));
++		int rerr = vn_rdwr(UIO_READ, svp, (caddr_t)have, 17, 0, UIO_SYSSPACE, 0,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		(void)vnode_close(svp, FREAD, ctx);
++		if (rerr == 0 && resid == 0 && memcmp(have, want, 17) == 0) {
++			printf("SWEET OVERLAY: stamp %016llx up to date
++", (unsigned long long)h);
++			return;
++		}
++	}
++
++	unsigned files = 0, dirs = 0, links = 0, removed = 0, errs = 0;
++	uint64_t pos = 0;
++	while (pos + 512 <= (uint64_t)size) {
++		const uint8_t *hdr = bytes + pos;
++		bool all_zero = true;
++		for (unsigned i = 0; i < 512; i++) {
++			if (hdr[i] != 0) {
++				all_zero = false;
++				break;
++			}
++		}
++		if (all_zero) {
++			break;
++		}
++		uint64_t fsize = sweet_ov_octal(hdr + 124, 12);
++		int mode = (int)sweet_ov_octal(hdr + 100, 8);
++		uid_t uid = (uid_t)sweet_ov_octal(hdr + 108, 8);
++		gid_t gid = (gid_t)sweet_ov_octal(hdr + 116, 8);
++		char typeflag = (char)hdr[156];
++
++		size_t plen = 0, nlen = 0;
++		while (plen < 155 && hdr[345 + plen] != ' ') {
++			plen++;
++		}
++		while (nlen < 100 && hdr[nlen] != ' ') {
++			nlen++;
++		}
++		if (plen > 0) {
++			snprintf(rel, sizeof(rel), "%.*s/%.*s", (int)plen, (const char *)(hdr + 345),
++			    (int)nlen, (const char *)hdr);
++		} else {
++			snprintf(rel, sizeof(rel), "%.*s", (int)nlen, (const char *)hdr);
++		}
++
++		pos += 512;
++		uint64_t data_pos = pos;
++		uint64_t padded = (fsize + 511ULL) & ~511ULL;
++		if (data_pos + padded > (uint64_t)size) {
++			break;
++		}
++		pos += padded;
++
++		if (typeflag == 'x' || typeflag == 'g') {
++			continue;
++		}
++		char *rp = rel;
++		while (rp[0] == '.' && rp[1] == '/') {
++			rp += 2;
++		}
++		while (*rp == '/') {
++			rp++;
++		}
++		size_t rlen = strlen(rp);
++		while (rlen > 0 && rp[rlen - 1] == '/') {
++			rp[--rlen] = ' ';
++		}
++		if (rlen == 0 || strcmp(rp, ".") == 0) {
++			continue;
++		}
++
++		if (strcmp(rp, ".sweet-rm") == 0) {
++			const char *s = (const char *)(bytes + data_pos);
++			const char *end = s + fsize;
++			while (s < end) {
++				const char *e = s;
++				while (e < end && *e != '
++' && *e != '') {
++					e++;
++				}
++				size_t ll = (size_t)(e - s);
++				while (ll > 0 && (s[0] == ' ' || s[0] == '/')) {
++					s++;
++					ll--;
++				}
++				if (ll > 0 && s[0] != '#' && ll < sizeof(path) - 2) {
++					snprintf(path, sizeof(path), "/%.*s", (int)ll, s);
++					if (sweet_vfs_unlink(path) == 0) {
++						removed++;
++					}
++				}
++				s = e;
++				while (s < end && (*s == '
++' || *s == '')) {
++					s++;
++				}
++			}
++			continue;
++		}
++
++		snprintf(path, sizeof(path), "/%s", rp);
++		sweet_ov_mkdirs_parent(path);
++		if (typeflag == '5') {
++			vnode_t dvp = NULLVP;
++			if (vnode_lookup(path, 0, &dvp, ctx) == 0) {
++				vnode_put(dvp);
++			} else {
++				(void)sweet_vfs_mkdir(path, mode ? mode : 0755);
++			}
++			sweet_ov_setattr(path, mode ? mode : 0755, uid, gid);
++			dirs++;
++		} else if (typeflag == '2') {
++			size_t llen = 0;
++			while (llen < 100 && hdr[157 + llen] != ' ') {
++				llen++;
++			}
++			snprintf(linktarget, sizeof(linktarget), "%.*s", (int)llen, (const char *)(hdr + 157));
++			(void)sweet_vfs_unlink(path);
++			if (sweet_vfs_symlink(linktarget, path) == 0) {
++				links++;
++			} else {
++				errs++;
++			}
++		} else if (typeflag == '0' || typeflag == ' ') {
++			int werr = sweet_ov_write_file(path, bytes + data_pos, fsize, mode ? mode : 0644, uid, gid);
++			if (werr == 0) {
++				files++;
++			} else {
++				printf("SWEET OVERLAY: write %s failed (%d)
++", path, werr);
++				errs++;
++			}
++		}
++	}
++
++	if (errs == 0) {
++		(void)sweet_ov_write_file("/private/var/local/.overlay-stamp", (const uint8_t *)want, 17, 0644, 0, 0);
++	}
++	printf("SWEET OVERLAY: applied %016llx (%u files, %u dirs, %u symlinks, %u unlinked, %u errs)
++",
++	    (unsigned long long)h, files, dirs, links, removed, errs);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bc98b59..668fb3a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -49,6 +49,7 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
+ 	uint32_t *out_dw, uint32_t *out_dh);
+ void sweet_gpu_panel_stride(uint32_t stride);
+ extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
++extern volatile uint32_t sweet_backlight_alpha;
+ }
+ #define SWEET_FB_GPU_ROWBYTES           4352    /* the 2D engine writes 64-byte multiples */
+ 
+@@ -61,6 +62,7 @@ extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
++#include <libkern/c++/OSContainers.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+@@ -127,26 +129,34 @@ public:
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+-	IOLock       *fLock;            /* swaps and client list */
++	IOLock       *fLock;		/* swaps and client list */
++	IOLock       *fPresentLock;	/* serializes direct SwapEnd present with timer/backlight */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+-	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
++	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];	/* latest swap, not yet shown */
++	uint8_t       fLastRec[SWEET_FB_SWAP_REC_SIZE];	/* latest swap overall (wake / backlight redraw) */
++	bool          fHasSwap;
+ 	bool          fDirty;
+-	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+-	bool          fPowerOff;      /* RequestPowerChange(0) */
+-	bool          fGPU;           /* panel switched to the GPU's stride; frames scaled to fit */
+-	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	bool          fDirectPresent;	/* queue async GPU present directly on SwapEnd */
++	uint64_t      fLastSwapAbs;
++	uint32_t      fFlushTicks;	/* vsync ticks between panel copies */
++	bool          fPowerOff;	/* RequestPowerChange(0) */
++	bool          fGPU;		/* panel switched to the GPU's stride; frames scaled to fit */
++	uint32_t      fFadeStep;	/* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
++	void refreshBrightness(void);
+ 	void present(const uint8_t *rec);
+ 	bool presentGPU(const uint8_t *rec);
+ 	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
+ };
+ 
++static AppleCLCD *gMainFB;
++
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -218,7 +228,11 @@ AppleCLCD::start(IOService *provider)
+ 		fCornerExt = 0;
+ 	}
+ 	fLock = IOLockAlloc();
++	fPresentLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
++	int direct = 1;
++	PE_parse_boot_argn("sweetfb_direct", &direct, sizeof(direct));
++	fDirectPresent = (direct != 0);
+ 	/* With the GPU (sweetgpu=1) the panel later switches to 4352-byte rows: map that much. */
+ 	int gpu = 0;
+ 	PE_parse_boot_argn("sweetgpu", &gpu, sizeof(gpu));
+@@ -226,7 +240,7 @@ AppleCLCD::start(IOService *provider)
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, mapRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+-	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
++	if (fLock == NULL || fPresentLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+ 		OSSafeReleaseNULL(fWorkLoop);
+@@ -245,9 +259,10 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	gMainFB = this;
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u (direct=%d)\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fDirectPresent ? 1 : 0);
+ 	return true;
+ }
+ 
+@@ -332,10 +347,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		IOLockLock(fb->fPresentLock);
+ 		uint64_t t0 = mach_absolute_time();
+ 		fb->present(rec);
+-		fb->fStatPresentAbs += mach_absolute_time() - t0;
++		uint64_t dt = mach_absolute_time() - t0;
++		IOLockUnlock(fb->fPresentLock);
++		IOLockLock(fb->fLock);
++		fb->fStatPresentAbs += dt;
+ 		fb->fStatPresents++;
++		IOLockUnlock(fb->fLock);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ }
+@@ -379,15 +399,70 @@ static uint32_t sweet_fb_swaps_logged;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	bool direct = false;
++	uint64_t now = mach_absolute_time();
+ 	IOLockLock(fLock);
+-	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-	fDirty = true;
++	memcpy(fLastRec, rec, SWEET_FB_SWAP_REC_SIZE);
++	fHasSwap = true;
++	fLastSwapAbs = now;
++	if (fDirectPresent && fFlushTicks == 1 && !fPowerOff && sweet_gpu_ready()) {
++		fDirty = false;
++		direct = true;
++	} else {
++		memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++		fDirty = true;
++	}
+ 	IOLockUnlock(fLock);
++	if (direct) {
++		IOLockLock(fPresentLock);
++		uint64_t t0 = mach_absolute_time();
++		present(rec);
++		uint64_t dt = mach_absolute_time() - t0;
++		IOLockUnlock(fPresentLock);
++		IOLockLock(fLock);
++		fStatPresentAbs += dt;
++		fStatPresents++;
++		IOLockUnlock(fLock);
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
+ 
++void
++AppleCLCD::refreshBrightness(void)
++{
++	uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++	bool direct = false;
++	uint64_t now = mach_absolute_time();
++	IOLockLock(fLock);
++	if (fHasSwap && !fPowerOff) {
++		uint64_t minGap = fVsyncAbs ? (fVsyncAbs * 3) / 4 : 0;
++		if (sweet_gpu_ready()) {
++			if (now - fLastSwapAbs >= minGap) {
++				fLastSwapAbs = now;
++				memcpy(rec, fLastRec, sizeof(rec));
++				direct = true;
++			}
++		} else {
++			memcpy(fPending, fLastRec, sizeof(fPending));
++			fDirty = true;
++		}
++	}
++	IOLockUnlock(fLock);
++	if (direct) {
++		IOLockLock(fPresentLock);
++		uint64_t t0 = mach_absolute_time();
++		present(rec);
++		uint64_t dt = mach_absolute_time() - t0;
++		IOLockUnlock(fPresentLock);
++		IOLockLock(fLock);
++		fStatPresentAbs += dt;
++		fStatPresents++;
++		IOLockUnlock(fLock);
++	}
++}
++
+ static uint32_t sweet_fb_gpu_why_logged;
+ 
+ /* Why presentGPU fell back to the CPU copy, logged once per reason. */
+@@ -418,8 +493,16 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
+ 	} else if (y >= fHeight - e) {
+ 		cov = fCornerCov + (size_t)(fHeight - 1 - y) * e;
+ 	}
++	uint32_t dim = sweet_backlight_alpha;
++	uint32_t bscale = dim >= 240 ? 15u : (255u - dim);
+ 	if (cov == NULL) {
+-		memcpy(dst, src, (size_t)n * 4);
++		if (bscale >= 255u) {
++			memcpy(dst, src, (size_t)n * 4);
++		} else {
++			for (uint32_t i = 0; i < n; i++) {
++				dst[i] = sweet_display_dim(src[i], bscale);
++			}
++		}
+ 		return;
+ 	}
+ 	/* [x, l): left corner, [l, r): plain, [r, end): right corner. */
+@@ -427,12 +510,19 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
+ 	l = l < x ? x : l;
+ 	r = r < l ? l : (r > end ? end : r);
+ 	for (uint32_t px = x; px < l; px++) {
+-		dst[px - x] = cov[px] == 255 ? src[px - x] : sweet_display_dim(src[px - x], cov[px]);
++		uint32_t c = (cov[px] * bscale) / 255u;
++		dst[px - x] = c >= 255u ? src[px - x] : sweet_display_dim(src[px - x], c);
++	}
++	if (bscale >= 255u) {
++		memcpy(&dst[l - x], &src[l - x], (size_t)(r - l) * 4);
++	} else {
++		for (uint32_t px = l; px < r; px++) {
++			dst[px - x] = sweet_display_dim(src[px - x], bscale);
++		}
+ 	}
+-	memcpy(&dst[l - x], &src[l - x], (size_t)(r - l) * 4);
+ 	for (uint32_t px = r; px < end; px++) {
+-		uint32_t c = cov[fWidth - 1 - px];
+-		dst[px - x] = c == 255 ? src[px - x] : sweet_display_dim(src[px - x], c);
++		uint32_t c = (cov[fWidth - 1 - px] * bscale) / 255u;
++		dst[px - x] = c >= 255u ? src[px - x] : sweet_display_dim(src[px - x], c);
+ 	}
+ }
+ 
+@@ -758,7 +848,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+-				fFB->fDirty = true;     /* on: redraw the latest frame */
++				if (!off && fFB->fHasSwap) {
++					memcpy(fFB->fPending, fFB->fLastRec, SWEET_FB_SWAP_REC_SIZE);
++				}
++				fFB->fDirty = true;	/* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+@@ -787,4 +880,210 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	}
+ 	return ret;
+ }
++
++/*
++ * AppleARMBacklight matching IODeviceTree:/backlight for CoreBrightness / BacklightServices.
++ * Converts linear Q16.16 brightness-nits (D22AP user max = 625 nits = 40960000) into an sRGB
++ * gamma-2.0 perceptual scale via integer square root, driving tear-free Adreno 640 2D dimming.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++
++	IOLock  *fLock;
++	uint32_t fMillinits;
++	uint32_t fRawLevel;
++	uint32_t fLogCount;
++
++	static OSDictionary *makeRange(uint32_t mn, uint32_t mx, uint32_t val);
++	void publishDisplayParams(void);
++	void applyNitsQ16(uint32_t rawQ16);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++static uint32_t
++sweet_isqrt32(uint32_t n)
++{
++	uint32_t res = 0;
++	uint32_t bit = 1u << 30;
++	while (bit > n) {
++		bit >>= 2;
++	}
++	while (bit != 0) {
++		if (n >= res + bit) {
++			n -= res + bit;
++			res = (res >> 1) + bit;
++		} else {
++			res >>= 1;
++		}
++		bit >>= 2;
++	}
++	return res;
++}
++
++OSDictionary *
++AppleARMBacklight::makeRange(uint32_t mn, uint32_t mx, uint32_t val)
++{
++	OSDictionary *d = OSDictionary::withCapacity(3);
++	if (d == NULL) {
++		return NULL;
++	}
++	OSNumber *nMin = OSNumber::withNumber((uint64_t)mn, 32);
++	OSNumber *nMax = OSNumber::withNumber((uint64_t)mx, 32);
++	OSNumber *nVal = OSNumber::withNumber((uint64_t)val, 32);
++	if (nMin != NULL) {
++		d->setObject("min", nMin);
++		nMin->release();
++	}
++	if (nMax != NULL) {
++		d->setObject("max", nMax);
++		nMax->release();
++	}
++	if (nVal != NULL) {
++		d->setObject("value", nVal);
++		nVal->release();
++	}
++	return d;
++}
++
++void
++AppleARMBacklight::publishDisplayParams(void)
++{
++	OSDictionary *params = OSDictionary::withCapacity(3);
++	if (params == NULL) {
++		return;
++	}
++	OSDictionary *dBri = makeRange(6, 2047, fRawLevel);
++	OSDictionary *dNits = makeRange(2000, 625000, fMillinits);
++	OSDictionary *dAmps = makeRange(0, 100000, 25000);
++	if (dBri != NULL) {
++		params->setObject("brightness", dBri);
++		dBri->release();
++	}
++	if (dNits != NULL) {
++		params->setObject("BrightnessMilliNits", dNits);
++		dNits->release();
++	}
++	if (dAmps != NULL) {
++		params->setObject("BrightnessMicroAmps", dAmps);
++		dAmps->release();
++	}
++	setProperty("IODisplayParameters", params);
++	params->release();
++}
++
++void
++AppleARMBacklight::applyNitsQ16(uint32_t rawQ16)
++{
++	const uint64_t maxQ16 = 625ULL * 65536ULL;
++	uint64_t clamped = rawQ16 > maxQ16 ? maxQ16 : (uint64_t)rawQ16;
++	uint32_t ratioQ16 = (uint32_t)((clamped * 65536ULL) / maxQ16);
++	uint32_t scale256 = sweet_isqrt32(ratioQ16);	/* 0..256 perceptual sRGB scale */
++	if (rawQ16 > 0 && scale256 < 20) {
++		scale256 = 20;				/* ~8% minimum readable floor */
++	}
++	uint32_t alpha = scale256 >= 256 ? 0 : (256u - scale256);
++	if (alpha > 236) {
++		alpha = 236;
++	}
++	fMillinits = (uint32_t)((clamped * 1000ULL) >> 16);
++	if (fMillinits < 2000 && rawQ16 > 0) {
++		fMillinits = 2000;
++	}
++	fRawLevel = (uint32_t)(6u + ((uint64_t)scale256 * 2041ULL) / 256ULL);
++	if (fRawLevel > 2047) {
++		fRawLevel = 2047;
++	}
++	uint32_t prev = sweet_backlight_alpha;
++	sweet_backlight_alpha = alpha;
++	setProperty("brightness-nits", (uint64_t)rawQ16, 32);
++	publishDisplayParams();
++	if (fLogCount < 8) {
++		fLogCount++;
++		IOLog("SWEET BL: nits_q16=%u (%u mNits) -> sRGB %u/256 dim_alpha=%u\n",
++		    rawQ16, fMillinits, scale256, alpha);
++	}
++	if (alpha != prev && gMainFB != NULL) {
++		gMainFB->refreshBrightness();
++	}
++}
++
++bool
++AppleARMBacklight::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fLock = IOLockAlloc();
++	if (fLock == NULL) {
++		return false;
++	}
++	fMillinits = 625000;
++	fRawLevel = 2047;
++	fLogCount = 0;
++	sweet_backlight_alpha = 0;
++	setProperty("backlight-control", kOSBooleanTrue);
++	setProperty("BuiltIn", kOSBooleanTrue);
++	setProperty("brightness-nits", (uint64_t)(625ULL * 65536ULL), 32);
++	publishDisplayParams();
++	registerService();
++	IOLog("SWEET BL: AppleARMBacklight registered on /backlight (max 625 nits)\n");
++	return true;
++}
++
++static bool
++sweet_extract_u32(OSObject *obj, uint32_t *out)
++{
++	OSNumber *num = OSDynamicCast(OSNumber, obj);
++	if (num != NULL) {
++		*out = num->unsigned32BitValue();
++		return true;
++	}
++	OSDictionary *d = OSDynamicCast(OSDictionary, obj);
++	if (d != NULL) {
++		OSNumber *v = OSDynamicCast(OSNumber, d->getObject("value"));
++		if (v != NULL) {
++			*out = v->unsigned32BitValue();
++			return true;
++		}
++	}
++	return false;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	uint32_t v = 0;
++	if (sweet_extract_u32(dict->getObject("brightness-nits"), &v)) {
++		applyNitsQ16(v);
++	} else if (sweet_extract_u32(dict->getObject("BrightnessMilliNits"), &v)) {
++		applyNitsQ16((uint32_t)(((uint64_t)v << 16) / 1000ULL));
++	} else if (sweet_extract_u32(dict->getObject("brightness"), &v)) {
++		uint32_t lvl = v > 2047 ? 2047 : v;
++		uint64_t lin = ((uint64_t)lvl * (uint64_t)lvl * 625ULL * 65536ULL) / (2047ULL * 2047ULL);
++		applyNitsQ16((uint32_t)lin);
++	} else {
++		OSDictionary *dp = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
++		if (dp != NULL) {
++			if (sweet_extract_u32(dp->getObject("BrightnessMilliNits"), &v)) {
++				applyNitsQ16((uint32_t)(((uint64_t)v << 16) / 1000ULL));
++			} else if (sweet_extract_u32(dp->getObject("brightness"), &v)) {
++				uint32_t lvl = v > 2047 ? 2047 : v;
++				uint64_t lin = ((uint64_t)lvl * (uint64_t)lvl * 625ULL * 65536ULL) / (2047ULL * 2047ULL);
++				applyNitsQ16((uint32_t)lin);
++			}
++		}
++	}
++	IOLockUnlock(fLock);
++	return kIOReturnSuccess;
++}
+ #endif /* SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index d5e16fe..b2f7ab6 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -68,6 +68,11 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'sweet,display';"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleARMBacklight;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'backlight';"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDButtons;"
+-- 
+2.43.0
+

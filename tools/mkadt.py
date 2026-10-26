@@ -243,6 +243,23 @@ def build(seed=None, qemu=False, highmem=False):
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
+    # CoreBrightness / BacklightServices match AppleARMBacklight on IODeviceTree:/backlight
+    # (IONameMatch = 'backlight', calibration constants from D22AP /backlight).
+    backlight = node('backlight', [
+        ph(),
+        ('compatible', cstr('backlight')),
+        ('device_type', cstr('backlight')),
+        ('LminProduct', u32(131072)),
+        ('LmidProduct', u32(10158080)),
+        ('LmaxProduct', u32(44173121)),
+        ('DBVMin', u32(139)),
+        ('DBVMax', u32(2047)),
+        ('panel-gamma', u32(2200)),
+        ('max-nit-value', u32(750)),
+        ('aab-constraint-lmax', u32(675)),
+        ('user-accessible-max-nits', u32(625)),
+    ])
+
     product_props = d22ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
 
@@ -258,7 +275,7 @@ def build(seed=None, qemu=False, highmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs, pram]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, backlight] + product + ([] if qemu else [ufs, pram]))
 
 
 if __name__ == '__main__':

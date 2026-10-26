@@ -64,11 +64,12 @@ def launchd(root):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
+    removed_labels = {'com.apple.CommCenter', 'com.apple.bluetoothd', 'com.apple.fairplayd.H2'}
+    removed = [k for k, j in jobs.items() if j.get('Label') in removed_labels]
     for k in removed:
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} unsupported daemon jobs removed')
 
 
 def containers(root):

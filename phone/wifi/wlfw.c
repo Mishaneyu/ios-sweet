@@ -32,7 +32,7 @@
 
 #define CLIENT_ID	0x4b4e454c	/* ath10k's */
 #define MSA_PA		0x9b000000ull	/* RMX1931 pil_wlan_fw_region */
-#define MSA_SIZE	0x100000u	/* qcom,wlan-msa-memory */
+#define MSA_SIZE	0x180000u	/* RMX1931 qcom,wlan-msa-memory (1.5 MiB) */
 #define BDF_PATH	"/var/local/fw/modem/bdwlan-rmx1931.bin"
 #define BDF_PATH2	"/var/local/fw/modem/bdwlan.bin"
 #define BDF_PATH3	"/var/local/fw/modem/bdwlan-flame.bin"

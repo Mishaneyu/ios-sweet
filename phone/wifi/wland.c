@@ -24,6 +24,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
@@ -646,6 +647,15 @@ static void net_idle(void)
 	join_poll();
 }
 
+static void wland_console(const char *msg)
+{
+	int cfd = open("/dev/console", O_WRONLY | O_NOCTTY);
+	if (cfd >= 0) {
+		(void)write(cfd, msg, strlen(msg));
+		close(cfd);
+	}
+}
+
 static int net(unsigned secs)
 {
 	if (getenv("WLAND_VERBOSE"))
@@ -653,8 +663,11 @@ static int net(unsigned secs)
 	link_idle = net_idle;
 	signal(SIGUSR1, on_usr1);
 	signal(SIGCHLD, SIG_IGN);	/* netsvc children (ipnet.c) reap themselves */
-	if (link_up(net_cb, 5000))
+	if (link_up(net_cb, 5000)) {
+		wland_console("wland: GLINK/QRTR link_up failed\n");
 		return -1;
+	}
+	wland_console("wland: modem GLINK/QRTR up\n");
 	if (rmtfs_init())
 		printf("net: no rmtfs\n");
 	if (pdmapper_init() || tftp_init())
@@ -671,12 +684,16 @@ static int net(unsigned secs)
 			continue;
 		if (wlfw_start()) {
 			printf("net: WLFW bring-up failed\n");
+			wland_console("wland: WLFW bring-up failed\n");
 		} else if (!getenv("WLAND_NO_RADIO")) {
+			wland_console("wland: WLFW mission mode up\n");
 			delay_ms(100);	/* topaz: only after mission mode; before it a CE access hangs the bus */
-			if (radio_start())
+			if (radio_start()) {
 				printf("net: radio start failed\n");
-			else if (bridge_open() != 0 && conf_ssid[0] && ipnet_init())
+				wland_console("wland: radio start failed\n");
+			} else if (bridge_open() != 0 && conf_ssid[0] && ipnet_init()) {
 				printf("net: no utun: joining without IP\n");
+			}
 		}
 	}
 	radio_summary();

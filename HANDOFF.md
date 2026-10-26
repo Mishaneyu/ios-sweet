@@ -1,9 +1,27 @@
 # Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-26, 04:20 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-26, 06:03 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
+
+### METAL/TURNIP SMOOTHNESS CONFIRMED (Boot #7, kernel 0128) + BACKLIGHT, WI-FI, DIRECT SWAP PRESENT & OVERLAY IN KERNEL 0129 (2026-10-26, 06:03)
+- **Boot #7 (`shim/out/shim-rmx1931-ios.img`, kernel `0128`, `flamereboot=3600`)**:
+  - User confirmed UI smoothness improved substantially once `/private/var/local/m2v-cache` (`0777`), `675 MHz` Adreno 640 Prime OPP, and `4 ms` touch polling took effect, and reported remaining items: frame pacing still below locked 60 fps, Wi-Fi stuck on "Connecting...", brightness slider & auto-brightness inactive, custom default wallpaper requested, and Phone dialer / Bluetooth status.
+- **Root causes found from `boot6-ios.log` + `dtb/live.dtb` + `d22ap.adt`**:
+  1. **Wi-Fi (`WCN3990`)**: `RMX1931`'s `pil_wlan_fw_region` is `0x9b000000 + 0x180000` (1.5 MiB), whereas `phone/wifi/wlfw.c` had `MSA_SIZE = 0x100000u` (1 MiB), causing `wlfw_start()` (`wlfw.c:274`) to reject the MSA region before mission mode. Also `RMX1931`'s `modemr.jsn` includes `tms/pdr_enabled` on `msm/modem/root_pd`, and `configd` starts at `~13 s` before `wland` publishes `en0` (`~22 s`), writing a `preferences.plist` without an `en0` DHCP service.
+  2. **Brightness slider**: `IODeviceTree:/backlight` and `AppleARMBacklight` were absent, so `CoreBrightness` / `BacklightServices` had no service to drive.
+  3. **Frame pacing / background CPU spikes**:
+     - `AppleCLCD::swap()` only buffered `fPending` until the unsynchronized 60 Hz software timer `vsyncFired` woke up (`0..16.7 ms` extra latency + beat-frequency dropped frames), instead of queuing the 16 us async 2D present IB directly behind `backboardd`'s Turnip render IB on `SwapEnd`.
+     - `com.apple.bluetoothd` (90 crash-restarts in Boot #6) and `com.apple.fairplayd.H2` (89 crash-restarts + deadlocks `locationd`) were still enabled in `launchd.plist`, and the default `7400.WWDC_2022` wallpaper used a 3-layer `.ca` `LayeredAnimation`.
+- **Fixes in Kernel 0129 (`xnu/patches/0129-rmx1931-backlight-wifi-fps-overlay.patch`) + `wland` + `tools/`**:
+  - **Wi-Fi (`phone/wifi/*`, `bsd/dev/flame_sta.c`, `bsd/dev/redwood_apple80211.c`)**: `MSA_SIZE = 0x180000u`, `tms/pdr_enabled` in `pdmapper.c`, `bridge_link(1)` ordered before `FW_JOIN_DONE(0)` in the already-joined shortcut, automatic `SystemConfiguration/preferences.plist` `en0` check + `configd` restart 800 ms after `FW_HELLO`, `flame_wlan_link_bss` priority in `sta_join`, and open-vs-WPA2 `AUTH_TYPE` (`capability & 0x0010`).
+  - **Brightness slider (`tools/mkadt.py`, `KernelConfigTables.cpp`, `SweetFramebuffer.cpp`, `sweet_gpu.c`)**: `/backlight` node with `D22AP` calibration constants (`LminProduct`/`LmidProduct`/`LmaxProduct`, `user-accessible-max-nits=625`), `AppleARMBacklight::setProperties("brightness-nits")` with `isqrt` gamma-2.0 perceptual curve (`8%..100%` sRGB), and tear-free off-screen staged 2D dimming (`DISPLAY_DIM_OFF = 0x410000`) + static-screen refresh.
+  - **Direct `SwapEnd` GPU present (`SweetFramebuffer.cpp`)**: `AppleCLCD::swap()` (`sweetfb_direct=1`, default on) queues `present()` immediately when `sweet_gpu_ready() && fFlushTicks == 1 && !fPowerOff`.
+  - **In-place root overlay (`tools/mkpayload.py --overlay`, `bsd/vfs/vfs_syscalls.c`, `bsd/kern/bsd_init.c`)**: unpacks `/chosen/sweet-overlay` POSIX `ustar` + `.sweet-rm` unlinks once per FNV-1a stamp (`/private/var/local/.overlay-stamp`) before `launchd` starts, updating `wland`, `launchd.plist` (`bluetoothd` + `fairplayd.H2` removed), and the `Still` default wallpaper without re-flashing 16 GiB `sda16`.
+- **Open (next)**:
+  1. Build `kernel-0129` (`xnu.yml`) + `wland` (`userland.yml`), pack `shim-rmx1931-ios.img` with `--overlay work/boot/rmx1931-overlay.tar`, pull Boot #7 `SWEETLOG`, and boot **Boot #8**.
+  2. Unsupported hardware subsystems (no drivers yet): cellular baseband/IMS (`MobilePhone.app`), `WCN3990` UART HCI (`Bluetooth`), and SLPI/ADSP SSC ambient light sensor (Auto-Brightness).
 
 ### INTERACTIVE iOS 16.7.16 UI ON RMX1931 (Boot #6, kernel 0127) + ROOT CAUSE OF CPU FALLBACK FIXED IN KERNEL 0128 (2026-10-26, 04:20)
 - **Boot #6 (`shim/out/shim-rmx1931-ios.img`, kernel `0127`, 16 GiB iOS 16.7.16 `20H392` HFS+ root on `/dev/block/sda16`)**:

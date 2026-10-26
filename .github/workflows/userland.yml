@@ -20,6 +20,20 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect build scope
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "full=true" >> "$GITHUB_OUTPUT"
+          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1 && \
+               ! git diff --name-only HEAD~1 HEAD | grep -Eq '^(phone/turnip/|phone/metal2/|tools/build-turnip-ios\.sh|tools/build-m2v-bridge\.sh)'; then
+            echo "full=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "full=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Setup Xcode and Homebrew tools
         run: |
@@ -33,10 +47,12 @@ jobs:
           echo "DEVELOPER_DIR=$DEV_DIR" >> "$GITHUB_ENV"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
-          brew install llvm bison flex ninja gnu-sed pkg-config autoconf automake glslang spirv-tools
-          if [ ! -x /opt/homebrew/opt/llvm/bin/llvm-as ]; then
-            sudo mkdir -p /opt/homebrew/opt/llvm/bin
-            sudo ln -sf "$(brew --prefix llvm)/bin/llvm-as" /opt/homebrew/opt/llvm/bin/llvm-as
+          if [ "${{ steps.scope.outputs.full }}" = "true" ]; then
+            brew install llvm bison flex ninja gnu-sed pkg-config autoconf automake glslang spirv-tools
+            if [ ! -x /opt/homebrew/opt/llvm/bin/llvm-as ]; then
+              sudo mkdir -p /opt/homebrew/opt/llvm/bin
+              sudo ln -sf "$(brew --prefix llvm)/bin/llvm-as" /opt/homebrew/opt/llvm/bin/llvm-as
+            fi
           fi
           chmod +x work/userland/bin/ios-cc tools/*.sh phone/*/*.sh
 
@@ -46,7 +62,8 @@ jobs:
           for p in xnu/patches/0095-*.patch xnu/patches/0105-*.patch xnu/patches/0106-*.patch \
                    xnu/patches/0107-*.patch xnu/patches/0108-*.patch xnu/patches/0109-*.patch \
                    xnu/patches/0111-*.patch xnu/patches/0112-*.patch xnu/patches/0115-*.patch \
-                   xnu/patches/0118-*.patch xnu/patches/0125-*.patch xnu/patches/0127-*.patch; do
+                   xnu/patches/0118-*.patch xnu/patches/0125-*.patch xnu/patches/0127-*.patch \
+                   xnu/patches/0128-*.patch; do
             git -C work/dxb/xnu apply --include='bsd/dev/sweet_a6xx*' "$PWD/$p"
           done
           ls -la work/dxb/xnu/bsd/dev/
@@ -58,6 +75,7 @@ jobs:
           bash phone/tools/build.sh
 
       - name: Build Mesa Turnip (libvulkan_freedreno.dylib) for iOS 16 arm64
+        if: steps.scope.outputs.full == 'true'
         run: |
           git clone --depth 1 https://github.com/UniXNU/UniXNU.git reference-repos/UniXNU
           mkdir -p work/turnip
@@ -86,6 +104,7 @@ jobs:
           sh tools/build-turnip-ios.sh ios
 
       - name: Build metal2vulkan bridge + SweetMetal2.bundle
+        if: steps.scope.outputs.full == 'true'
         run: |
           rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
           git init -q work/metal2vulkan
@@ -98,6 +117,7 @@ jobs:
           sh phone/metal2/build.sh
 
       - name: Build dash + dropbearmulti + toybox for iOS 16 arm64 SSH shell
+        if: steps.scope.outputs.full == 'true'
         continue-on-error: true
         run: |
           mkdir -p work/userland/stage work/userland/src
@@ -169,8 +189,10 @@ jobs:
       - name: Package userland bundle
         run: |
           mkdir -p dist-userland/bin dist-userland/Extensions
-          cp -R phone/metal2/out/SweetMetal2.bundle dist-userland/Extensions/
-          cp phone/metal2/out/m2vtest dist-userland/bin/ || true
+          if [ -d phone/metal2/out/SweetMetal2.bundle ]; then
+            cp -R phone/metal2/out/SweetMetal2.bundle dist-userland/Extensions/
+          fi
+          cp phone/metal2/out/m2vtest dist-userland/bin/ 2>/dev/null || true
           cp phone/wifi/out/wland dist-userland/bin/
           cp phone/gpu/out/gpu phone/gpu/out/pmem dist-userland/bin/
           cp phone/tools/out/* dist-userland/bin/

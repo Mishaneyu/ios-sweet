@@ -124,3 +124,4 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
   `GENI_IF_DISABLE_RO` (`0x64`) reports `FIFO_IF_DISABLE` (`rmxtouchgpio=1` forces it).
 - 0127 RMX1931 GPU: set Adreno 640 `ZAP_REGION` to `0x99515000` (`pil_gpu_region` in `RMX1931` FDT).
 - 0128 RMX1931 Metal/GPU/touch: ensure `/private/var/local` + `m2v-cache` (`0777`) and `/private/etc/dropbear` (`0700`) before `launchd`, unlock SM8150-AC `675 MHz` Adreno 640 OPP (`sweetgpufreq=6`), and 4 ms active touch polling.
+- 0129 RMX1931 backlight/Wi-Fi/FPS/overlay: `AppleARMBacklight` on `/backlight` with tear-free Adreno 640 AMOLED dimming, direct `SwapEnd` GPU present (`sweetfb_direct=1`), `sta_joined_bss` + open-network `AUTH_TYPE`, and pre-`launchd` `/chosen/sweet-overlay` ustar unpacker.
