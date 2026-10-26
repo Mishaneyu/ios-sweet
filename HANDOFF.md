@@ -5,6 +5,32 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### iOS 26.5.2 (`23F84`, `xnu-12377.121.6`, `D421AP` `arm64e`) REBASE, OFFLINE DE-PAC, SLEH EMULATOR & ROOT IMAGES READY (2026-10-26, 11:40)
+- **Branch**: `upgrade_ios_version_target` (tracked at `origin/upgrade_ios_version_target`, HEAD `d9e833a`).
+- **Target IPSW & Version**: iOS 26.5.2 (`23F84`, Darwin `25.5.0`, `xnu-12377.121.6`, `iPhone12,3` / `D421AP` iPhone 11 Pro).
+- **Completed & Verified Deliverables**:
+  1. **Dual-version `boot_args` (`v1` 736B vs `v2` 1152B)**:
+     - `shim/loader.c` (`13` compile-time `_Static_assert`s verified), `tools/mkpayload.py` (`v2` default with `1024` byte CommandLine), and `tools/qemu-sweet.py` (auto-detects `v1`/`v2` and reads `/sweet-fbcon` directly from payload ADT).
+  2. **High-Speed In-Place PAC Stripper (`tools/de-pac-arm64e.py` + `tools/de_pac_fast.c`)**:
+     - Scans strictly `S_ATTR_*INSTRUCTIONS` minus `LC_DATA_IN_CODE`. Verified on the real iOS 26.5.2 85-file split `dyld_shared_cache_arm64e` and root Mach-Os: rewrote **`39,440,621`** PAC opcodes in `366 s` (`2.08 GiB/s` C core) leaving only `1,667` writeback `ldra*` and `687` `pacga` opcodes for the EL1 emulator.
+  3. **Rebased Patch Series (`xnu/patches-26/`, 5 Stage Scripts + 122 Patches)**:
+     - `0000` (`CoreEntitlements` V2 headers), `0019` (`libpthread-539`), `0020` (`BearSSL`), `0026` (`hfs-715.120.4`), `0058` (`IOHIDFamily-2238.120.5`).
+     - `0129-ios26-arm64e-exec-and-shared-region.patch`: Grades `arm64e` on `ARM64_V8` host, passes `ptrauth_disabled=1` in `apple[]` (causing dyld-1378 to select `load_arm64e_keysOff = {arm64e, arm64}`), unifies shared region `sr_cpu_subtype == 0`, and fixes `v3`/`v5` page slide auth rebase `memcpy`.
+     - `0130-ios26-sleh-armv84-pac-emulator.patch`: EL1 `sleh.c` user-mode instruction emulator for ARMv8.4 + PAC (`reta*`, `bra*`/`blra*`, `pac*`/`aut*`/`xpac*`, `pacga`, `ldra*`, `fjcvtzs`, `fcadd`/`fcmla`, `stlur*`/`ldapur*`, `FlagM`/`DIT`, `SHA3`) with zero floating-point libcalls and TBI user address sanitization.
+     - `tools/validate-repo.py` passes 100% across both `xnu/patches/` and `xnu/patches-26/`.
+  4. **Staged Root Images**:
+     - `/home/paink/ios26-root-rmx1931.img` (`30 GiB` case-sensitive journaled HFS+ image holding iOS 26.5.2 OS + SystemOS + AppOS Cryptexes, de-PAC rewritten, `sweet-root-tweaks.py` applied, `SweetMetal2.bundle`, `wland`, `dropbear`, and RMX1931 firmware staged; verified `fsck_hfs` clean). Phone's `/dev/block/sda16` (`userdata`) is untouched.
+     - `/home/paink/ios26-qemu-dyld.img` (`16 MiB` HFS+ test ramdisk with real iOS 26.5.2 `/usr/lib/dyld` and test binaries).
+     - `work/boot/sweet-init-v84.macho` (`16,635 B` `0x80000002` Mach-O exercising all 9 instruction emulation test suites).
+- **Exact Remaining Fixes for CI Build (`.github/workflows/xnu.yml` / `xnu/patches-26/`)**:
+  GitHub Actions run `40265518489` (`make -k` on `macos-latest` Xcode 26.6 / MacOSX26.5.sdk) reported the following fixes needed:
+  1. **`TrustCache/API.h`**: Missing in `xnu-12377.121.6` open-source release (referenced by `amfi.h`, `pmap_cs.h`, `kern_trustcache.c`). Needs staging in `EXTERNAL_HEADERS/TrustCache/API.h` or adding a stub in `xnu/patches-26/`.
+  2. **`CoreEntitlements/EntitlementsPriv.h`**: Triggers `#error This is a private API...` unless guarded or bypassed. Add `-DCORE_ENTITLEMENTS_I_KNOW_WHAT_I_AM_DOING` or patch out the `#error`.
+  3. **`kmem_alloc_contig` / `KMA_*` in `sweet_ufs.c`, `sweet_pmem.c`, `sweet_gpu.c`, `sweet_usb.c`**: In `xnu-12377`, `kmem_alloc_contig` was replaced with `kmem_alloc_contig_guard` / `kmem_alloc_flags` or `#include <vm/vm_kern.h>`.
+  4. **Warning noise**: Add `-Wno-reserved-identifier` in `MakeInc.def` to suppress Xcode 26.6's 700+ MB macro warning spam.
+
+---
+
 ### INTERACTIVE iOS 16.7.16 UI ON RMX1931 (Boot #6, kernel 0127) + ROOT CAUSE OF CPU FALLBACK FIXED IN KERNEL 0128 (2026-10-26, 04:20)
 - **Boot #6 (`shim/out/shim-rmx1931-ios.img`, kernel `0127`, 16 GiB iOS 16.7.16 `20H392` HFS+ root on `/dev/block/sda16`)**:
   - Boot-args: `launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 ufslogsecs=2 sweetgpu=1 sweetmtl=2 sweetusb=2 sweetusbframes=0 sweetrtcoff=1792944948 rmxtouchdelay=2 flamereboot=1800`.
