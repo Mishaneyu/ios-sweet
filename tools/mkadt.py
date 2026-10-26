@@ -50,16 +50,28 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
 
-def d22ap_product(path=D22AP_ADT):
-    """/product properties of the real D22AP tree, without the syscfg
-    placeholders iBoot would fill in (flag bit set) and the node bookkeeping."""
+def _clean_adt_subtree(src_node, ph):
+    name_bytes = dict((k, v) for k, f, v in src_node.props).get('name', b'\0')
+    name = name_bytes.rstrip(b'\0').decode('latin1')
+    props = [ph()] + [
+        (k, v) for k, f, v in src_node.props
+        if not f and k not in ('name', 'AAPL,phandle')
+    ]
+    children = [_clean_adt_subtree(ch, ph) for ch in src_node.children]
+    return node(name, props, children)
+
+
+def d22ap_product(ph, path=D22AP_ADT):
+    """/product subtree of the real D22AP tree (including camera, haptics,
+    audio, facetime, maps), without the syscfg placeholders iBoot would fill in
+    (flag bit set) and with fresh AAPL,phandles."""
     if not os.path.exists(path):
         print(f'warning: {path} missing, no /product node', file=sys.stderr)
-        return None
+        return []
     root, _ = adt.parse(open(path, 'rb').read())
     for c in root.children:
         if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
-            return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+            return [_clean_adt_subtree(c, ph)]
     raise SystemExit(f'{path}: no /product node')
 
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
@@ -243,8 +255,7 @@ def build(seed=None, qemu=False, highmem=False):
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
-    product_props = d22ap_product()
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    product = d22ap_product(ph)
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product

@@ -19,9 +19,13 @@ what you need to fetch yourself.
   - `phone/wifi/radio.c` is a userland port of its TopazModem radio (its patches 0123-0130).
   - Our patch 0123 contains its 0900 (en0 + Apple80211 for wifid) and 0128 (IOKit quiesce).
   - ios-topaz's CREDITS.md puts the HackiOS-derived kernel parts under the APSL 2.0.
-- **HackiOS** (OOSEX GANG, <https://github.com/oosexgang/hackios-xnu-kernel>, APSL 2.0): the origin of the
-  Apple80211/wifid code above (`redwood_net`, `redwood_apple80211`, `redwood_sta`, `RedwoodWLAN`,
-  `MiniIONetworkStack`), the keystore wrap/unwrap and the 10-bit surface formats in 0123/0124.
+- **HackiOS** (OOSEX GANG, <https://github.com/oosexgang/hackios-xnu-kernel>, APSL 2.0):
+  - Apple80211/wifid code (`redwood_net`, `redwood_apple80211`, `redwood_sta`, `RedwoodWLAN`, `MiniIONetworkStack`),
+    keystore wrap/unwrap, and 10-bit surface formats in patches 0123/0124.
+  - AMFI `0x5a`/`0x60` & Sandbox op `4` + entitlement privilege table, `kern.exec_inject`, `xpcproxy` `pidversion`
+    preservation, and persona-less `posix_spawn` adoption in patch 0200.
+  - `phone/audio/` (`HakiosAudio.driver` CoreAudio HAL plug-in) and `phone/media/` (`libsweet_media.dylib` and
+    `libsweet_sysfix.dylib`), adapted for iOS 16.7.16 (`20H392`) and RMX1931 hardware (`BQ28Z610`, `PM8150L`, `AW8697`).
 - **UniXNU** (<https://github.com/UniXNU/UniXNU>, BSD-2-Clause-Patent at the top level):
   - `phone/metal2/NativeBridgeMetalFrontend.mm`: NativeMetal, MIT, patched for iOS 16.
   - `phone/metal2/bridge/` (NativeMetalBridge/NativeMetalObjects): NativeMetal, MIT; see `bridge/LICENSE`.
