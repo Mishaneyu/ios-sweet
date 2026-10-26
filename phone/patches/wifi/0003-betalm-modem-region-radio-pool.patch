@@ -1,0 +1,28 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+index a456c05..b5549f2 100644
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -31,7 +31,7 @@ const uint8_t radio_mac[6] = { 0x02, 0x50, 0x49, 0x58, 0x45, 0x4c };	/* what WLF
+ 
+ /* ---------------------------------------------------------------- host memory */
+ 
+-#define POOL_PA		0xE0000000ull
++#define POOL_PA		0xF0000000ull	/* LG G8S: above the GPU buffer pool (0xb0000000 + 1 GB); flame: 0xE0000000 */
+ #define POOL_SIZE	0x01000000ull
+ static uint64_t pool_next = POOL_PA;
+ 
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+index bb28cd3..347b253 100644
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -356,8 +356,8 @@ static int qmp_send(const char *msg)
+ /* ---- modem boot: TrustZone PAS (Linux qcom_q6v5_pas + qcom_mdt_loader) ---- */
+ 
+ #define PAS_MODEM	4
+-#define MPSS_PA		0x8dc00000ull	/* flame modem_region */
+-#define MPSS_SIZE	0x0b400000ull
++#define MPSS_PA		0x8d800000ull	/* LG G8S modem_region (flame: 0x8dc00000 + 0xb400000) */
++#define MPSS_SIZE	0x09600000ull
+ #define FW_DIR		"/var/local/fw/modem"
+ #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
+ 
