@@ -1,9 +1,23 @@
 # Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-26, 08:25 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-26, 09:40 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
+
+### LIVE BOOTED-OS DIAGNOSTIC & OBSERVABILITY SYSTEM (Kernel 0132 + `sweet-dbg.py` + `sweetdiag`, 2026-10-26, 09:40)
+- **Live Wi-Fi check on running Boot #9 (`kernel-0130`)**:
+  - Confirmed RMX1931 booted into iOS 16.7.16 and online over `WCN3990` Wi-Fi (`en0` MAC `02:50:49:58:45:4c`, `0%` ICMP loss, `TTL=64`), while `TCP 2223` was inactive when booted unplugged because pre-`0132` `sweet_usb_gadget_start()` returned early on `ep0 cmd 0x1 timeout` before calling `sweet_files_start()`.
+- **Kernel `0132` (`xnu/patches/0132-sweet-live-diag-system.patch`, target boot-args unchanged from Boot #9)**:
+  - **Live Kernel Telemetry Hub (`EXTERNAL_HEADERS/sweet_diag.h`, `bsd/dev/sweet_diag.c`, `bsd/conf/files`, `bsd/kern/bsd_init.c`)**:
+    - `/dev/sweet-diag` (`0444`) and `sweet_diag_format_json()`: structured live JSON snapshot of rolling **1s FPS** & **5s FPS**, `vsync_hz`/`vsync_count`, active present path (`gpu_direct` SwapEnd vs `gpu_vsync` vs `cpu_fallback`), panel PA/geometry/stride, logical resolution & fitted rect, last swapped `IOSurface` (`id`, `w`, `h`, `bpr`, FourCC e.g. `BGRA`/`w30r`/`b3a8`, `age_ms`), `gpu_presents` vs `cpu_presents`, `avg_present_us`, `last_fallback_reason`, `AppleARMBacklight` (`brightness_pct`, `millinits`, `raw_level`, AMOLED `dim_alpha`), Adreno 640 clock/busy/pool + live `SweetAcceleratorUserClient` table (`v2_turnip` vs `v1`, `pool_kb`, `submits`, `faults`, `cap_refused`), touch/keys, `flame_wlan.c` + `<net/kpi_interface.h>` `en0`/`ue0` IPs & packet counters, battery/audio/torch/haptics, `exec_inject` hits, denied sandbox privileges, and a 16-entry userland crash ring (`pc`, `lr`, `sp`, `fp`, `far`, `slide`, `mh`, `bt`).
+    - `/dev/sweet-log` (`0444`) + `sysctl kern.sweet.{log_pos,fps_1s_x10,gpu_busy_pct,crashes}`: lossless userland/SSH read & tail access to XNU's 1 MiB `sweet_log_ring`.
+    - **Wi-Fi & USB `TCP 2223` Extensions (`bsd/dev/sweet_files.c`, `bsd/dev/sweet_usb.c`)**: `sweet_files_start()` now launches unconditionally in `bsdinit_task` (protected by `os_atomic_cmpxchg` so Wi-Fi works even when USB is unplugged) and adds feedback-loop-free `DIAG`, `KLOG <cursor> <max>`, and synchronous `CMD <line>` (`fbmode`, `brightness`, `tap`, `swipe`, `rtc`, `sync`, `reboot`, and `sweet_poke.c` commands).
+- **On-Phone & Cross-Platform Host Tooling**:
+  - `phone/tools/sweetdiag.c` (+ `phone/tools/build.sh`): on-phone SSH CLI (`sweetdiag status`, `watch`/`top`, `json`, `crashes`, `klog -f`) with pre-`0132` `sysctl`/`getifaddrs` fallback.
+  - `tools/sweet-dbg.py`: zero-dependency cross-platform debugger for Windows, macOS, and Linux over Wi-Fi or USB (`connect [<IP>|--scan]`, `status`, `doctor`, `watch`, `web` live browser dashboard at `127.0.0.1:8765` with charts + live display controls + auto-geometry screen preview & click/drag remote touch, `klog -f`, `crashes`, `shot`, `cmd`, `snapshot --redact`), plus `--host` / `SWEET_HOST` / `work/.sweet-host` support in `tools/flame-files.py`, `tools/flame-shot`, and `tools/flame-cmd.py`.
+- **Open (next)**:
+  1. Wait for `xnu.yml` (`kernel-0132`) and `userland.yml` (`sweetdiag`) CI runs, pack `shim/out/shim-rmx1931-ios.img` (Boot #10), boot on RMX1931, and connect live over Wi-Fi via `python tools/sweet-dbg.py connect --scan`.
 
 ### BOOT #9 LAUNCHED ON RMX1931: KERNEL 0130 (0129 + HACKIOS PERIPHERALS, AUDIO HAL & MEDIA/SYSFIX DYLIBS) (2026-10-26, 08:25)
 - **Merged `feat/hackios-port` into `master` (`8ef41c8`) & built combined artifacts on GitHub Actions `macos-15`**:

@@ -1,0 +1,2645 @@
+diff --git a/EXTERNAL_HEADERS/sweet_diag.h b/EXTERNAL_HEADERS/sweet_diag.h
+new file mode 100644
+index 0000000..4e5ae30
+--- /dev/null
++++ b/EXTERNAL_HEADERS/sweet_diag.h
+@@ -0,0 +1,229 @@
++/*
++ * Live kernel telemetry, crash ring, and debug snapshot interface for booted
++ * iOS bring-up (bsd/dev/sweet_diag.c, /dev/sweet-diag, /dev/sweet-log, and
++ * TCP 2223 DIAG / KLOG / CMD).
++ */
++#ifndef _SWEET_DIAG_H_
++#define _SWEET_DIAG_H_
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define SWEET_DIAG_MAX_OWNERS   7
++#define SWEET_DIAG_MAX_CLIENTS  24
++#define SWEET_DIAG_MAX_CRASHES  16
++#define SWEET_DIAG_MAX_BT       8
++#define SWEET_DIAG_MAX_PRIVS    24
++
++struct sweet_diag_display {
++	bool     registered;
++	bool     power_on;
++	bool     direct_present;
++	bool     force_cpu;
++	bool     gpu_ever;
++	bool     last_present_gpu;
++	bool     backlight_registered;
++	uint64_t panel_pa;
++	uint32_t panel_w, panel_h, panel_stride;
++	uint32_t logical_w, logical_h;
++	int32_t  fit_x, fit_y, fit_w, fit_h;
++	uint32_t corner_radius, corner_ext;
++	uint32_t vsync_hz;
++	uint64_t vsync_count;
++	uint64_t swaps_total;
++	uint64_t presents_total;
++	uint64_t gpu_presents;
++	uint64_t cpu_presents;
++	uint32_t fps_1s_x10;
++	uint32_t fps_5s_x10;
++	uint64_t last_5s_swaps;
++	uint64_t last_5s_presents;
++	uint64_t avg_present_us;
++	uint32_t clients_count;
++	uint32_t last_surf_id;
++	uint32_t last_surf_w, last_surf_h, last_surf_bpr, last_surf_fmt;
++	uint32_t last_layer_mask;
++	uint64_t last_swap_age_ms;
++	uint32_t gpu_fallback_mask;
++	uint64_t gpu_fallback_count;
++	char     last_fallback_reason[48];
++	uint32_t millinits;
++	uint32_t raw_level;
++	uint32_t dim_alpha;
++};
++
++struct sweet_diag_gpu_owner {
++	int32_t  pid;
++	char     name[24];
++	uint32_t submits;
++	uint64_t busy_ms;
++};
++
++struct sweet_diag_gpu_client {
++	int32_t  pid;
++	char     name[32];
++	bool     v2;
++	bool     system;
++	bool     cap_refused;
++	uint64_t pool_bytes;
++	uint64_t pool_peak;
++	uint64_t submits;
++	uint64_t faults;
++};
++
++struct sweet_diag_gpu {
++	bool     enabled;
++	bool     ready;
++	bool     ddr_boost;
++	uint32_t perf_level;
++	uint32_t clock_mhz;
++	uint64_t recoveries;
++	uint32_t fence_submitted;
++	uint32_t fence_done;
++	uint64_t pool_total_bytes;
++	uint64_t pool_used_bytes;
++	uint64_t pool_peak_bytes;
++	uint64_t pool_alloc_failures;
++	uint32_t cap_mb;
++	uint32_t reserve_mb;
++	uint64_t clean_us;
++	uint64_t blit_us;
++	uint64_t present_frames;
++	uint64_t win_age_ms;
++	uint32_t win_submits;
++	uint32_t win_missed;
++	uint64_t win_busy_ms;
++	uint32_t win_busy_pct;
++	uint64_t win_longest_us;
++	uint64_t win_mean_us;
++	uint32_t owner_count;
++	struct sweet_diag_gpu_owner owners[SWEET_DIAG_MAX_OWNERS];
++	uint32_t client_count;
++	struct sweet_diag_gpu_client clients[SWEET_DIAG_MAX_CLIENTS];
++};
++
++struct sweet_diag_input {
++	char     driver[32];
++	bool     touch_ready;
++	uint32_t poll_ms;
++	uint64_t touch_errors;
++	uint64_t touch_events;
++	uint32_t fingers_mask;
++	int32_t  last_x, last_y;
++	uint64_t last_touch_age_ms;
++	uint64_t button_events;
++	uint32_t buttons_mask;
++};
++
++struct sweet_diag_net {
++	bool     wland_open;
++	bool     wlan_ready;
++	bool     wlan_link_up;
++	uint8_t  wlan_mac[6];
++	char     wlan_ssid[33];
++	uint8_t  wlan_bssid[6];
++	uint16_t wlan_freq_mhz;
++	int16_t  wlan_rssi_dbm;
++	uint32_t wlan_bss_count;
++	uint64_t wlan_tx_dropped;
++	bool     usb_ready;
++	bool     usb_configured;
++	uint64_t usb_rx_frames;
++	uint64_t usb_tx_frames;
++};
++
++struct sweet_diag_peripherals {
++	bool     bat_online;
++	bool     bat_ext;
++	bool     bat_charging;
++	bool     bat_full;
++	uint32_t bat_soc;
++	uint32_t bat_mv;
++	uint32_t bat_pack_mv;
++	int32_t  bat_ma;
++	int32_t  bat_temp_deci_c;
++	uint32_t bat_rem_mah;
++	uint32_t bat_fcc_mah;
++	uint32_t bat_cycles;
++	uint32_t bat_errors;
++
++	bool     audio_ready;
++	bool     audio_active;
++	bool     audio_muted;
++	uint64_t audio_frames_total;
++	uint64_t audio_frames_sound;
++	uint32_t audio_peak_pct;
++	int32_t  audio_vol_eighth_db;
++
++	bool     torch_ready;
++	bool     torch_fault;
++	uint32_t torch_level;
++
++	bool     haptic_ready;
++	uint32_t haptic_events;
++	uint32_t haptic_faults;
++};
++
++struct sweet_diag_crash {
++	uint64_t seq;
++	uint64_t uptime_ms;
++	int32_t  pid;
++	int32_t  sig;
++	char     name[20];
++	uint64_t code;
++	uint64_t subcode;
++	uint64_t pc;
++	uint64_t lr;
++	uint64_t sp;
++	uint64_t fp;
++	uint64_t far;
++	uint64_t slide;
++	uint64_t mh;
++	uint32_t bt_count;
++	uint64_t bt[SWEET_DIAG_MAX_BT];
++};
++
++struct sweet_diag_priv {
++	int32_t  priv;
++	char     name[20];
++};
++
++void sweet_diag_init(void);
++size_t sweet_diag_format_json(char *buf, size_t cap);
++
++void sweet_cpufreq_record(unsigned cluster, unsigned mhz);
++void sweet_wdt_record(bool enabled, int reboot_s, int elapsed_s);
++void sweet_touch_driver_record(const char *driver, bool ready, uint32_t poll_ms, uint64_t errors);
++void sweet_crash_record(const char *name, int pid, int sig, uint64_t code, uint64_t subcode,
++    uint64_t pc, uint64_t lr, uint64_t sp, uint64_t fp, uint64_t far,
++    uint64_t slide, uint64_t mh, const uint64_t *bt, uint32_t bt_count);
++
++void sweet_fb_diag_snapshot(struct sweet_diag_display *out);
++int  sweet_fb_set_mode(const char *mode);
++int  sweet_backlight_set_pct(uint32_t pct);
++
++void sweet_gpu_diag_snapshot(struct sweet_diag_gpu *out);
++void sweet_accel_diag_snapshot(struct sweet_diag_gpu *out);
++void sweet_hid_diag_snapshot(struct sweet_diag_input *out);
++void sweet_wlan_diag_snapshot(struct sweet_diag_net *out);
++void sweet_usb_diag_snapshot(struct sweet_diag_net *out);
++void sweet_usb_run_cmd(const char *cmd, size_t got, bool allow_reset);
++
++void rmx1931_battery_diag_snapshot(struct sweet_diag_peripherals *out);
++void rmx1931_audio_diag_snapshot(struct sweet_diag_peripherals *out);
++void rmx1931_torch_diag_snapshot(struct sweet_diag_peripherals *out);
++void rmx1931_haptic_diag_snapshot(struct sweet_diag_peripherals *out);
++
++void sweet_exec_inject_diag(char *out_conf, size_t cap, uint64_t *out_hits);
++uint32_t sweet_amfi_priv_diag(struct sweet_diag_priv *out, uint32_t max_entries, uint32_t *out_total);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _SWEET_DIAG_H_ */
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1dc0334..ec699a3 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/rmx1931_haptic.c		standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_poke.c			standard
+ bsd/dev/sweet_files.c			standard
++bsd/dev/sweet_diag.c			standard
+ bsd/dev/sweet_pmem.c			standard
+ bsd/dev/sweet_a6xx.c			standard
+ bsd/dev/sweet_gpu.c			standard
+diff --git a/bsd/dev/flame_wlan.c b/bsd/dev/flame_wlan.c
+index 4fca097..aad7605 100644
+--- a/bsd/dev/flame_wlan.c
++++ b/bsd/dev/flame_wlan.c
+@@ -22,6 +22,7 @@
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
+ #include <sys/flame_wlan.h>
++#include <sweet_diag.h>
+ 
+ void flame_wlan_init(void);
+ void flame_sta_init(void);              /* bsd/dev/flame_sta.c */
+@@ -450,4 +451,30 @@ flame_wlan_init(void)
+ 	flame_sta_init();
+ 	printf("flame wlan: /dev/wlan ready (major %d)\n", major);
+ }
++
++void
++sweet_wlan_diag_snapshot(struct sweet_diag_net *out)
++{
++	if (out == NULL) {
++		return;
++	}
++	lck_mtx_lock(&fw_lock);
++	out->wland_open = fw_opened;
++	out->wlan_ready = fw_ready;
++	out->wlan_link_up = fw_link_up;
++	memcpy(out->wlan_mac, fw_addr, 6);
++	out->wlan_bss_count = fw_nbss;
++	out->wlan_tx_dropped = fw_tx_dropped;
++	if (fw_link_up) {
++		size_t slen = fw_link.ssid_len < 32 ? fw_link.ssid_len : 32;
++		memcpy(out->wlan_ssid, fw_link.ssid, slen);
++		out->wlan_ssid[slen] = '\0';
++		memcpy(out->wlan_bssid, fw_link.bssid, 6);
++		if (fw_link_bss_heard) {
++			out->wlan_freq_mhz = fw_link_bss.frequency;
++			out->wlan_rssi_dbm = fw_link_bss.rssi;
++		}
++	}
++	lck_mtx_unlock(&fw_lock);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/rmx1931_audio.c b/bsd/dev/rmx1931_audio.c
+index 4f780c7..687cf61 100644
+--- a/bsd/dev/rmx1931_audio.c
++++ b/bsd/dev/rmx1931_audio.c
+@@ -25,6 +25,7 @@
+ #include <kern/thread_call.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
++#include <sweet_diag.h>
+ 
+ void rmx1931_audio_init(void);
+ 
+@@ -46,7 +47,9 @@ static LCK_MTX_DECLARE(rmx_audio_lock, &rmx_audio_grp);
+ 
+ static uint64_t stretch_last;
+ static uint64_t stretch_frames, stretch_sound;
+-static uint32_t stretch_peak;
++static uint64_t total_frames_ever, total_sound_ever;
++static uint32_t stretch_peak, last_peak_pct;
++static bool     audio_dev_ready;
+ static thread_call_t audio_report_call;
+ static bool audio_report_armed;
+ static int sys_audio_vol_below = 0;
+@@ -123,12 +126,15 @@ rmx_audio_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		lck_mtx_lock(&rmx_audio_lock);
+ 		stretch_last = mach_absolute_time();
+ 		stretch_frames += count;
++		total_frames_ever += count;
+ 		if (peak > AUDIO_SILENCE) {
+ 			stretch_sound += count;
++			total_sound_ever += count;
+ 		}
+ 		if (peak > stretch_peak) {
+ 			stretch_peak = peak;
+ 		}
++		last_peak_pct = (peak * 100u) / 32768u;
+ 		if (!audio_report_armed && audio_report_call != NULL) {
+ 			audio_report_armed = true;
+ 			clock_interval_to_deadline(2u * AUDIO_QUIET_MS, NSEC_PER_MSEC, &deadline);
+@@ -188,6 +194,28 @@ rmx1931_audio_init(void)
+ 		return;
+ 	}
+ 	audio_report_call = thread_call_allocate(rmx_audio_report, NULL);
++	audio_dev_ready = true;
+ 	printf("RMX AUDIO: /dev/hakios-audio ready (48 kHz stereo sink)\n");
+ }
++
++void
++rmx1931_audio_diag_snapshot(struct sweet_diag_peripherals *out)
++{
++	if (out == NULL) {
++		return;
++	}
++	uint64_t since_ns = 0;
++	lck_mtx_lock(&rmx_audio_lock);
++	if (stretch_last != 0) {
++		absolutetime_to_nanoseconds(mach_absolute_time() - stretch_last, &since_ns);
++	}
++	out->audio_ready = audio_dev_ready;
++	out->audio_active = (stretch_last != 0 && since_ns < (uint64_t)AUDIO_QUIET_MS * NSEC_PER_MSEC);
++	out->audio_muted = (sys_audio_muted != 0);
++	out->audio_frames_total = total_frames_ever;
++	out->audio_frames_sound = total_sound_ever;
++	out->audio_peak_pct = last_peak_pct;
++	out->audio_vol_eighth_db = sys_audio_vol_below;
++	lck_mtx_unlock(&rmx_audio_lock);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/rmx1931_battery.c b/bsd/dev/rmx1931_battery.c
+index 5b13720..7ed8ccc 100644
+--- a/bsd/dev/rmx1931_battery.c
++++ b/bsd/dev/rmx1931_battery.c
+@@ -31,6 +31,7 @@
+ #include <pexpert/pexpert.h>
+ #include "sweet_spmi.h"
+ #include "rmx1931_battery.h"
++#include <sweet_diag.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -72,6 +73,8 @@ static int sys_bat_charging = 0;
+ static int sys_bat_external = 0;
+ static int sys_bat_fcc_mah = -1;
+ static int sys_bat_cycles = -1;
++static struct rmx1931_battery_state bq_last_state;
++static uint32_t bq_total_errors;
+ 
+ SYSCTL_NODE(_kern, OID_AUTO, rmx1931, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
+     "Realme X2 Pro (RMX1931) hardware telemetry");
+@@ -406,6 +409,7 @@ bq_thread(void *arg __unused, wait_result_t wr __unused)
+ 		struct rmx1931_battery_state st;
+ 		if (bq_poll_once(&st)) {
+ 			errors = 0;
++			bq_last_state = st;
+ 			sys_bat_soc = (int)st.soc;
+ 			sys_bat_mv = (int)st.voltage_mv;
+ 			sys_bat_pack_mv = (int)st.pack_voltage_mv;
+@@ -428,8 +432,11 @@ bq_thread(void *arg __unused, wait_result_t wr __unused)
+ 				    st.charging, st.full);
+ 			}
+ 			logged++;
+-		} else if ((errors++ % 10u) == 0) {
+-			printf("RMX BATTERY: poll read error (%u)\n", errors);
++		} else {
++			bq_total_errors++;
++			if ((errors++ % 10u) == 0) {
++				printf("RMX BATTERY: poll read error (%u)\n", errors);
++			}
+ 		}
+ 		bq_wait_ms(15000);
+ 	}
+@@ -460,4 +467,26 @@ rmx1931_battery_init(void)
+ 		printf("RMX BATTERY: kernel_thread_start failed\n");
+ 	}
+ }
++
++void
++rmx1931_battery_diag_snapshot(struct sweet_diag_peripherals *out)
++{
++	if (out == NULL) {
++		return;
++	}
++	struct rmx1931_battery_state st = bq_last_state;
++	out->bat_online = st.valid;
++	out->bat_ext = st.external_connected;
++	out->bat_charging = st.charging;
++	out->bat_full = st.full;
++	out->bat_soc = st.soc;
++	out->bat_mv = st.voltage_mv;
++	out->bat_pack_mv = st.pack_voltage_mv;
++	out->bat_ma = st.current_ma;
++	out->bat_temp_deci_c = st.temp_deci_c;
++	out->bat_rem_mah = st.rem_mah;
++	out->bat_fcc_mah = st.fcc_mah;
++	out->bat_cycles = st.cycle_count;
++	out->bat_errors = bq_total_errors;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/rmx1931_haptic.c b/bsd/dev/rmx1931_haptic.c
+index 3b4a2fa..917b496 100644
+--- a/bsd/dev/rmx1931_haptic.c
++++ b/bsd/dev/rmx1931_haptic.c
+@@ -39,6 +39,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
++#include <sweet_diag.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -685,4 +686,15 @@ rmx1931_haptic_init(void)
+ 		printf("RMX HAPTIC: kernel_thread_start failed\n");
+ 	}
+ }
++
++void
++rmx1931_haptic_diag_snapshot(struct sweet_diag_peripherals *out)
++{
++	if (out == NULL) {
++		return;
++	}
++	out->haptic_ready = (aw_gpio != 0 && !aw_broken);
++	out->haptic_events = (uint32_t)sys_haptic_events;
++	out->haptic_faults = aw_broken ? 1u : 0u;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/rmx1931_torch.c b/bsd/dev/rmx1931_torch.c
+index 18882d1..efa4c60 100644
+--- a/bsd/dev/rmx1931_torch.c
++++ b/bsd/dev/rmx1931_torch.c
+@@ -36,6 +36,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
++#include <sweet_diag.h>
+ #include "sweet_spmi.h"
+ #include "rmx1931_battery.h"
+ 
+@@ -496,4 +497,15 @@ rmx1931_torch_init(void)
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++void
++rmx1931_torch_diag_snapshot(struct sweet_diag_peripherals *out)
++{
++	if (out == NULL) {
++		return;
++	}
++	out->torch_ready = (tr_ch != 0 && !tr_broken);
++	out->torch_fault = tr_broken;
++	out->torch_level = (uint32_t)sys_torch_level;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/rmx1931_touch.c b/bsd/dev/rmx1931_touch.c
+index 89481fa..3fe4a3d 100644
+--- a/bsd/dev/rmx1931_touch.c
++++ b/bsd/dev/rmx1931_touch.c
+@@ -29,6 +29,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sweet_diag.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -1025,16 +1026,21 @@ rmx_thread(void *arg, wait_result_t result)
+ 	if (!rmx_rmi_init()) {
+ 		goto out;
+ 	}
++	const char *drv_name = rt.bitbang ? "rmx1931_s3706_gpio_i2c" : "rmx1931_s3706_geni";
++	sweet_touch_driver_record(drv_name, true, 4, 0);
+ 	printf("RMX TOUCH: Synaptics S3706 ready (%ux%u, 10 fingers, poll=4ms/8ms)\n",
+ 	    RMX_PANEL_W, RMX_PANEL_H);
+ 
+ 	unsigned errors = 0, logged_events = 0, ticks = 0;
++	uint64_t total_errors = 0;
+ 	while (!rt.dead) {
+ 		bool irq_low = (rmx_rd(rt.gpio, RMX_GPIO_IO(RMX_PIN_IRQ)) & 1u) == 0;
+ 		bool periodic = (++ticks % 125u) == 0;
+ 		if (irq_low || rt.active || periodic) {
+ 			err = rmx_poll_once(&logged_events);
+ 			if (err) {
++				total_errors++;
++				sweet_touch_driver_record(drv_name, true, 8, total_errors);
+ 				if ((errors++ % 100u) == 0) {
+ 					printf("RMX TOUCH: poll err=%d irq=%#x\n", err, rt.irq_status);
+ 				}
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 82097a3..e7be238 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -13,6 +13,7 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sweet_diag.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_cpufreq_init(void);
+@@ -85,6 +86,7 @@ sweet_cpufreq_init(void)
+ 		__asm__ volatile("dmb oshst" ::: "memory");
+ 		*(volatile uint32_t *)(base + OSM_DESIRED) = best;
+ 		__asm__ volatile("dsb osh" ::: "memory");
++		sweet_cpufreq_record(c, best_khz / 1000);
+ 		printf("SWEET CPUFREQ: %s index %u -> %u (%u MHz), reads back %u\n",
+ 		    osm_clusters[c].name, cur, best, best_khz / 1000, osm_rd(base, OSM_DESIRED));
+ 	}
+diff --git a/bsd/dev/sweet_diag.c b/bsd/dev/sweet_diag.c
+new file mode 100644
+index 0000000..52e4905
+--- /dev/null
++++ b/bsd/dev/sweet_diag.c
+@@ -0,0 +1,757 @@
++/*
++ * Live OS & hardware diagnostic hub for booted iOS bring-up:
++ *   - /dev/sweet-diag (0444): live JSON snapshot of display/FPS/present path,
++ *     Adreno 640 GPU + pool + per-process Metal/Turnip clients, touch/keys,
++ *     Wi-Fi/USB + interface IPs, battery/audio/torch/haptics, exec_inject,
++ *     denied sandbox privileges, and the last 16 userland crash backtraces.
++ *   - /dev/sweet-log  (0444): lossless read/tail access to XNU's 1 MiB
++ *     sweet_log_ring console buffer from userland or SSH.
++ *   - sysctl kern.sweet.*: lightweight live telemetry counters.
++ *   - sweet_diag_format_json(): shared with TCP 2223 "DIAG" in sweet_files.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/socket.h>
++#include <sys/sysctl.h>
++#include <sys/time.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <os/atomic_private.h>
++#include <net/if.h>
++#include <net/kpi_interface.h>
++#include <netinet/in.h>
++#include <stdarg.h>
++#include <sweet_diag.h>
++
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
++
++#define SWEET_DIAG_JSON_CAP     32768u
++#define SWEET_LOG_CHUNK_CAP     16384u
++
++static LCK_GRP_DECLARE(sweet_diag_grp, "sweet-diag");
++static LCK_SPIN_DECLARE(sweet_crash_lock, &sweet_diag_grp);
++
++static uint32_t g_cpufreq_mhz[3];
++static bool     g_wdt_enabled;
++static int32_t  g_wdt_reboot_s;
++static int32_t  g_wdt_elapsed_s;
++
++static char     g_touch_driver[32] = "none";
++static bool     g_touch_ready;
++static uint32_t g_touch_poll_ms;
++static uint64_t g_touch_errors;
++
++static uint64_t g_crash_seq;
++static struct sweet_diag_crash g_crashes[SWEET_DIAG_MAX_CRASHES];
++
++static uint64_t
++sd_uptime_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ULL;
++}
++
++void
++sweet_cpufreq_record(unsigned cluster, unsigned mhz)
++{
++	if (cluster < 3) {
++		g_cpufreq_mhz[cluster] = (uint32_t)mhz;
++	}
++}
++
++void
++sweet_wdt_record(bool enabled, int reboot_s, int elapsed_s)
++{
++	g_wdt_enabled = enabled;
++	g_wdt_reboot_s = (int32_t)reboot_s;
++	g_wdt_elapsed_s = (int32_t)elapsed_s;
++}
++
++void
++sweet_touch_driver_record(const char *driver, bool ready, uint32_t poll_ms, uint64_t errors)
++{
++	if (driver != NULL) {
++		strlcpy(g_touch_driver, driver, sizeof(g_touch_driver));
++	}
++	g_touch_ready = ready;
++	g_touch_poll_ms = poll_ms;
++	g_touch_errors = errors;
++}
++
++void
++sweet_crash_record(const char *name, int pid, int sig, uint64_t code, uint64_t subcode,
++    uint64_t pc, uint64_t lr, uint64_t sp, uint64_t fp, uint64_t far,
++    uint64_t slide, uint64_t mh, const uint64_t *bt, uint32_t bt_count)
++{
++	uint64_t up_ms = sd_uptime_ms();
++
++	lck_spin_lock(&sweet_crash_lock);
++	uint64_t seq = ++g_crash_seq;
++	struct sweet_diag_crash *c = &g_crashes[(seq - 1) % SWEET_DIAG_MAX_CRASHES];
++	bzero(c, sizeof(*c));
++	c->seq = seq;
++	c->uptime_ms = up_ms;
++	c->pid = (int32_t)pid;
++	c->sig = (int32_t)sig;
++	if (name != NULL) {
++		strlcpy(c->name, name, sizeof(c->name));
++	}
++	c->code = code;
++	c->subcode = subcode;
++	c->pc = pc;
++	c->lr = lr;
++	c->sp = sp;
++	c->fp = fp;
++	c->far = far;
++	c->slide = slide;
++	c->mh = mh;
++	if (bt_count > SWEET_DIAG_MAX_BT) {
++		bt_count = SWEET_DIAG_MAX_BT;
++	}
++	c->bt_count = bt_count;
++	for (uint32_t i = 0; i < bt_count; i++) {
++		c->bt[i] = bt[i];
++	}
++	lck_spin_unlock(&sweet_crash_lock);
++}
++
++/* ---- Safe bounded JSON builder ---- */
++
++struct sd_buf {
++	char  *p;
++	size_t len;
++	size_t cap;
++};
++
++static void sd_putf(struct sd_buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
++
++static void
++sd_putf(struct sd_buf *b, const char *fmt, ...)
++{
++	if (b->len + 1 >= b->cap) {
++		return;
++	}
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(b->p + b->len, b->cap - b->len, fmt, ap);
++	va_end(ap);
++	if (n > 0) {
++		size_t adv = (size_t)n;
++		if (b->len + adv >= b->cap) {
++			b->len = b->cap - 1;
++			b->p[b->len] = '\0';
++		} else {
++			b->len += adv;
++		}
++	}
++}
++
++static void
++sd_put_json_str(struct sd_buf *b, const char *s)
++{
++	sd_putf(b, "\"");
++	if (s != NULL) {
++		for (const unsigned char *c = (const unsigned char *)s; *c != 0; c++) {
++			if (*c == '"' || *c == '\\') {
++				sd_putf(b, "\\%c", (int)*c);
++			} else if (*c == '\n') {
++				sd_putf(b, "\\n");
++			} else if (*c == '\r') {
++				sd_putf(b, "\\r");
++			} else if (*c == '\t') {
++				sd_putf(b, "\\t");
++			} else if (*c >= 0x20 && *c < 0x7f) {
++				sd_putf(b, "%c", (int)*c);
++			} else {
++				sd_putf(b, "\\u%04x", (unsigned)*c);
++			}
++		}
++	}
++	sd_putf(b, "\"");
++}
++
++static void
++sd_fourcc_str(uint32_t fmt, char out[12])
++{
++	if (fmt == 0) {
++		strlcpy(out, "none", 12);
++		return;
++	}
++	unsigned char c0 = (unsigned char)((fmt >> 24) & 0xff);
++	unsigned char c1 = (unsigned char)((fmt >> 16) & 0xff);
++	unsigned char c2 = (unsigned char)((fmt >> 8) & 0xff);
++	unsigned char c3 = (unsigned char)(fmt & 0xff);
++	if (c0 >= 0x20 && c0 < 0x7f && c1 >= 0x20 && c1 < 0x7f &&
++	    c2 >= 0x20 && c2 < 0x7f && c3 >= 0x20 && c3 < 0x7f) {
++		out[0] = (char)c0;
++		out[1] = (char)c1;
++		out[2] = (char)c2;
++		out[3] = (char)c3;
++		out[4] = '\0';
++	} else {
++		snprintf(out, 12, "0x%08x", fmt);
++	}
++}
++
++static void
++sd_if_info(const char *ifname, char ip_out[20], bool *up_out, uint64_t *rx_pkts, uint64_t *tx_pkts)
++{
++	ip_out[0] = '\0';
++	*up_out = false;
++	*rx_pkts = 0;
++	*tx_pkts = 0;
++
++	ifnet_t ifp = NULL;
++	if (ifnet_find_by_name(ifname, &ifp) != 0 || ifp == NULL) {
++		return;
++	}
++	u_int16_t flags = ifnet_flags(ifp);
++	*up_out = (flags & IFF_UP) != 0 && (flags & IFF_RUNNING) != 0;
++
++	struct ifnet_stats_param st;
++	bzero(&st, sizeof(st));
++	if (ifnet_stat(ifp, &st) == 0) {
++		*rx_pkts = st.packets_in;
++		*tx_pkts = st.packets_out;
++	}
++
++	ifaddr_t *addrs = NULL;
++	if (ifnet_get_address_list_family(ifp, &addrs, AF_INET) == 0 && addrs != NULL) {
++		for (unsigned i = 0; addrs[i] != NULL; i++) {
++			struct sockaddr_in sin;
++			bzero(&sin, sizeof(sin));
++			if (ifaddr_address(addrs[i], (struct sockaddr *)&sin, sizeof(sin)) == 0 &&
++			    sin.sin_addr.s_addr != 0) {
++				uint32_t a = ntohl(sin.sin_addr.s_addr);
++				snprintf(ip_out, 20, "%u.%u.%u.%u",
++				    (a >> 24) & 0xffu, (a >> 16) & 0xffu,
++				    (a >> 8) & 0xffu, a & 0xffu);
++				break;
++			}
++		}
++		ifnet_free_address_list(addrs);
++	}
++	ifnet_release(ifp);
++}
++
++size_t
++sweet_diag_format_json(char *buf, size_t cap)
++{
++	if (buf == NULL || cap < 64) {
++		return 0;
++	}
++	buf[0] = '\0';
++	struct sd_buf b = { .p = buf, .len = 0, .cap = cap };
++
++	struct sweet_diag_display disp;
++	struct sweet_diag_gpu *gpu = kalloc_data(sizeof(*gpu), Z_WAITOK | Z_ZERO);
++	struct sweet_diag_input inp;
++	struct sweet_diag_net net;
++	struct sweet_diag_peripherals per;
++	struct sweet_diag_priv privs[SWEET_DIAG_MAX_PRIVS];
++	struct sweet_diag_crash *crashes = kalloc_data(sizeof(*crashes) * SWEET_DIAG_MAX_CRASHES, Z_WAITOK | Z_ZERO);
++	char inject_conf[512];
++
++	if (gpu == NULL || crashes == NULL) {
++		if (gpu != NULL) {
++			kfree_data(gpu, sizeof(*gpu));
++		}
++		if (crashes != NULL) {
++			kfree_data(crashes, sizeof(*crashes) * SWEET_DIAG_MAX_CRASHES);
++		}
++		return 0;
++	}
++
++	bzero(&disp, sizeof(disp));
++	bzero(&inp, sizeof(inp));
++	bzero(&net, sizeof(net));
++	bzero(&per, sizeof(per));
++	bzero(privs, sizeof(privs));
++	inject_conf[0] = '\0';
++
++	sweet_fb_diag_snapshot(&disp);
++	sweet_gpu_diag_snapshot(gpu);
++	sweet_accel_diag_snapshot(gpu);
++	sweet_hid_diag_snapshot(&inp);
++	strlcpy(inp.driver, g_touch_driver, sizeof(inp.driver));
++	inp.touch_ready = g_touch_ready;
++	inp.poll_ms = g_touch_poll_ms;
++	inp.touch_errors = g_touch_errors;
++
++	sweet_wlan_diag_snapshot(&net);
++	sweet_usb_diag_snapshot(&net);
++
++	rmx1931_battery_diag_snapshot(&per);
++	rmx1931_audio_diag_snapshot(&per);
++	rmx1931_torch_diag_snapshot(&per);
++	rmx1931_haptic_diag_snapshot(&per);
++
++	uint64_t inject_hits = 0;
++	sweet_exec_inject_diag(inject_conf, sizeof(inject_conf), &inject_hits);
++
++	uint32_t priv_total = 0;
++	uint32_t priv_n = sweet_amfi_priv_diag(privs, SWEET_DIAG_MAX_PRIVS, &priv_total);
++
++	uint64_t crash_total = 0;
++	uint32_t crash_n = 0;
++	lck_spin_lock(&sweet_crash_lock);
++	crash_total = g_crash_seq;
++	uint64_t start_seq = crash_total > SWEET_DIAG_MAX_CRASHES ? crash_total - SWEET_DIAG_MAX_CRASHES + 1 : 1;
++	for (uint64_t s = start_seq; crash_total > 0 && s <= crash_total && crash_n < SWEET_DIAG_MAX_CRASHES; s++) {
++		crashes[crash_n++] = g_crashes[(s - 1) % SWEET_DIAG_MAX_CRASHES];
++	}
++	lck_spin_unlock(&sweet_crash_lock);
++
++	char en0_ip[20], ue0_ip[20];
++	bool en0_up = false, ue0_up = false;
++	uint64_t en0_rx = 0, en0_tx = 0, ue0_rx = 0, ue0_tx = 0;
++	sd_if_info("en0", en0_ip, &en0_up, &en0_rx, &en0_tx);
++	sd_if_info("ue0", ue0_ip, &ue0_up, &ue0_rx, &ue0_tx);
++
++	struct timeval tv;
++	microtime(&tv);
++	uint64_t up_ms = sd_uptime_ms();
++	int32_t rem_s = (g_wdt_enabled && g_wdt_reboot_s > 0) ?
++	    (g_wdt_reboot_s > g_wdt_elapsed_s ? g_wdt_reboot_s - g_wdt_elapsed_s : 0) : -1;
++
++	const char *present_mode = "no_swaps";
++	if (!disp.power_on) {
++		present_mode = "power_off";
++	} else if (disp.presents_total > 0) {
++		if (disp.last_present_gpu) {
++			present_mode = disp.direct_present ? "gpu_direct" : "gpu_vsync";
++		} else {
++			present_mode = "cpu_fallback";
++		}
++	}
++
++	char fourcc[12];
++	sd_fourcc_str(disp.last_surf_fmt, fourcc);
++
++	sd_putf(&b, "{\n");
++	sd_putf(&b, "  \"schema\": 1,\n");
++	sd_putf(&b, "  \"system\": {\n");
++	sd_putf(&b, "    \"uptime_ms\": %llu,\n", (unsigned long long)up_ms);
++	sd_putf(&b, "    \"wall_time_sec\": %lld,\n", (long long)tv.tv_sec);
++	sd_putf(&b, "    \"boottime_sec\": %lld,\n", (long long)boottime_sec());
++	sd_putf(&b, "    \"cpus_online\": %u,\n", ml_get_cpu_count());
++	sd_putf(&b, "    \"cpufreq_mhz\": [%u, %u, %u],\n",
++	    g_cpufreq_mhz[0], g_cpufreq_mhz[1], g_cpufreq_mhz[2]);
++	sd_putf(&b, "    \"wdt_enabled\": %s,\n", g_wdt_enabled ? "true" : "false");
++	sd_putf(&b, "    \"flamereboot_s\": %d,\n", g_wdt_reboot_s);
++	sd_putf(&b, "    \"reboot_remaining_s\": %d,\n", rem_s);
++	sd_putf(&b, "    \"klog_bytes_total\": %llu,\n", (unsigned long long)sweet_log_position());
++	sd_putf(&b, "    \"boot_args\": ");
++	sd_put_json_str(&b, PE_boot_args());
++	sd_putf(&b, "\n  },\n");
++
++	/* Display & Framebuffer */
++	uint32_t bri_pct = disp.backlight_registered ? (disp.raw_level * 100u + 1023u) / 2047u : 100u;
++	sd_putf(&b, "  \"display\": {\n");
++	sd_putf(&b, "    \"registered\": %s,\n", disp.registered ? "true" : "false");
++	sd_putf(&b, "    \"power_on\": %s,\n", disp.power_on ? "true" : "false");
++	sd_putf(&b, "    \"present_mode\": \"%s\",\n", present_mode);
++	sd_putf(&b, "    \"direct_present\": %s,\n", disp.direct_present ? "true" : "false");
++	sd_putf(&b, "    \"force_cpu\": %s,\n", disp.force_cpu ? "true" : "false");
++	sd_putf(&b, "    \"gpu_present_active\": %s,\n", disp.last_present_gpu ? "true" : "false");
++	sd_putf(&b, "    \"panel_pa\": \"0x%llx\",\n", (unsigned long long)disp.panel_pa);
++	sd_putf(&b, "    \"panel_w\": %u, \"panel_h\": %u, \"panel_stride\": %u,\n",
++	    disp.panel_w, disp.panel_h, disp.panel_stride);
++	sd_putf(&b, "    \"logical_w\": %u, \"logical_h\": %u,\n", disp.logical_w, disp.logical_h);
++	sd_putf(&b, "    \"fit_rect\": [%d, %d, %d, %d],\n",
++	    disp.fit_x, disp.fit_y, disp.fit_w, disp.fit_h);
++	sd_putf(&b, "    \"corner_radius\": %u, \"corner_ext\": %u,\n",
++	    disp.corner_radius, disp.corner_ext);
++	sd_putf(&b, "    \"vsync_hz\": %u, \"vsync_count\": %llu,\n",
++	    disp.vsync_hz, (unsigned long long)disp.vsync_count);
++	sd_putf(&b, "    \"fps_1s\": %u.%u, \"fps_5s\": %u.%u,\n",
++	    disp.fps_1s_x10 / 10u, disp.fps_1s_x10 % 10u,
++	    disp.fps_5s_x10 / 10u, disp.fps_5s_x10 % 10u);
++	sd_putf(&b, "    \"swaps_total\": %llu, \"presents_total\": %llu,\n",
++	    (unsigned long long)disp.swaps_total, (unsigned long long)disp.presents_total);
++	sd_putf(&b, "    \"gpu_presents\": %llu, \"cpu_presents\": %llu,\n",
++	    (unsigned long long)disp.gpu_presents, (unsigned long long)disp.cpu_presents);
++	sd_putf(&b, "    \"avg_present_us\": %llu,\n", (unsigned long long)disp.avg_present_us);
++	sd_putf(&b, "    \"clients_count\": %u,\n", disp.clients_count);
++	sd_putf(&b, "    \"last_swap\": {\n");
++	sd_putf(&b, "      \"surface_id\": %u, \"w\": %u, \"h\": %u, \"bpr\": %u,\n",
++	    disp.last_surf_id, disp.last_surf_w, disp.last_surf_h, disp.last_surf_bpr);
++	sd_putf(&b, "      \"fourcc\": ");
++	sd_put_json_str(&b, fourcc);
++	sd_putf(&b, ", \"layer_mask\": %u, \"age_ms\": %llu\n",
++	    disp.last_layer_mask, (unsigned long long)disp.last_swap_age_ms);
++	sd_putf(&b, "    },\n");
++	sd_putf(&b, "    \"gpu_fallback_mask\": %u, \"gpu_fallback_count\": %llu, \"last_fallback_reason\": ",
++	    disp.gpu_fallback_mask, (unsigned long long)disp.gpu_fallback_count);
++	sd_put_json_str(&b, disp.last_fallback_reason);
++	sd_putf(&b, ",\n");
++	sd_putf(&b, "    \"backlight\": {\n");
++	sd_putf(&b, "      \"registered\": %s, \"millinits\": %u, \"raw_level\": %u, \"brightness_pct\": %u, \"dim_alpha\": %u\n",
++	    disp.backlight_registered ? "true" : "false", disp.millinits,
++	    disp.raw_level, bri_pct, disp.dim_alpha);
++	sd_putf(&b, "    }\n");
++	sd_putf(&b, "  },\n");
++
++	/* GPU & Metal Clients */
++	uint64_t pool_free = gpu->pool_total_bytes > gpu->pool_used_bytes ?
++	    gpu->pool_total_bytes - gpu->pool_used_bytes : 0;
++	uint32_t live_busy_pct = gpu->win_age_ms <= 6000ULL ? gpu->win_busy_pct : 0;
++	sd_putf(&b, "  \"gpu\": {\n");
++	sd_putf(&b, "    \"enabled\": %s, \"ready\": %s, \"ddr_boost\": %s,\n",
++	    gpu->enabled ? "true" : "false", gpu->ready ? "true" : "false",
++	    gpu->ddr_boost ? "true" : "false");
++	sd_putf(&b, "    \"perf_level\": %u, \"clock_mhz\": %u, \"recoveries\": %llu,\n",
++	    gpu->perf_level, gpu->clock_mhz, (unsigned long long)gpu->recoveries);
++	sd_putf(&b, "    \"fence_submitted\": %u, \"fence_done\": %u,\n",
++	    gpu->fence_submitted, gpu->fence_done);
++	sd_putf(&b, "    \"present_frames\": %llu, \"clean_us\": %llu, \"blit_us\": %llu,\n",
++	    (unsigned long long)gpu->present_frames, (unsigned long long)gpu->clean_us,
++	    (unsigned long long)gpu->blit_us);
++	sd_putf(&b, "    \"pool_total_mb\": %llu, \"pool_used_mb\": %llu, \"pool_free_mb\": %llu, \"pool_peak_mb\": %llu,\n",
++	    (unsigned long long)(gpu->pool_total_bytes >> 20),
++	    (unsigned long long)(gpu->pool_used_bytes >> 20),
++	    (unsigned long long)(pool_free >> 20),
++	    (unsigned long long)(gpu->pool_peak_bytes >> 20));
++	sd_putf(&b, "    \"pool_cap_mb\": %u, \"pool_reserve_mb\": %u, \"pool_alloc_failures\": %llu,\n",
++	    gpu->cap_mb, gpu->reserve_mb, (unsigned long long)gpu->pool_alloc_failures);
++	sd_putf(&b, "    \"busy_pct_live\": %u, \"window_age_ms\": %llu,\n",
++	    live_busy_pct, (unsigned long long)gpu->win_age_ms);
++	sd_putf(&b, "    \"window_5s\": {\n");
++	sd_putf(&b, "      \"submits\": %u, \"missed\": %u, \"busy_ms\": %llu, \"busy_pct\": %u,\n",
++	    gpu->win_submits, gpu->win_missed, (unsigned long long)gpu->win_busy_ms, gpu->win_busy_pct);
++	sd_putf(&b, "      \"mean_us\": %llu, \"longest_us\": %llu\n",
++	    (unsigned long long)gpu->win_mean_us, (unsigned long long)gpu->win_longest_us);
++	sd_putf(&b, "    },\n");
++	sd_putf(&b, "    \"owners_5s\": [");
++	for (uint32_t i = 0; i < gpu->owner_count; i++) {
++		const struct sweet_diag_gpu_owner *o = &gpu->owners[i];
++		sd_putf(&b, "%s{\"pid\": %d, \"name\": ", i ? ", " : "", o->pid);
++		sd_put_json_str(&b, o->name);
++		sd_putf(&b, ", \"submits\": %u, \"busy_ms\": %llu}",
++		    o->submits, (unsigned long long)o->busy_ms);
++	}
++	sd_putf(&b, "],\n");
++	sd_putf(&b, "    \"clients\": [");
++	for (uint32_t i = 0; i < gpu->client_count; i++) {
++		const struct sweet_diag_gpu_client *c = &gpu->clients[i];
++		sd_putf(&b, "%s\n      {\"pid\": %d, \"name\": ", i ? "," : "", c->pid);
++		sd_put_json_str(&b, c->name);
++		sd_putf(&b, ", \"abi\": \"%s\", \"system\": %s, \"cap_refused\": %s, "
++		    "\"pool_kb\": %llu, \"pool_peak_kb\": %llu, \"submits\": %llu, \"faults\": %llu}",
++		    c->v2 ? "v2_turnip" : "v1",
++		    c->system ? "true" : "false",
++		    c->cap_refused ? "true" : "false",
++		    (unsigned long long)(c->pool_bytes >> 10),
++		    (unsigned long long)(c->pool_peak >> 10),
++		    (unsigned long long)c->submits,
++		    (unsigned long long)c->faults);
++	}
++	sd_putf(&b, "%s]\n  },\n", gpu->client_count ? "\n    " : "");
++
++	/* Input */
++	sd_putf(&b, "  \"input\": {\n");
++	sd_putf(&b, "    \"touch_driver\": ");
++	sd_put_json_str(&b, inp.driver);
++	sd_putf(&b, ",\n    \"touch_ready\": %s, \"poll_ms\": %u, \"touch_errors\": %llu,\n",
++	    inp.touch_ready ? "true" : "false", inp.poll_ms, (unsigned long long)inp.touch_errors);
++	sd_putf(&b, "    \"touch_events\": %llu, \"fingers_mask\": %u, \"last_x\": %d, \"last_y\": %d, \"last_touch_age_ms\": %llu,\n",
++	    (unsigned long long)inp.touch_events, inp.fingers_mask, inp.last_x, inp.last_y,
++	    (unsigned long long)inp.last_touch_age_ms);
++	sd_putf(&b, "    \"button_events\": %llu, \"buttons_mask\": %u\n",
++	    (unsigned long long)inp.button_events, inp.buttons_mask);
++	sd_putf(&b, "  },\n");
++
++	/* Network & USB */
++	char mac_s[20], bssid_s[20];
++	snprintf(mac_s, sizeof(mac_s), "%02x:%02x:%02x:%02x:%02x:%02x",
++	    net.wlan_mac[0], net.wlan_mac[1], net.wlan_mac[2],
++	    net.wlan_mac[3], net.wlan_mac[4], net.wlan_mac[5]);
++	snprintf(bssid_s, sizeof(bssid_s), "%02x:%02x:%02x:%02x:%02x:%02x",
++	    net.wlan_bssid[0], net.wlan_bssid[1], net.wlan_bssid[2],
++	    net.wlan_bssid[3], net.wlan_bssid[4], net.wlan_bssid[5]);
++	sd_putf(&b, "  \"network\": {\n");
++	sd_putf(&b, "    \"wifi\": {\n");
++	sd_putf(&b, "      \"wland_open\": %s, \"radio_ready\": %s, \"link_up\": %s,\n",
++	    net.wland_open ? "true" : "false", net.wlan_ready ? "true" : "false",
++	    net.wlan_link_up ? "true" : "false");
++	sd_putf(&b, "      \"en0_up\": %s, \"en0_ip\": ", en0_up ? "true" : "false");
++	sd_put_json_str(&b, en0_ip);
++	sd_putf(&b, ", \"en0_rx_pkts\": %llu, \"en0_tx_pkts\": %llu,\n",
++	    (unsigned long long)en0_rx, (unsigned long long)en0_tx);
++	sd_putf(&b, "      \"mac\": \"%s\", \"ssid\": ", mac_s);
++	sd_put_json_str(&b, net.wlan_ssid);
++	sd_putf(&b, ", \"bssid\": \"%s\",\n", bssid_s);
++	sd_putf(&b, "      \"freq_mhz\": %u, \"rssi_dbm\": %d, \"bss_heard\": %u, \"tx_dropped\": %llu\n",
++	    (unsigned)net.wlan_freq_mhz, (int)net.wlan_rssi_dbm, net.wlan_bss_count,
++	    (unsigned long long)net.wlan_tx_dropped);
++	sd_putf(&b, "    },\n");
++	sd_putf(&b, "    \"usb\": {\n");
++	sd_putf(&b, "      \"ready\": %s, \"configured\": %s, \"ue0_up\": %s, \"ue0_ip\": ",
++	    net.usb_ready ? "true" : "false", net.usb_configured ? "true" : "false",
++	    ue0_up ? "true" : "false");
++	sd_put_json_str(&b, ue0_ip);
++	sd_putf(&b, ",\n      \"rx_frames\": %llu, \"tx_frames\": %llu, \"files_port\": 2223, \"cmd_port\": 5141\n",
++	    (unsigned long long)net.usb_rx_frames, (unsigned long long)net.usb_tx_frames);
++	sd_putf(&b, "    }\n");
++	sd_putf(&b, "  },\n");
++
++	/* Peripherals */
++	uint64_t aud_ms = (per.audio_frames_total * 1000ULL) / 48000ULL;
++	uint64_t aud_snd_ms = (per.audio_frames_sound * 1000ULL) / 48000ULL;
++	sd_putf(&b, "  \"peripherals\": {\n");
++	sd_putf(&b, "    \"battery\": {\n");
++	sd_putf(&b, "      \"gauge_online\": %s, \"soc_pct\": %u, \"voltage_mv\": %u, \"pack_voltage_mv\": %u,\n",
++	    per.bat_online ? "true" : "false", per.bat_soc, per.bat_mv, per.bat_pack_mv);
++	sd_putf(&b, "      \"current_ma\": %d, \"temp_deci_c\": %d, \"external\": %s, \"charging\": %s, \"full\": %s,\n",
++	    per.bat_ma, per.bat_temp_deci_c, per.bat_ext ? "true" : "false",
++	    per.bat_charging ? "true" : "false", per.bat_full ? "true" : "false");
++	sd_putf(&b, "      \"rem_mah\": %u, \"fcc_mah\": %u, \"cycles\": %u, \"i2c_errors\": %u\n",
++	    per.bat_rem_mah, per.bat_fcc_mah, per.bat_cycles, per.bat_errors);
++	sd_putf(&b, "    },\n");
++	sd_putf(&b, "    \"audio\": {\n");
++	sd_putf(&b, "      \"ready\": %s, \"streaming_now\": %s, \"muted\": %s,\n",
++	    per.audio_ready ? "true" : "false", per.audio_active ? "true" : "false",
++	    per.audio_muted ? "true" : "false");
++	sd_putf(&b, "      \"written_ms\": %llu, \"nonsilent_ms\": %llu, \"peak_pct\": %u, \"atten_eighth_db\": %d\n",
++	    (unsigned long long)aud_ms, (unsigned long long)aud_snd_ms,
++	    per.audio_peak_pct, per.audio_vol_eighth_db);
++	sd_putf(&b, "    },\n");
++	sd_putf(&b, "    \"torch\": {\"ready\": %s, \"fault\": %s, \"level\": %u},\n",
++	    per.torch_ready ? "true" : "false", per.torch_fault ? "true" : "false", per.torch_level);
++	sd_putf(&b, "    \"haptic\": {\"ready\": %s, \"activations\": %u, \"faults\": %u}\n",
++	    per.haptic_ready ? "true" : "false", per.haptic_events, per.haptic_faults);
++	sd_putf(&b, "  },\n");
++
++	/* Runtime: exec_inject, sandbox denied privileges, recent userland crashes */
++	sd_putf(&b, "  \"runtime\": {\n");
++	sd_putf(&b, "    \"exec_inject\": ");
++	sd_put_json_str(&b, inject_conf);
++	sd_putf(&b, ",\n    \"exec_inject_hits\": %llu,\n", (unsigned long long)inject_hits);
++	sd_putf(&b, "    \"sandbox_denied_total\": %u,\n", priv_total);
++	sd_putf(&b, "    \"sandbox_denied\": [");
++	for (uint32_t i = 0; i < priv_n; i++) {
++		sd_putf(&b, "%s{\"priv\": %d, \"proc\": ", i ? ", " : "", privs[i].priv);
++		sd_put_json_str(&b, privs[i].name);
++		sd_putf(&b, "}");
++	}
++	sd_putf(&b, "],\n");
++	sd_putf(&b, "    \"crashes_total\": %llu,\n", (unsigned long long)crash_total);
++	sd_putf(&b, "    \"recent_crashes\": [");
++	for (uint32_t i = 0; i < crash_n; i++) {
++		const struct sweet_diag_crash *c = &crashes[i];
++		sd_putf(&b, "%s\n      {\"seq\": %llu, \"uptime_ms\": %llu, \"pid\": %d, \"sig\": %d, \"name\": ",
++		    i ? "," : "", (unsigned long long)c->seq, (unsigned long long)c->uptime_ms,
++		    c->pid, c->sig);
++		sd_put_json_str(&b, c->name);
++		sd_putf(&b, ", \"code\": \"0x%llx\", \"subcode\": \"0x%llx\", "
++		    "\"pc\": \"0x%llx\", \"lr\": \"0x%llx\", \"sp\": \"0x%llx\", "
++		    "\"fp\": \"0x%llx\", \"far\": \"0x%llx\", \"slide\": \"0x%llx\", "
++		    "\"mh\": \"0x%llx\", \"bt\": [",
++		    (unsigned long long)c->code, (unsigned long long)c->subcode,
++		    (unsigned long long)c->pc, (unsigned long long)c->lr,
++		    (unsigned long long)c->sp, (unsigned long long)c->fp,
++		    (unsigned long long)c->far, (unsigned long long)c->slide,
++		    (unsigned long long)c->mh);
++		for (uint32_t j = 0; j < c->bt_count; j++) {
++			sd_putf(&b, "%s\"0x%llx\"", j ? ", " : "", (unsigned long long)c->bt[j]);
++		}
++		sd_putf(&b, "]}");
++	}
++	sd_putf(&b, "%s]\n  }\n}\n", crash_n ? "\n    " : "");
++
++	kfree_data(gpu, sizeof(*gpu));
++	kfree_data(crashes, sizeof(*crashes) * SWEET_DIAG_MAX_CRASHES);
++	return b.len;
++}
++
++/* ---- /dev/sweet-diag and /dev/sweet-log character devices ---- */
++
++static int
++sd_dev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++sd_diag_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	off_t off = uio_offset(uio);
++	if (off < 0 || (size_t)off >= SWEET_DIAG_JSON_CAP || uio_resid(uio) <= 0) {
++		return 0;
++	}
++	char *buf = kalloc_data(SWEET_DIAG_JSON_CAP, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	size_t len = sweet_diag_format_json(buf, SWEET_DIAG_JSON_CAP);
++	int err = 0;
++	if ((size_t)off < len) {
++		size_t avail = len - (size_t)off;
++		user_ssize_t want = uio_resid(uio);
++		size_t n = (size_t)want < avail ? (size_t)want : avail;
++		err = uiomove(buf + off, (int)n, uio);
++	}
++	kfree_data(buf, SWEET_DIAG_JSON_CAP);
++	return err;
++}
++
++static int
++sd_log_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	off_t raw_off = uio_offset(uio);
++	if (raw_off < 0 || uio_resid(uio) <= 0) {
++		return 0;
++	}
++	uint64_t total = sweet_log_position();
++	uint64_t pos = (uint64_t)raw_off;
++	if (pos >= total) {
++		return 0;
++	}
++	char *chunk = kalloc_data(SWEET_LOG_CHUNK_CAP, Z_WAITOK);
++	if (chunk == NULL) {
++		return ENOMEM;
++	}
++	int err = 0;
++	while (uio_resid(uio) > 0 && pos < total) {
++		user_ssize_t resid = uio_resid(uio);
++		uint32_t ask = (uint32_t)(resid < (user_ssize_t)SWEET_LOG_CHUNK_CAP ? resid : (user_ssize_t)SWEET_LOG_CHUNK_CAP);
++		uint64_t p = pos;
++		uint32_t got = sweet_log_copy(&p, chunk, ask);
++		if (got == 0) {
++			break;
++		}
++		/* If the ring wrapped ahead of raw_off, sync uio_offset before uiomove advances it. */
++		uio_setoffset(uio, (off_t)(p - got));
++		err = uiomove(chunk, (int)got, uio);
++		pos = p;
++		if (err != 0) {
++			break;
++		}
++	}
++	kfree_data(chunk, SWEET_LOG_CHUNK_CAP);
++	return err;
++}
++
++static const struct cdevsw sweet_diag_cdevsw = {
++	.d_open       = sd_dev_open,
++	.d_close      = sd_dev_open,
++	.d_read       = sd_diag_read,
++	.d_write      = eno_rdwrt,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++static const struct cdevsw sweet_log_cdevsw = {
++	.d_open       = sd_dev_open,
++	.d_close      = sd_dev_open,
++	.d_read       = sd_log_read,
++	.d_write      = eno_rdwrt,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++/* ---- sysctl kern.sweet.* ---- */
++
++SYSCTL_NODE(_kern, OID_AUTO, sweet, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
++    "Live SWEET/iOS bring-up telemetry");
++
++static int
++sysctl_sweet_log_pos SYSCTL_HANDLER_ARGS
++{
++	#pragma unused(oidp, arg1, arg2)
++	uint64_t v = sweet_log_position();
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_kern_sweet, OID_AUTO, log_pos, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_log_pos, "Q", "Total console bytes written to sweet_log_ring");
++
++static int
++sysctl_sweet_fps_1s SYSCTL_HANDLER_ARGS
++{
++	#pragma unused(oidp, arg1, arg2)
++	struct sweet_diag_display d;
++	bzero(&d, sizeof(d));
++	sweet_fb_diag_snapshot(&d);
++	int v = (int)d.fps_1s_x10;
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_kern_sweet, OID_AUTO, fps_1s_x10, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_fps_1s, "I", "Rolling 1-second display swap FPS * 10");
++
++static int
++sysctl_sweet_gpu_busy SYSCTL_HANDLER_ARGS
++{
++	#pragma unused(oidp, arg1, arg2)
++	struct sweet_diag_gpu *g = kalloc_data(sizeof(*g), Z_WAITOK | Z_ZERO);
++	int v = 0;
++	if (g != NULL) {
++		sweet_gpu_diag_snapshot(g);
++		v = g->win_age_ms <= 6000ULL ? (int)g->win_busy_pct : 0;
++		kfree_data(g, sizeof(*g));
++	}
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_kern_sweet, OID_AUTO, gpu_busy_pct, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_gpu_busy, "I", "Adreno 640 GPU busy percentage");
++
++static int
++sysctl_sweet_crashes SYSCTL_HANDLER_ARGS
++{
++	#pragma unused(oidp, arg1, arg2)
++	uint64_t v = 0;
++	lck_spin_lock(&sweet_crash_lock);
++	v = g_crash_seq;
++	lck_spin_unlock(&sweet_crash_lock);
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_kern_sweet, OID_AUTO, crashes, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_crashes, "Q", "Total userland fatal signal crashes since boot");
++
++void
++sweet_diag_init(void)
++{
++	static int started = 0;
++	if (!os_atomic_cmpxchg(&started, 0, 1, relaxed)) {
++		return;
++	}
++	int maj_d = cdevsw_add(-1, &sweet_diag_cdevsw);
++	if (maj_d >= 0) {
++		(void)devfs_make_node(makedev(maj_d, 0), DEVFS_CHAR, UID_ROOT,
++		    GID_WHEEL, 0444, "sweet-diag");
++	}
++	int maj_l = cdevsw_add(-1, &sweet_log_cdevsw);
++	if (maj_l >= 0) {
++		(void)devfs_make_node(makedev(maj_l, 0), DEVFS_CHAR, UID_ROOT,
++		    GID_WHEEL, 0444, "sweet-log");
++	}
++	printf("SWEET DIAG: /dev/sweet-diag and /dev/sweet-log ready (majors %d, %d)\n", maj_d, maj_l);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+index dedded7..59669ba 100644
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -29,9 +29,17 @@
+ #include <sys/socket.h>
+ #include <sys/uio.h>
+ #include <netinet/in.h>
++#include <kern/kalloc.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <libkern/libkern.h>
++#include <os/atomic_private.h>
++#include <sweet_diag.h>
++
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
++struct sync_args;
++extern int sync(proc_t p, struct sync_args *uap, int32_t *retval);
+ 
+ extern int sweet_vfs_mkdir(const char *path, int mode);
+ extern int sweet_vfs_symlink(const char *target, const char *link);
+@@ -263,6 +271,96 @@ sf_read(socket_t so, const char *path, uint64_t off, uint64_t len)
+ 	return err;
+ }
+ 
++#define SF_DIAG_CAP     32768u
++#define SF_KLOG_MAX     262144u
++
++static void
++sf_diag(socket_t so)
++{
++	char *buf = kalloc_data(SF_DIAG_CAP, Z_WAITOK);
++	if (buf == NULL) {
++		sf_reply(so, ENOMEM, 0, false);
++		return;
++	}
++	size_t len = sweet_diag_format_json(buf, SF_DIAG_CAP);
++	sf_reply(so, 0, (uint64_t)len, true);
++	if (len > 0) {
++		(void)sf_send(so, buf, len);
++	}
++	kfree_data(buf, SF_DIAG_CAP);
++}
++
++static void
++sf_klog(socket_t so, uint64_t pos, uint64_t max_len)
++{
++	if (max_len == 0 || max_len > SF_KLOG_MAX) {
++		max_len = SF_KLOG_MAX;
++	}
++	uint64_t total = sweet_log_position();
++	if (pos >= total) {
++		char hdr[64];
++		int hlen = snprintf(hdr, sizeof(hdr), "OK %llu 0\n", (unsigned long long)total);
++		(void)sf_send(so, hdr, (size_t)hlen);
++		return;
++	}
++	uint32_t cap = (uint32_t)max_len;
++	char *buf = kalloc_data(cap, Z_WAITOK);
++	if (buf == NULL) {
++		sf_reply(so, ENOMEM, 0, false);
++		return;
++	}
++	uint64_t cursor = pos;
++	uint32_t got = sweet_log_copy(&cursor, buf, cap);
++	char hdr[64];
++	int hlen = snprintf(hdr, sizeof(hdr), "OK %llu %u\n", (unsigned long long)cursor, got);
++	if (sf_send(so, hdr, (size_t)hlen) == 0 && got > 0) {
++		(void)sf_send(so, buf, got);
++	}
++	kfree_data(buf, cap);
++}
++
++static void
++sf_cmd(socket_t so, const char *cmd)
++{
++	while (*cmd == ' ') {
++		cmd++;
++	}
++	size_t clen = strlen(cmd);
++	if (clen == 0) {
++		sf_reply(so, EINVAL, 0, false);
++		return;
++	}
++	if (strncmp(cmd, "reboot", 6) == 0 && (cmd[6] == '\0' || cmd[6] == ' ')) {
++		int32_t rv = 0;
++		(void)sync(kernproc, NULL, &rv);
++		const char *msg = "SWEET CMD: synced; rebooting via PSCI SYSTEM_RESET\n";
++		size_t mlen = strlen(msg);
++		sf_reply(so, 0, (uint64_t)mlen, true);
++		(void)sf_send(so, msg, mlen);
++		(void)sock_shutdown(so, SHUT_WR);
++		sf_sleep_ms(800);
++		printf("SWEET CMD: rebooting (PSCI SYSTEM_RESET)\n");
++		sf_sleep_ms(300);
++		register uint64_t x0 __asm__("x0") = 0x84000009ULL;
++		__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++		return;
++	}
++	uint64_t p0 = sweet_log_position();
++	sweet_usb_run_cmd(cmd, clen, false);
++	uint32_t cap = 16384u;
++	char *out = kalloc_data(cap, Z_WAITOK);
++	if (out == NULL) {
++		sf_reply(so, ENOMEM, 0, false);
++		return;
++	}
++	uint32_t got = sweet_log_copy(&p0, out, cap);
++	sf_reply(so, 0, (uint64_t)got, true);
++	if (got > 0) {
++		(void)sf_send(so, out, got);
++	}
++	kfree_data(out, cap);
++}
++
+ static void
+ sf_handle(socket_t so)
+ {
+@@ -274,6 +372,24 @@ sf_handle(socket_t so)
+ 		return;
+ 	}
+ 	a[0] = b[0] = 0;
++	if (!strcmp(line, "DIAG")) {
++		sf_diag(so);
++		return;
++	}
++	if (!strncmp(line, "KLOG", 4) && (line[4] == '\0' || line[4] == ' ')) {
++		char *p = line + 4;
++		unsigned long long off = 0, mx = 65536ULL;
++		if (*p == ' ') {
++			off = strtoul(p + 1, &p, 10);   /* 64-bit unsigned long on arm64 */
++			mx = sf_dec(p);
++		}
++		sf_klog(so, (uint64_t)off, (uint64_t)mx);
++		return;
++	}
++	if (!strncmp(line, "CMD ", 4)) {
++		sf_cmd(so, line + 4);
++		return;
++	}
+ 	if (!strncmp(line, "PUT ", 4)) {
+ 		unsigned mode = 0644;
+ 		char *p = line + 4, *sp = strchr(p, ' ');
+@@ -376,7 +492,11 @@ sf_thread(void *arg __unused, wait_result_t wr __unused)
+ void
+ sweet_files_start(void)
+ {
++	static int sf_started = 0;
+ 	thread_t thread;
++	if (!os_atomic_cmpxchg(&sf_started, 0, 1, relaxed)) {
++		return;
++	}
+ 	if (kernel_thread_start(sf_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 7ee003e..6cae525 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -20,6 +20,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sweet_diag.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -538,7 +539,9 @@ fts_thread(void *arg, wait_result_t result)
+ 	if (err) {
+ 		goto out;
+ 	}
++	sweet_touch_driver_record("flame_fts_spi", true, 8, 0);
+ 	unsigned errors = 0, events = 0, ticks = 0;
++	uint64_t total_errors = 0;
+ 	while (!ft.dead) {
+ 		uint8_t ev[8];
+ 		/* The IRQ line (active low) says the FIFO holds events; also read
+@@ -547,6 +550,8 @@ fts_thread(void *arg, wait_result_t result)
+ 		while ((poll || !(fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u)) && !ft.dead) {
+ 			poll = false;
+ 			if (fts_event(ev)) {
++				total_errors++;
++				sweet_touch_driver_record("flame_fts_spi", true, 8, total_errors);
+ 				if ((errors++ % 100u) == 0) {
+ 					printf("SWEET FTS: read error (%u)\n", errors);
+ 				}
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index cdb1adc..de4c033 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -31,6 +31,7 @@
+ #include <libkern/libkern.h>
+ #include <mach/mach_time.h>
+ #include "sweet_a6xx.h"
++#include <sweet_diag.h>
+ #include "../../iokit/Kernel/arm/SweetDisplayMask.h"
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -66,6 +67,8 @@ static vm_offset_t pool_kva;
+ static vm_offset_t pt_kva;
+ static uint64_t pt_pa;
+ static volatile bool gpu_ready;
++static bool gpu_enabled_arg;
++static bool gpu_ddr_arg = true;
+ static LCK_GRP_DECLARE(sweet_gpu_grp, "sweet_gpu");
+ static LCK_MTX_DECLARE(sweet_gpu_lock, &sweet_gpu_grp);
+ 
+@@ -242,6 +245,7 @@ gpu_bus_vote(void)
+ {
+ 	uint32_t on = 1;
+ 	PE_parse_boot_argn("sweetddr", &on, sizeof(on));
++	gpu_ddr_arg = (on != 0);
+ 	if (!on) {
+ 		return;
+ 	}
+@@ -277,6 +281,7 @@ sweet_gpu_init(void)
+ {
+ 	uint32_t on = 0;
+ 	PE_parse_boot_argn("sweetgpu", &on, sizeof(on));
++	gpu_enabled_arg = (on != 0);
+ 	if (!on) {
+ 		return;
+ 	}
+@@ -338,6 +343,11 @@ static int gstat_pid[A6_TS_SLOTS];
+ static struct { int pid; uint32_t n; uint64_t busy; } gstat_own[GSTAT_OWNERS + 1];     /* last: everyone else */
+ static uint32_t gstat_n, gstat_missed;
+ static uint64_t gstat_busy, gstat_longest;
++static uint64_t gstat_last_abs;
++static uint32_t gstat_last_n, gstat_last_missed, gstat_last_pct;
++static uint64_t gstat_last_busy_ms, gstat_last_longest_us, gstat_last_mean_us;
++static uint32_t gstat_last_owner_count;
++static struct sweet_diag_gpu_owner gstat_last_owners[SWEET_DIAG_MAX_OWNERS];
+ 
+ static void
+ gpu_owner_locked(uint32_t fence, int pid)
+@@ -377,17 +387,34 @@ gpu_stats_locked(void)
+ 	if (ns < 5000000000ULL) {
+ 		return;
+ 	}
++	gstat_last_abs = now;
++	gstat_last_n = gstat_n;
++	gstat_last_missed = gstat_missed;
++	gstat_last_busy_ms = gstat_busy / 19200ULL;
++	gstat_last_pct = (ns >= 1000000ULL) ? (uint32_t)(gstat_busy * 100ULL / 19200ULL / (ns / 1000000ULL)) : 0;
++	gstat_last_longest_us = gstat_longest * 10ULL / 192ULL;
++	gstat_last_mean_us = gstat_n ? (gstat_busy * 10ULL / 192ULL / gstat_n) : 0;
++	gstat_last_owner_count = 0;
+ 	if (gstat_n) {
+ 		char who[160] = "", name[24];
+ 		size_t w = 0;
+-		for (int o = 0; o <= GSTAT_OWNERS && gstat_own[o].n && w < sizeof(who) - 40; o++) {
++		for (int o = 0; o <= GSTAT_OWNERS && gstat_own[o].n; o++) {
+ 			if (gstat_own[o].pid > 0) {
+ 				proc_name(gstat_own[o].pid, name, sizeof(name));
+ 			} else {
+ 				strlcpy(name, gstat_own[o].pid == 0 ? "present" : "others", sizeof(name));
+ 			}
+-			w += snprintf(who + w, sizeof(who) - w, " %s %u/%llums", name, gstat_own[o].n,
+-			    gstat_own[o].busy / 19200);
++			if (gstat_last_owner_count < SWEET_DIAG_MAX_OWNERS) {
++				struct sweet_diag_gpu_owner *dst = &gstat_last_owners[gstat_last_owner_count++];
++				dst->pid = gstat_own[o].pid;
++				strlcpy(dst->name, name, sizeof(dst->name));
++				dst->submits = gstat_own[o].n;
++				dst->busy_ms = gstat_own[o].busy / 19200ULL;
++			}
++			if (w < sizeof(who) - 40) {
++				w += snprintf(who + w, sizeof(who) - w, " %s %u/%llums", name, gstat_own[o].n,
++				    gstat_own[o].busy / 19200);
++			}
+ 		}
+ 		a6_log("5s: %u submits (%u missed), GPU busy %llu ms (%llu%%), longest %llu us, mean %llu us;%s\n",
+ 		    gstat_n, gstat_missed, gstat_busy / 19200, gstat_busy * 100 / 19200 / (ns / 1000000),
+@@ -577,6 +604,7 @@ display_dim_build(void)
+ }
+ 
+ static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
++static uint64_t stat_last_clean_us, stat_last_blit_us;
+ 
+ /* The four corner mattes: black, alpha = 1 - coverage of the image (SweetDisplayMask.h). */
+ static void
+@@ -773,8 +801,10 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 		uint64_t c, g;
+ 		absolutetime_to_nanoseconds(stat_clean_abs, &c);
+ 		absolutetime_to_nanoseconds(stat_gpu_abs, &g);
++		stat_last_clean_us = c / 1000 / 300;
++		stat_last_blit_us = g / 1000 / 300;
+ 		a6_log("present: %llu frames, avg cache clean %llu us, GPU blit %llu us\n", stat_frames,
+-		    c / 1000 / 300, g / 1000 / 300);
++		    stat_last_clean_us, stat_last_blit_us);
+ 		stat_clean_abs = stat_gpu_abs = 0;
+ 	}
+ 	*out_dx = frame.dx;
+@@ -975,7 +1005,7 @@ static const struct { uint64_t pa, size; } gpool_ranges[] = {
+ };
+ static struct { uint64_t pa, size; } gpool_free[GPOOL_FREE_MAX];       /* sorted by address, merged */
+ static uint32_t gpool_nfree;
+-static uint64_t gpool_used, gpool_peak;
++static uint64_t gpool_used, gpool_peak, gpool_failures;
+ 
+ /* GPU pool bytes not in use (sweet_gpu_pool_alloc), for the per-client cap in SweetAccelerator */
+ uint64_t sweet_gpu_pool_avail(void);
+@@ -1026,6 +1056,9 @@ sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa)
+ 			break;
+ 		}
+ 	}
++	if (rc) {
++		gpool_failures++;
++	}
+ 	lck_mtx_unlock(&sweet_gpool_lock);
+ 	if (rc) {
+ 		a6_log("pool: no %llu bytes free (%llu MB in use)\n", size, gpool_used >> 20);
+@@ -1225,4 +1258,69 @@ sweet_gpu_timestamp(void)
+ {
+ 	return gpu_ready ? a6_timestamp(&gpu) : 0;
+ }
++
++void
++sweet_gpu_diag_snapshot(struct sweet_diag_gpu *out)
++{
++	static const uint32_t lvl_mhz[] = { 257, 257, 345, 427, 499, 585, 675 };
++	if (out == NULL) {
++		return;
++	}
++	uint64_t total_pool = 0;
++	for (unsigned i = 0; i < sizeof(gpool_ranges) / sizeof(gpool_ranges[0]); i++) {
++		total_pool += gpool_ranges[i].size;
++	}
++	uint32_t cap = 256, resv = 160;
++	PE_parse_boot_argn("sweetgpucap", &cap, sizeof(cap));
++	PE_parse_boot_argn("sweetgpureserve", &resv, sizeof(resv));
++
++	out->enabled = gpu_enabled_arg;
++	out->ready = gpu_ready;
++	out->ddr_boost = gpu_ddr_arg;
++	out->pool_total_bytes = total_pool;
++	out->cap_mb = cap;
++	out->reserve_mb = resv;
++
++	lck_mtx_lock(&sweet_gpool_lock);
++	out->pool_used_bytes = gpool_used;
++	out->pool_peak_bytes = gpool_peak;
++	out->pool_alloc_failures = gpool_failures;
++	lck_mtx_unlock(&sweet_gpool_lock);
++
++	out->present_frames = stat_frames;
++	out->clean_us = stat_last_clean_us;
++	out->blit_us = stat_last_blit_us;
++
++	if (!gpu_enabled_arg) {
++		return;
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	if (gpu_ready) {
++		gpu_stats_locked();
++		out->fence_done = a6_fence_read(&gpu);
++	}
++	out->perf_level = gpu.perf_level;
++	out->clock_mhz = gpu.perf_level < (sizeof(lvl_mhz) / sizeof(lvl_mhz[0])) ? lvl_mhz[gpu.perf_level] : 675u;
++	out->recoveries = recoveries;
++	out->fence_submitted = gpu.fence;
++	uint64_t now = mach_absolute_time();
++	if (gstat_last_abs != 0 && now >= gstat_last_abs) {
++		uint64_t age_ns = 0;
++		absolutetime_to_nanoseconds(now - gstat_last_abs, &age_ns);
++		out->win_age_ms = age_ns / 1000000ULL;
++	} else {
++		out->win_age_ms = 999999ULL;
++	}
++	out->win_submits = gstat_last_n;
++	out->win_missed = gstat_last_missed;
++	out->win_busy_ms = gstat_last_busy_ms;
++	out->win_busy_pct = gstat_last_pct;
++	out->win_longest_us = gstat_last_longest_us;
++	out->win_mean_us = gstat_last_mean_us;
++	out->owner_count = gstat_last_owner_count;
++	for (uint32_t i = 0; i < gstat_last_owner_count && i < SWEET_DIAG_MAX_OWNERS; i++) {
++		out->owners[i] = gstat_last_owners[i];
++	}
++	lck_mtx_unlock(&sweet_gpu_lock);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 1116ace..3e8bd21 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -36,6 +36,7 @@
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
++#include <sweet_diag.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+@@ -913,6 +914,19 @@ ud_num(const char **p)
+ 	return v;
+ }
+ 
++static int ud_cmd_sleep_chan;
++static LCK_GRP_DECLARE(ud_cmd_grp, "sweet-cmd");
++static LCK_MTX_DECLARE(ud_cmd_mtx, &ud_cmd_grp);
++
++static void
++ud_cmd_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ud_cmd_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ ud_touch_cmd(const char *cmd)
+ {
+@@ -920,7 +934,7 @@ ud_touch_cmd(const char *cmd)
+ 	int x1 = ud_num(&p), y1 = ud_num(&p);
+ 	if (cmd[0] == 't') {
+ 		sweet_hid_touch(9, 1, x1, y1);
+-		ud_sleep_ms(80);
++		ud_cmd_sleep_ms(80);
+ 		sweet_hid_touch(9, 0, x1, y1);
+ 		printf("SWEET CMD: tap %d %d\n", x1, y1);
+ 		return;
+@@ -932,12 +946,88 @@ ud_touch_cmd(const char *cmd)
+ 	}
+ 	for (int i = 0; i <= steps; i++) {
+ 		sweet_hid_touch(9, 1, x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps);
+-		ud_sleep_ms(10);
++		ud_cmd_sleep_ms(10);
+ 	}
+ 	sweet_hid_touch(9, 0, x2, y2);
+ 	printf("SWEET CMD: swipe %d,%d -> %d,%d in %d steps\n", x1, y1, x2, y2, steps);
+ }
+ 
++void
++sweet_usb_diag_snapshot(struct sweet_diag_net *out)
++{
++	out->usb_ready = (ud.ifp != NULL);
++	out->usb_configured = ud.configured;
++	out->usb_rx_frames = ud.rx_frames;
++	out->usb_tx_frames = ud.tx_frames;
++}
++
++void
++sweet_usb_run_cmd(const char *cmd, size_t got, bool allow_reset)
++{
++	lck_mtx_lock(&ud_cmd_mtx);
++	printf("SWEET CMD: %u bytes: %.60s\n", (unsigned)got, cmd);
++	if (strncmp(cmd, "sync", 4) == 0 || (allow_reset && strncmp(cmd, "reboot", 6) == 0)) {
++		int32_t rv = 0;
++		(void)sync(kernproc, NULL, &rv);
++		printf("SWEET CMD: synced\n");
++		if (cmd[0] == 's') {
++			lck_mtx_unlock(&ud_cmd_mtx);
++			return;
++		}
++	}
++	if (strncmp(cmd, "tap ", 4) == 0 || strncmp(cmd, "swipe ", 6) == 0) {
++		ud_touch_cmd(cmd);
++		lck_mtx_unlock(&ud_cmd_mtx);
++		return;
++	}
++	if (strncmp(cmd, "fbmode ", 7) == 0) {
++		const char *m = cmd + 7;
++		while (*m == ' ') {
++			m++;
++		}
++		int rc = sweet_fb_set_mode(m);
++		printf("SWEET CMD: fbmode '%s' -> %d\n", m, rc);
++		lck_mtx_unlock(&ud_cmd_mtx);
++		return;
++	}
++	if (strncmp(cmd, "brightness ", 11) == 0) {
++		const char *p = cmd + 11;
++		int pct = ud_num(&p);
++		int rc = sweet_backlight_set_pct((uint32_t)(pct < 0 ? 0 : (pct > 100 ? 100 : pct)));
++		printf("SWEET CMD: brightness %d%% -> %d\n", pct, rc);
++		lck_mtx_unlock(&ud_cmd_mtx);
++		return;
++	}
++	if (strncmp(cmd, "rtc", 3) == 0) {
++		extern int sweet_rtc_seconds(uint32_t *secs);
++		uint32_t rtc = 0;
++		struct timeval tv;
++		int rc = sweet_rtc_seconds(&rtc);
++		microtime(&tv);
++		printf("SWEET CMD: rtc %u%s, time of day %ld\n", rtc, rc ? " (read failed)" : "", (long)tv.tv_sec);
++		if (!rc) {
++			printf("SWEET RTC: %u\n", rtc);
++		}
++		lck_mtx_unlock(&ud_cmd_mtx);
++		return;
++	}
++	if (strncmp(cmd, "panic", 5) == 0) {
++		panic("SWEET CMD: panic requested");
++	}
++	if (allow_reset && strncmp(cmd, "reboot", 6) == 0) {
++		ud_cmd_sleep_ms(1000);
++		printf("SWEET CMD: rebooting (PSCI SYSTEM_RESET)\n");
++		ud_cmd_sleep_ms(500);
++		register uint64_t x0 __asm__("x0") = 0x84000009ULL;
++		__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++		lck_mtx_unlock(&ud_cmd_mtx);
++		return;
++	}
++	sweet_poke_run(cmd, (unsigned)got);
++	printf("SWEET CMD: done\n");
++	lck_mtx_unlock(&ud_cmd_mtx);
++}
++
+ static void
+ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -972,46 +1062,10 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			continue;
+ 		}
+ 		cmd[got] = 0;
+-		printf("SWEET CMD: %u bytes: %.60s\n", (unsigned)got, cmd);
+-		if (strncmp(cmd, "sync", 4) == 0 || strncmp(cmd, "reboot", 6) == 0) {
+-			/* Flush dirty file data (e.g. sweet_files.c writes) before a reset. */
+-			int32_t rv = 0;
+-			(void)sync(kernproc, NULL, &rv);
+-			printf("SWEET CMD: synced\n");
+-			if (cmd[0] == 's') {
+-				continue;
+-			}
+-		}
+-		if (strncmp(cmd, "tap ", 4) == 0 || strncmp(cmd, "swipe ", 6) == 0) {
+-			ud_touch_cmd(cmd);
+-			continue;
+-		}
+-		if (strncmp(cmd, "rtc", 3) == 0) {
+-			extern int sweet_rtc_seconds(uint32_t *secs);   /* SweetPlatformExpert.cpp */
+-			uint32_t rtc = 0;
+-			struct timeval tv;
+-			int rc = sweet_rtc_seconds(&rtc);
+-			microtime(&tv);
+-			printf("SWEET CMD: rtc %u%s, time of day %ld\n", rtc, rc ? " (read failed)" : "", (long)tv.tv_sec);
+-			if (!rc) {
+-				printf("SWEET RTC: %u\n", rtc);
+-			}
+-			continue;
+-		}
+-		if (strncmp(cmd, "panic", 5) == 0) {
+-			/* Tests the panic path: backtraces must reach the persistent log. */
+-			panic("SWEET CMD: panic requested over USB");
+-		}
+-		if (strncmp(cmd, "reboot", 6) == 0) {
+-			ud_sleep_ms(1000);      /* let HFS finish the journal writes */
+-			printf("SWEET CMD: rebooting (PSCI SYSTEM_RESET)\n");
+-			ud_sleep_ms(500);       /* let the log go out */
+-			register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+-			__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+-			continue;
++		while (got > 0 && (cmd[got - 1] == '\n' || cmd[got - 1] == '\r')) {
++			cmd[--got] = 0;
+ 		}
+-		sweet_poke_run(cmd, (unsigned)got);
+-		printf("SWEET CMD: done\n");
++		sweet_usb_run_cmd(cmd, got, true);
+ 	}
+ }
+ 
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 5897a3a..5666b01 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1002,7 +1002,11 @@ bsd_init(void)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 		{
+ 			extern void rmx1931_audio_init(void);
++			extern void sweet_diag_init(void);
++			extern void sweet_files_start(void);
+ 			rmx1931_audio_init();
++			sweet_diag_init();
++			sweet_files_start();
+ 		}
+ #endif
+ 	}
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index b262f4e..45f717b 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5611,11 +5611,24 @@ bad:
+  * sweet dylibs) in bsdinit_task before launchd starts; sweetinject=0 disables.
+  */
+ static TUNABLE(uint32_t, xpcproxy_idversion, "xpcproxy_idversion", 0);
++#include <sweet_diag.h>
+ static char exec_inject_conf[512];
++static uint64_t exec_inject_hits;
+ SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED,
+     exec_inject_conf, sizeof(exec_inject_conf),
+     "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
+ 
++void
++sweet_exec_inject_diag(char *out_conf, size_t cap, uint64_t *out_hits)
++{
++	if (out_conf != NULL && cap > 0) {
++		strlcpy(out_conf, exec_inject_conf, cap);
++	}
++	if (out_hits != NULL) {
++		*out_hits = exec_inject_hits;
++	}
++}
++
+ void sweet_exec_inject_init(void);
+ 
+ static bool
+@@ -5759,6 +5772,9 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ 			any = true;
+ 		}
+ 	}
++	if (any) {
++		os_atomic_inc(&exec_inject_hits, relaxed);
++	}
+ 	return any;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 219b4c8..b53fa5a 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -510,6 +510,7 @@ static const struct {
+ };
+ static TUNABLE(uint32_t, sweet_privs_by_entitlement, "privs", 1);
+ 
++#include <sweet_diag.h>
+ #define SWEET_PRIV_LOG_MAX      64
+ static struct {
+ 	int  priv;
+@@ -552,6 +553,24 @@ sweet_sandbox_priv_grant(kauth_cred_t cred, int priv)
+ 	return EPERM;
+ }
+ 
++uint32_t
++sweet_amfi_priv_diag(struct sweet_diag_priv *out, uint32_t max_entries, uint32_t *out_total)
++{
++	uint32_t total = (uint32_t)(sweet_priv_logged_count > 0 ? sweet_priv_logged_count : 0);
++	if (out_total != NULL) {
++		*out_total = total;
++	}
++	if (out == NULL || max_entries == 0) {
++		return 0;
++	}
++	uint32_t n = total < max_entries ? total : max_entries;
++	for (uint32_t i = 0; i < n; i++) {
++		out[i].priv = sweet_priv_logged[i].priv;
++		strlcpy(out[i].name, sweet_priv_logged[i].name, sizeof(out[i].name));
++	}
++	return n;
++}
++
+ static const struct mac_policy_ops sweet_sandbox_mac_ops = {
+ 	.mpo_policy_syscall = sweet_sandbox_syscall,
+ 	.mpo_priv_grant = sweet_sandbox_priv_grant,
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 0254860..3332c15 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -43,9 +43,11 @@
+ #include <pexpert/pexpert.h>
+ #include "SweetSurface.h"
+ #include "SweetGPUABI.h"
++#include <sweet_diag.h>
+ 
+ extern "C" {
+ void proc_selfname(char *buf, int size);
++int proc_selfpid(void);
+ bool sweet_gpu_ready(void);
+ int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+ void sweet_gpu_unmap_user(uint64_t iova, uint64_t len);
+@@ -88,6 +90,11 @@ class IOAcceleratorES : public IOService {
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
++class SweetAcceleratorUserClient;
++static void sweet_accel_diag_init_lock(void);
++static void sweet_accel_client_add(SweetAcceleratorUserClient *c);
++static void sweet_accel_client_remove(SweetAcceleratorUserClient *c);
++
+ class SweetAccelerator : public IOAcceleratorES {
+ 	OSDeclareDefaultStructors(SweetAccelerator);
+ 
+@@ -121,6 +128,7 @@ SweetAccelerator::start(IOService *provider)
+ 	setProperty("IOGLBundleName", plugin);
+ 	setProperty("model", "Adreno 640");
+ 	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
++	sweet_accel_diag_init_lock();
+ 	registerService();
+ 	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName %s)\n", plugin);
+ 	return true;
+@@ -149,6 +157,8 @@ class SweetAcceleratorUserClient : public IOUserClient {
+ 	uint64_t *fPageBuf;
+ 	uint64_t fEpoch, fFaults;       /* GPU resets seen; those that lost this client's work */
+ 	uint64_t fPoolBytes, fPoolPeak; /* GPU pool memory this client holds */
++	uint64_t fSubmits;
++	int      fPid;
+ 	char fName[32];
+ 	bool fSystem;                   /* backboardd / SpringBoard: no pool cap, and the reserve is theirs */
+ 	bool fCapLogged;
+@@ -161,6 +171,7 @@ class SweetAcceleratorUserClient : public IOUserClient {
+ 	void v2Release(SweetV2BO *bo);
+ 
+ public:
++	void fillClientDiag(struct sweet_diag_gpu_client *out);
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+ 	void free(void) APPLE_KEXT_OVERRIDE;
+@@ -186,6 +197,8 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
+ 	if (fLock == NULL || fMem == NULL || fMaps == NULL || fVA == NULL || fLen == NULL) {
+ 		return false;
+ 	}
++	fPid = proc_selfpid();
++	proc_selfname(fName, sizeof(fName));
+ 	if (type == SWEET_V2_OPEN_TYPE || type == SWEET_V2_OPEN_DIRECT) {
+ 		fBOCap = 256;
+ 		fBO = IONewZero(SweetV2BO, fBOCap);
+@@ -195,10 +208,10 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
+ 			return false;
+ 		}
+ 		fEpoch = sweet_gpu_recoveries();
+-		proc_selfname(fName, sizeof(fName));
+ 		fSystem = !strcmp(fName, "backboardd") || !strcmp(fName, "SpringBoard");
+ 		fV2 = true;
+ 	}
++	sweet_accel_client_add(this);
+ 	return true;
+ }
+ 
+@@ -245,6 +258,7 @@ SweetAcceleratorUserClient::clientClose(void)
+ void
+ SweetAcceleratorUserClient::free(void)
+ {
++	sweet_accel_client_remove(this);
+ 	/*
+ 	 * Submits are asynchronous: a client that exits (or crashes) may leave work queued. Unmapping its
+ 	 * memory under the GPU would fault, or hand the VAs and pages to someone else while the GPU still
+@@ -481,6 +495,9 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 		}
+ 		uint32_t fence = 0;
+ 		int rc = sweet_gpu_submit_user(in[0], (uint32_t)in[1], (uint32_t)in[2], &fence);
++		if (!rc) {
++			fSubmits++;
++		}
+ 		out[0] = fence;
+ 		return rc ? kIOReturnTimeout : kIOReturnSuccess;
+ 	}
+@@ -506,6 +523,7 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 		out[0] = sweet_gpu_submit_user_async(in[0], (uint32_t)in[1]);
+ 		if (out[0]) {
+ 			fLastFence = (uint32_t)out[0];
++			fSubmits++;
+ 		}
+ 		return out[0] ? kIOReturnSuccess : kIOReturnNotReady;
+ 	}
+@@ -848,6 +866,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 			return busy ? kIOReturnBusy : kIOReturnNotReady;
+ 		}
+ 		fLastFence = fence;
++		fSubmits++;
+ 		rp->fence = fence;
+ 		return kIOReturnSuccess;
+ 	}
+@@ -887,4 +906,78 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ #undef V2_IN
+ #undef V2_OUT
+ }
++
++static IOLock *gAccelClientsLock;
++static SweetAcceleratorUserClient *gAccelClients[SWEET_DIAG_MAX_CLIENTS];
++
++static void
++sweet_accel_diag_init_lock(void)
++{
++	if (gAccelClientsLock == NULL) {
++		gAccelClientsLock = IOLockAlloc();
++	}
++}
++
++static void
++sweet_accel_client_add(SweetAcceleratorUserClient *c)
++{
++	if (gAccelClientsLock == NULL) {
++		return;
++	}
++	IOLockLock(gAccelClientsLock);
++	for (unsigned i = 0; i < SWEET_DIAG_MAX_CLIENTS; i++) {
++		if (gAccelClients[i] == NULL) {
++			gAccelClients[i] = c;
++			break;
++		}
++	}
++	IOLockUnlock(gAccelClientsLock);
++}
++
++static void
++sweet_accel_client_remove(SweetAcceleratorUserClient *c)
++{
++	if (gAccelClientsLock == NULL) {
++		return;
++	}
++	IOLockLock(gAccelClientsLock);
++	for (unsigned i = 0; i < SWEET_DIAG_MAX_CLIENTS; i++) {
++		if (gAccelClients[i] == c) {
++			gAccelClients[i] = NULL;
++			break;
++		}
++	}
++	IOLockUnlock(gAccelClientsLock);
++}
++
++void
++SweetAcceleratorUserClient::fillClientDiag(struct sweet_diag_gpu_client *out)
++{
++	out->pid = fPid;
++	strlcpy(out->name, fName, sizeof(out->name));
++	out->v2 = fV2;
++	out->system = fSystem;
++	out->cap_refused = fCapLogged;
++	out->pool_bytes = fPoolBytes;
++	out->pool_peak = fPoolPeak;
++	out->submits = fSubmits;
++	out->faults = fFaults;
++}
++
++extern "C" void
++sweet_accel_diag_snapshot(struct sweet_diag_gpu *out)
++{
++	if (out == NULL || gAccelClientsLock == NULL) {
++		return;
++	}
++	IOLockLock(gAccelClientsLock);
++	uint32_t n = 0;
++	for (unsigned i = 0; i < SWEET_DIAG_MAX_CLIENTS && n < SWEET_DIAG_MAX_CLIENTS; i++) {
++		if (gAccelClients[i] != NULL) {
++			gAccelClients[i]->fillClientDiag(&out->clients[n++]);
++		}
++	}
++	out->client_count = n;
++	IOLockUnlock(gAccelClientsLock);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 668fb3a..8b05427 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -36,6 +36,7 @@
+  */
+ #include "SweetSurface.h"
+ #include "SweetDisplayMask.h"
++#include <sweet_diag.h>
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+@@ -139,12 +140,24 @@ public:
+ 	bool          fHasSwap;
+ 	bool          fDirty;
+ 	bool          fDirectPresent;	/* queue async GPU present directly on SwapEnd */
++	bool          fForceCPU;	/* runtime debug override: force CPU copyRow path */
++	bool          fLastPresentGPU;	/* true if most recent present() completed on GPU */
+ 	uint64_t      fLastSwapAbs;
++	uint64_t      fSwapRingAbs[128];
++	uint32_t      fSwapRingIdx;
++	uint32_t      fLast5sFpsX10;
++	uint64_t      fLast5sSwaps, fLast5sPresents, fLast5sAvgUs;
++	uint64_t      fTotalPresents, fGpuPresents, fCpuPresents;
++	uint32_t      fLastSurfId, fLastSurfW, fLastSurfH, fLastSurfBpr, fLastSurfFmt;
++	uint32_t      fLastLayerMask;
+ 	uint32_t      fFlushTicks;	/* vsync ticks between panel copies */
+ 	bool          fPowerOff;	/* RequestPowerChange(0) */
+ 	bool          fGPU;		/* panel switched to the GPU's stride; frames scaled to fit */
+ 	uint32_t      fFadeStep;	/* fade-out steps done while off */
+ 
++	void fillDiag(struct sweet_diag_display *out);
++	int  setPresentMode(const char *mode);
++
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+@@ -290,16 +303,24 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	sender->wakeAtTime(fb->fNextVsync);
+ 	if ((count % 300) == 0) {
+ 		/* Every 5 s: frames backboardd swapped, frames copied to the panel. */
+-		uint64_t swaps = sweet_fb_swap_count - fb->fStatSwaps, ns = 0;
+-		absolutetime_to_nanoseconds(fb->fStatPresentAbs, &ns);
+-		if (swaps || fb->fStatPresents) {
+-			IOLog("SWEET FB: 5s: %llu swaps (%llu.%llu fps), %llu panel copies, avg copy %llu us\n",
+-			    swaps, swaps / 5, (swaps * 2) % 10, fb->fStatPresents,
+-			    fb->fStatPresents ? ns / 1000 / fb->fStatPresents : 0);
+-		}
++		IOLockLock(fb->fLock);
++		uint64_t swaps = sweet_fb_swap_count - fb->fStatSwaps;
++		uint64_t presents = fb->fStatPresents, pabs = fb->fStatPresentAbs;
+ 		fb->fStatSwaps = sweet_fb_swap_count;
+ 		fb->fStatPresents = 0;
+ 		fb->fStatPresentAbs = 0;
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(pabs, &ns);
++		uint64_t avg_us = presents ? ns / 1000 / presents : 0;
++		fb->fLast5sSwaps = swaps;
++		fb->fLast5sPresents = presents;
++		fb->fLast5sAvgUs = avg_us;
++		fb->fLast5sFpsX10 = (uint32_t)(swaps * 2ULL);
++		IOLockUnlock(fb->fLock);
++		if (swaps || presents) {
++			IOLog("SWEET FB: 5s: %llu swaps (%llu.%llu fps), %llu panel copies, avg copy %llu us\n",
++			    swaps, swaps / 5, (swaps * 2) % 10, presents, avg_us);
++		}
+ 	}
+ 	/*
+ 	 * CA::WindowServer::IOMFBServer::vsync_callback(fb, a1, a2, a3, refcon): a1 only goes to kdebug, a2 is
+@@ -355,6 +376,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		IOLockLock(fb->fLock);
+ 		fb->fStatPresentAbs += dt;
+ 		fb->fStatPresents++;
++		fb->fTotalPresents++;
+ 		IOLockUnlock(fb->fLock);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+@@ -405,7 +427,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(fLastRec, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fHasSwap = true;
+ 	fLastSwapAbs = now;
+-	if (fDirectPresent && fFlushTicks == 1 && !fPowerOff && sweet_gpu_ready()) {
++	fSwapRingAbs[fSwapRingIdx & 127u] = now;
++	fSwapRingIdx++;
++	if (fDirectPresent && !fForceCPU && fFlushTicks == 1 && !fPowerOff && sweet_gpu_ready()) {
+ 		fDirty = false;
+ 		direct = true;
+ 	} else {
+@@ -422,6 +446,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		IOLockLock(fLock);
+ 		fStatPresentAbs += dt;
+ 		fStatPresents++;
++		fTotalPresents++;
+ 		IOLockUnlock(fLock);
+ 	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+@@ -438,7 +463,7 @@ AppleCLCD::refreshBrightness(void)
+ 	IOLockLock(fLock);
+ 	if (fHasSwap && !fPowerOff) {
+ 		uint64_t minGap = fVsyncAbs ? (fVsyncAbs * 3) / 4 : 0;
+-		if (sweet_gpu_ready()) {
++		if (!fForceCPU && sweet_gpu_ready()) {
+ 			if (now - fLastSwapAbs >= minGap) {
+ 				fLastSwapAbs = now;
+ 				memcpy(rec, fLastRec, sizeof(rec));
+@@ -459,16 +484,21 @@ AppleCLCD::refreshBrightness(void)
+ 		IOLockLock(fLock);
+ 		fStatPresentAbs += dt;
+ 		fStatPresents++;
++		fTotalPresents++;
+ 		IOLockUnlock(fLock);
+ 	}
+ }
+ 
+ static uint32_t sweet_fb_gpu_why_logged;
++static uint64_t sweet_fb_gpu_fallback_count;
++static const char *sweet_fb_last_fallback = "none";
+ 
+ /* Why presentGPU fell back to the CPU copy, logged once per reason. */
+ static bool
+ gpu_fallback(uint32_t why, const char *what)
+ {
++	sweet_fb_gpu_fallback_count++;
++	sweet_fb_last_fallback = what;
+ 	if (!(sweet_fb_gpu_why_logged & (1u << why))) {
+ 		sweet_fb_gpu_why_logged |= 1u << why;
+ 		IOLog("SWEET FB: GPU present not used: %s\n", what);
+@@ -552,6 +582,12 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		OSSafeReleaseNULL(s);
+ 		return gpu_fallback(2, "no surface (or the panel's own)");
+ 	}
++	fLastSurfId = id;
++	fLastSurfW = s->width;
++	fLastSurfH = s->height;
++	fLastSurfBpr = s->bytesPerRow;
++	fLastSurfFmt = s->pixelFormat;
++	fLastLayerMask = mask;
+ 	if (s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 	    (s->bytesPerRow & 63) || s->width == 0 || s->height == 0 ||
+ 	    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
+@@ -625,12 +661,23 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
+-	if (sweet_gpu_ready() && presentGPU(rec)) {
++	if (!fForceCPU && sweet_gpu_ready() && presentGPU(rec)) {
++		fLastPresentGPU = true;
++		fGpuPresents++;
+ 		return;
+ 	}
++	if (fForceCPU) {
++		sweet_fb_last_fallback = "forced CPU via fbmode";
++	} else if (!sweet_gpu_ready()) {
++		sweet_fb_last_fallback = "GPU not ready";
++	}
++	fLastPresentGPU = false;
++	fCpuPresents++;
++	fLastLayerMask = mask;
+ 	if (sweet_display_fit_w) {
+ 		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
+ 		sweet_display_fit_x = sweet_display_fit_y = sweet_display_fit_h = 0;
++		bzero((void *)fPixels, (size_t)fRowBytes * fHeight);
+ 	}
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+@@ -656,6 +703,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
++		fLastSurfId = id;
++		fLastSurfW = s->width;
++		fLastSurfH = s->height;
++		fLastSurfBpr = s->bytesPerRow;
++		fLastSurfFmt = s->pixelFormat;
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+@@ -901,8 +953,12 @@ class AppleARMBacklight : public IOService {
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	void fillDiag(struct sweet_diag_display *out);
++	void setPercent(uint32_t pct);
+ };
+ 
++static AppleARMBacklight *gMainBacklight;
++
+ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ 
+ static uint32_t
+@@ -1030,6 +1086,7 @@ AppleARMBacklight::start(IOService *provider)
+ 	setProperty("BuiltIn", kOSBooleanTrue);
+ 	setProperty("brightness-nits", (uint64_t)(625ULL * 65536ULL), 32);
+ 	publishDisplayParams();
++	gMainBacklight = this;
+ 	registerService();
+ 	IOLog("SWEET BL: AppleARMBacklight registered on /backlight (max 625 nits)\n");
+ 	return true;
+@@ -1086,4 +1143,149 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 	IOLockUnlock(fLock);
+ 	return kIOReturnSuccess;
+ }
++void
++AppleARMBacklight::fillDiag(struct sweet_diag_display *out)
++{
++	IOLockLock(fLock);
++	out->backlight_registered = true;
++	out->millinits = fMillinits;
++	out->raw_level = fRawLevel;
++	out->dim_alpha = sweet_backlight_alpha;
++	IOLockUnlock(fLock);
++}
++
++void
++AppleARMBacklight::setPercent(uint32_t pct)
++{
++	if (pct > 100) {
++		pct = 100;
++	}
++	uint64_t lin = ((uint64_t)pct * (uint64_t)pct * 625ULL * 65536ULL) / 10000ULL;
++	IOLockLock(fLock);
++	applyNitsQ16((uint32_t)lin);
++	IOLockUnlock(fLock);
++}
++
++void
++AppleCLCD::fillDiag(struct sweet_diag_display *out)
++{
++	uint64_t now = mach_absolute_time();
++	uint64_t one_sec_abs = 0;
++	nanoseconds_to_absolutetime(1000000000ULL, &one_sec_abs);
++
++	IOLockLock(fLock);
++	out->registered = true;
++	out->power_on = !fPowerOff;
++	out->direct_present = fDirectPresent;
++	out->force_cpu = fForceCPU;
++	out->gpu_ever = fGPU;
++	out->last_present_gpu = fLastPresentGPU;
++	out->panel_pa = fPhys;
++	out->panel_w = fWidth;
++	out->panel_h = fHeight;
++	out->panel_stride = fRowBytes;
++	out->logical_w = fLogicalW;
++	out->logical_h = fLogicalH;
++	out->fit_x = sweet_display_fit_x;
++	out->fit_y = sweet_display_fit_y;
++	out->fit_w = sweet_display_fit_w;
++	out->fit_h = sweet_display_fit_h;
++	out->corner_radius = fCornerRadius;
++	out->corner_ext = fCornerExt;
++	out->vsync_hz = fFlushTicks ? (uint32_t)(60u / fFlushTicks) : 60u;
++	out->vsync_count = fVsyncCount;
++	out->swaps_total = sweet_fb_swap_count;
++	out->presents_total = fTotalPresents;
++	out->gpu_presents = fGpuPresents;
++	out->cpu_presents = fCpuPresents;
++	out->fps_5s_x10 = fLast5sFpsX10;
++	out->last_5s_swaps = fLast5sSwaps;
++	out->last_5s_presents = fLast5sPresents;
++	out->avg_present_us = fLast5sAvgUs;
++	out->clients_count = fClients != NULL ? fClients->getCount() : 0;
++	out->last_surf_id = fLastSurfId;
++	out->last_surf_w = fLastSurfW;
++	out->last_surf_h = fLastSurfH;
++	out->last_surf_bpr = fLastSurfBpr;
++	out->last_surf_fmt = fLastSurfFmt;
++	out->last_layer_mask = fLastLayerMask;
++	if (fHasSwap && now >= fLastSwapAbs) {
++		uint64_t age_ns = 0;
++		absolutetime_to_nanoseconds(now - fLastSwapAbs, &age_ns);
++		out->last_swap_age_ms = age_ns / 1000000ULL;
++	}
++	uint32_t count_1s = 0;
++	uint32_t lim = fSwapRingIdx < 128u ? fSwapRingIdx : 128u;
++	for (uint32_t i = 0; i < lim; i++) {
++		uint64_t ts = fSwapRingAbs[i];
++		if (ts != 0 && now >= ts && (now - ts) <= one_sec_abs) {
++			count_1s++;
++		}
++	}
++	out->fps_1s_x10 = count_1s * 10u;
++	out->gpu_fallback_mask = sweet_fb_gpu_why_logged;
++	out->gpu_fallback_count = sweet_fb_gpu_fallback_count;
++	strlcpy(out->last_fallback_reason, sweet_fb_last_fallback, sizeof(out->last_fallback_reason));
++	out->dim_alpha = sweet_backlight_alpha;
++	IOLockUnlock(fLock);
++}
++
++int
++AppleCLCD::setPresentMode(const char *mode)
++{
++	if (mode == NULL) {
++		return -1;
++	}
++	IOLockLock(fLock);
++	if (!strncmp(mode, "direct", 6)) {
++		fDirectPresent = true;
++		fForceCPU = false;
++	} else if (!strncmp(mode, "vsync", 5)) {
++		fDirectPresent = false;
++		fForceCPU = false;
++	} else if (!strncmp(mode, "cpu", 3)) {
++		fForceCPU = true;
++	} else if (!strncmp(mode, "gpu", 3)) {
++		fForceCPU = false;
++	} else {
++		IOLockUnlock(fLock);
++		return -1;
++	}
++	if (fHasSwap && !fPowerOff) {
++		memcpy(fPending, fLastRec, SWEET_FB_SWAP_REC_SIZE);
++		fDirty = true;
++	}
++	IOLockUnlock(fLock);
++	return 0;
++}
++
++extern "C" void
++sweet_fb_diag_snapshot(struct sweet_diag_display *out)
++{
++	if (out == NULL) {
++		return;
++	}
++	if (gMainFB != NULL) {
++		gMainFB->fillDiag(out);
++	}
++	if (gMainBacklight != NULL) {
++		gMainBacklight->fillDiag(out);
++	}
++}
++
++extern "C" int
++sweet_fb_set_mode(const char *mode)
++{
++	return gMainFB != NULL ? gMainFB->setPresentMode(mode) : -1;
++}
++
++extern "C" int
++sweet_backlight_set_pct(uint32_t pct)
++{
++	if (gMainBacklight == NULL) {
++		return -1;
++	}
++	gMainBacklight->setPercent(pct);
++	return 0;
++}
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 2514af3..081fab0 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <sweet_diag.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -46,8 +47,10 @@ flame_wdt_thread(void *arg)
+ 	PE_parse_boot_argn("flamereboot", &reboot_s, sizeof(reboot_s));
+ 	for (int t = 0; reboot_s <= 0 || t < reboot_s; t += FLAME_WDT_PET_S) {
+ 		wdt[FLAME_WDT_RST / 4] = 1;
++		sweet_wdt_record(true, reboot_s, t);
+ 		IOSleep(FLAME_WDT_PET_S * 1000);
+ 	}
++	sweet_wdt_record(true, reboot_s, reboot_s);
+ 	IOLog("FLAME WDT: flamereboot=%d reached, no more pets: reset follows\n", reboot_s);
+ 	for (;;) {
+ 		IOSleep(1000000);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index a9f0b6c..d19be02 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -29,6 +29,7 @@
+ #include "IOHIDPrivateKeys.h"
+ #include "IOHIDUsageTables.h"
+ #include "../SweetDisplayMask.h"
++#include <sweet_diag.h>
+ 
+ extern "C" uint64_t mach_absolute_time(void);
+ 
+@@ -403,9 +404,25 @@ SweetHIDButtons::start(IOService *provider)
+ 	return true;
+ }
+ 
++static uint64_t gHidButtonEvents;
++static uint32_t gHidButtonsMask;
++static uint64_t gHidTouchEvents;
++static uint32_t gHidFingersMask;
++static int32_t  gHidLastX, gHidLastY;
++static uint64_t gHidLastTouchAbs;
++
+ void
+ SweetHIDButtons::key(UInt32 usage, bool down)
+ {
++	gHidButtonEvents++;
++	uint32_t bit = (usage == kHIDUsage_Csmr_Power) ? 1u :
++	    (usage == kHIDUsage_Csmr_VolumeIncrement) ? 2u :
++	    (usage == kHIDUsage_Csmr_VolumeDecrement) ? 4u : 8u;
++	if (down) {
++		gHidButtonsMask |= bit;
++	} else {
++		gHidButtonsMask &= ~bit;
++	}
+ 	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
+ 
+ 	if (event) {
+@@ -563,7 +580,14 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (down) {
+ 		fX[finger] = nx;
+ 		fY[finger] = ny;
++		gHidFingersMask |= (1u << finger);
++		gHidLastX = x;
++		gHidLastY = y;
++	} else {
++		gHidFingersMask &= ~(1u << finger);
+ 	}
++	gHidTouchEvents++;
++	gHidLastTouchAbs = now;
+ 	collection->setFixedValue(kIOHIDEventFieldDigitizerX, nx);
+ 	collection->setFixedValue(kIOHIDEventFieldDigitizerY, ny);
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerRange, any);
+@@ -601,3 +625,24 @@ sweet_hid_touch(int finger, int down, int x, int y)
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++extern "C" void
++sweet_hid_diag_snapshot(struct sweet_diag_input *out)
++{
++	if (out == NULL) {
++		return;
++	}
++	out->touch_events = gHidTouchEvents;
++	out->fingers_mask = gHidFingersMask;
++	out->last_x = gHidLastX;
++	out->last_y = gHidLastY;
++	uint64_t last_abs = gHidLastTouchAbs;
++	uint64_t now = mach_absolute_time();
++	if (last_abs != 0 && now >= last_abs) {
++		uint64_t age_ns = 0;
++		absolutetime_to_nanoseconds(now - last_abs, &age_ns);
++		out->last_touch_age_ms = age_ns / 1000000ULL;
++	}
++	out->button_events = gHidButtonEvents;
++	out->buttons_mask = gHidButtonsMask;
++}
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..4dcb72b 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -823,6 +823,7 @@ exception_triage(
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <vm/vm_shared_region.h>
+ #include <arm/thread.h>
++#include <sweet_diag.h>
+ 
+ /*
+  * SWEET crash report on the console. The phone has no way to get crash
+@@ -851,20 +852,29 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 	printf("CRASH %s[%d] sig %d code 0x%llx sub 0x%llx slide 0x%llx mh 0x%llx\n",
+ 	    name, pid, sig, code, subcode, slide, mh);
+ 	if (ss == NULL || !is_saved_state64(ss)) {
++		sweet_crash_record(name, pid, sig, code, subcode, 0, 0, 0, 0, 0, slide, mh, NULL, 0);
+ 		return;
+ 	}
++	uint64_t pc = get_saved_state_pc(ss);
++	uint64_t lr = get_saved_state_lr(ss);
++	uint64_t sp = get_saved_state_sp(ss);
+ 	uint64_t fp = get_saved_state_fp(ss);
++	uint64_t far = (uint64_t)saved_state64(ss)->far;
+ 	printf("CRASH %s pc 0x%llx lr 0x%llx sp 0x%llx fp 0x%llx far 0x%llx\n", name,
+-	    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss), fp,
+-	    (uint64_t)saved_state64(ss)->far);
++	    pc, lr, sp, fp, far);
+ 
+ 	char line[200];
++	uint64_t bt[SWEET_DIAG_MAX_BT];
++	uint32_t bt_count = 0;
+ 	int n = snprintf(line, sizeof(line), "CRASH %s bt", name);
+ 	for (int i = 0; i < 10 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+ 		uint64_t frame[2];
+ 		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
+ 			break;
+ 		}
++		if (bt_count < SWEET_DIAG_MAX_BT) {
++			bt[bt_count++] = frame[1];
++		}
+ 		n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
+ 		if (frame[0] <= fp) {
+ 			break;
+@@ -872,6 +882,7 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 		fp = frame[0];
+ 	}
+ 	printf("%s\n", line);
++	sweet_crash_record(name, pid, sig, code, subcode, pc, lr, sp, fp, far, slide, mh, bt, bt_count);
+ 
+ 	if (sig == 11 || sig == 10) {
+ 		/* Which mapping the faulting address is in, or which two it falls between. */

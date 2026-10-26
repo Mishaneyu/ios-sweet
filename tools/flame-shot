@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Screenshot of the phone's framebuffer (or any surface in physical memory) as a PNG.
 
-  tools/flame-shot OUT.png [--pa PA] [--w W] [--h H] [--stride BYTES] [--fmt bgra|rgba] [--raw OUT.bin]
+  tools/flame-shot OUT.png [--host IP[:PORT]] [--pa PA] [--w W] [--h H] [--stride BYTES]
+                           [--fmt bgra|rgba] [--raw OUT.bin]
 
-Default: the panel framebuffer ABL scans out (0x9c400000, 1080x2280, 4320-byte rows, a8r8g8b8
-= bytes B G R A). Reads /dev/pmem through the file server (kernel 0094+, FlameBridge 2223), so the
-pixels are exact: compare them, don't eyeball them. Prints the time and the centre pixel.
+Default: queries live panel geometry (panel_pa, panel_w, panel_h, panel_stride) from DIAG
+on Kernel 0132+ (e.g. 0x9d000000 1080x2400 on RMX1931, 0x9c400000 1080x2280 on Pixel 4),
+falling back to 0x9c400000 1080x2280 on older kernels. Reads /dev/pmem through TCP 2223.
 """
-import argparse, importlib.util, os, struct, sys, time, zlib
+import argparse, importlib.util, json, os, struct, time, zlib
 
 here = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location('flame_files', os.path.join(here, 'flame-files.py'))
@@ -30,31 +31,52 @@ def png(path, w, h, rows):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('out')
-    ap.add_argument('--pa', type=lambda x: int(x, 0), default=0x9c400000)
-    ap.add_argument('--w', type=int, default=1080)
-    ap.add_argument('--h', type=int, default=2280)
+    ap.add_argument('--host', '-H', help='phone IP[:PORT] (else $SWEET_HOST or work/.sweet-host)')
+    ap.add_argument('--pa', type=lambda x: int(x, 0), default=None)
+    ap.add_argument('--w', type=int, default=None)
+    ap.add_argument('--h', type=int, default=None)
     ap.add_argument('--stride', type=int, default=0)
     ap.add_argument('--fmt', choices=['bgra', 'rgba'], default='bgra')
     ap.add_argument('--raw', help='also save the raw bytes')
     a = ap.parse_args()
-    stride = a.stride or a.w * 4
+
+    th, tp = ff.resolve_target(a.host) or (None, None)
+    pa, w, h, stride = a.pa, a.w, a.h, a.stride
+    if pa is None or w is None or h is None:
+        try:
+            d = json.loads(ff.diag_json(host=th, port=tp, timeout=4)).get('display', {})
+            if pa is None and d.get('panel_pa'):
+                pa = int(d['panel_pa'], 0)
+            if w is None and d.get('panel_w'):
+                w = int(d['panel_w'])
+            if h is None and d.get('panel_h'):
+                h = int(d['panel_h'])
+            if not stride and d.get('panel_stride'):
+                stride = int(d['panel_stride'])
+        except (OSError, ValueError, SystemExit):
+            pass
+    pa = 0x9c400000 if pa is None else pa
+    w = 1080 if w is None else w
+    h = 2280 if h is None else h
+    stride = stride or w * 4
+
     t0 = time.time()
-    data = ff.read_range(ff.conn(), '/dev/pmem', a.pa, stride * a.h)
+    data = ff.read_range(ff.conn(host=th, port=tp), '/dev/pmem', pa, stride * h)
     dt = time.time() - t0
     if a.raw:
         open(a.raw, 'wb').write(data)
     order = (2, 1, 0) if a.fmt == 'bgra' else (0, 1, 2)
     rows = []
-    for y in range(a.h):
-        r = data[y * stride:y * stride + a.w * 4]
-        rgb = bytearray(a.w * 3)
+    for y in range(h):
+        r = data[y * stride:y * stride + w * 4]
+        rgb = bytearray(w * 3)
         rgb[0::3] = r[order[0]::4]
         rgb[1::3] = r[order[1]::4]
         rgb[2::3] = r[order[2]::4]
         rows.append(bytes(rgb))
-    png(a.out, a.w, a.h, rows)
-    c = (a.h // 2) * stride + (a.w // 2) * 4
-    print(f'{a.out}: {a.w}x{a.h} from {a.pa:#x}, {len(data) / 1e6:.1f} MB in {dt:.2f} s '
+    png(a.out, w, h, rows)
+    c = (h // 2) * stride + (w // 2) * 4
+    print(f'{a.out}: {w}x{h} (stride {stride}) from {pa:#x}, {len(data) / 1e6:.1f} MB in {dt:.2f} s '
           f'({len(data) / 1e6 / max(dt, 1e-6):.1f} MB/s); centre pixel {data[c:c + 4].hex()}')
 
 
