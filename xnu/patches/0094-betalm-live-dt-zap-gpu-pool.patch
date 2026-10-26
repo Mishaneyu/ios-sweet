@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 451bb8d..24b2850 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -651,7 +651,7 @@ static int gmu_hfi(struct a6_gpu *g)
+ #include <pexpert/arm64/board_config.h>
+ #endif
+ #if defined(SWEET_BOARD_BETALM)
+-#define ZAP_REGION	0x98715000ull	/* LG G8S reserved-memory pil_gpu_region */
++#define ZAP_REGION	0x99915000ull	/* LG G8S pil_gpu_region (live device tree, after LG's dtbo) */
+ #else
+ #define ZAP_REGION	0x9a915000ull	/* reserved-memory pil_gpu_region */
+ #endif
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 83482a1..3253bb2 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -924,11 +924,13 @@ sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, ui
+ static const struct { uint64_t pa, size; } gpool_ranges[] = {
+ #if defined(SWEET_BOARD_BETALM)
+ 	/*
+-	 * G8S: the last fixed carve-out below 4 GB (cdsp_sec_regions) ends at
+-	 * 0xa8800000 and XNU takes RAM from 4 GB up (mkadt --highmem); ABL's
+-	 * ramdisk and the shim are dead once XNU runs. Leave a margin.
++	 * G8S (live device tree, after LG's dtbo): the last fixed carve-out
++	 * below 4 GB (cdsp_sec_regions) ends at 0xa8c00000 and LG's
++	 * ramoops_region is 0xb0000000 + 3 MB; XNU takes RAM from 4 GB up
++	 * (mkadt --highmem); ABL's ramdisk and the shim are dead once XNU runs.
++	 * wland's radio pool follows at 0xf0000000.
+ 	 */
+-	{ 0xb0000000ULL, 0x40000000ULL },       /* 1 GB */
++	{ 0xb0400000ULL, 0x3fc00000ULL },       /* 1020 MB */
+ #else
+ 	{ 0xc4000000ULL, 0x1c000000ULL },       /* 448 MB (the first 64 MB left to ABL's ramdisk) */
+ 	{ 0xe1000000ULL, 0x1f000000ULL },       /* 496 MB */
