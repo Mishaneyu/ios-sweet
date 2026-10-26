@@ -23,20 +23,7 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Detect build scope
-        id: scope
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "full=true" >> "$GITHUB_OUTPUT"
-          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1 && \
-               ! git diff --name-only HEAD~1 HEAD | grep -Eq '^(phone/turnip/|phone/metal2/|tools/build-turnip-ios\.sh|tools/build-m2v-bridge\.sh)'; then
-            echo "full=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "full=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Cache Mesa Turnip (libvulkan_freedreno.dylib)
-        if: steps.scope.outputs.full == 'true'
         id: cache-turnip
         uses: actions/cache@v4
         with:
@@ -44,7 +31,6 @@ jobs:
           key: turnip-ios-85fda3b3-${{ runner.os }}-${{ hashFiles('phone/turnip/**', 'tools/build-turnip-ios.sh', 'work/userland/bin/ios-cc') }}
 
       - name: Cache metal2vulkan bridge archive (libnative_metal_bridge.a)
-        if: steps.scope.outputs.full == 'true'
         id: cache-m2v-lib
         uses: actions/cache@v4
         with:
@@ -52,7 +38,7 @@ jobs:
           key: m2v-lib-720ef1ce-${{ runner.os }}-${{ hashFiles('phone/metal2/bridge/**', 'tools/build-m2v-bridge.sh') }}
 
       - name: Cache metal2vulkan Cargo dependencies
-        if: steps.scope.outputs.full == 'true' && steps.cache-m2v-lib.outputs.cache-hit != 'true'
+        if: steps.cache-m2v-lib.outputs.cache-hit != 'true'
         id: cache-m2v-cargo
         uses: actions/cache@v4
         with:
@@ -67,7 +53,6 @@ jobs:
             m2v-cargo-720ef1ce-${{ runner.os }}-
 
       - name: Cache SSH shell tools (dash, dropbearmulti, toybox)
-        if: steps.scope.outputs.full == 'true'
         id: cache-shell
         uses: actions/cache@v4
         with:
@@ -86,24 +71,22 @@ jobs:
           echo "DEVELOPER_DIR=$DEV_DIR" >> "$GITHUB_ENV"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
-          if [ "${{ steps.scope.outputs.full }}" = "true" ]; then
-            PKGS=""
-            if [ "${{ steps.cache-turnip.outputs.cache-hit }}" != "true" ] || [ "${{ steps.cache-m2v-lib.outputs.cache-hit }}" != "true" ]; then
-              PKGS="$PKGS llvm"
-            fi
-            if [ "${{ steps.cache-turnip.outputs.cache-hit }}" != "true" ]; then
-              PKGS="$PKGS bison flex ninja pkg-config glslang spirv-tools"
-            fi
-            if [ "${{ steps.cache-shell.outputs.cache-hit }}" != "true" ]; then
-              PKGS="$PKGS gnu-sed autoconf automake"
-            fi
-            if [ -n "$PKGS" ]; then
-              brew install $PKGS
-            fi
-            if [ -d "$(brew --prefix llvm 2>/dev/null)/bin" ] && [ ! -x /opt/homebrew/opt/llvm/bin/llvm-as ]; then
-              sudo mkdir -p /opt/homebrew/opt/llvm/bin
-              sudo ln -sf "$(brew --prefix llvm)/bin/llvm-as" /opt/homebrew/opt/llvm/bin/llvm-as
-            fi
+          PKGS=""
+          if [ "${{ steps.cache-turnip.outputs.cache-hit }}" != "true" ] || [ "${{ steps.cache-m2v-lib.outputs.cache-hit }}" != "true" ]; then
+            PKGS="$PKGS llvm"
+          fi
+          if [ "${{ steps.cache-turnip.outputs.cache-hit }}" != "true" ]; then
+            PKGS="$PKGS bison flex ninja pkg-config glslang spirv-tools"
+          fi
+          if [ "${{ steps.cache-shell.outputs.cache-hit }}" != "true" ]; then
+            PKGS="$PKGS gnu-sed autoconf automake"
+          fi
+          if [ -n "$PKGS" ]; then
+            brew install $PKGS
+          fi
+          if [ -d "$(brew --prefix llvm 2>/dev/null)/bin" ] && [ ! -x /opt/homebrew/opt/llvm/bin/llvm-as ]; then
+            sudo mkdir -p /opt/homebrew/opt/llvm/bin
+            sudo ln -sf "$(brew --prefix llvm)/bin/llvm-as" /opt/homebrew/opt/llvm/bin/llvm-as
           fi
           chmod +x work/userland/bin/ios-cc tools/*.sh phone/*/*.sh
 
@@ -123,13 +106,13 @@ jobs:
         run: |
           sh phone/wifi/build.sh
           sh phone/gpu/build.sh
-          [ ! -f phone/media/build.sh ] || sh phone/media/build.sh
-          [ ! -f phone/audio/build.sh ] || sh phone/audio/build.sh
+          sh phone/media/build.sh
+          sh phone/audio/build.sh
           sh phone/store/build.sh
           bash phone/tools/build.sh
 
       - name: Build Mesa Turnip (libvulkan_freedreno.dylib) for iOS 16 arm64
-        if: steps.scope.outputs.full == 'true' && steps.cache-turnip.outputs.cache-hit != 'true'
+        if: steps.cache-turnip.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 https://github.com/UniXNU/UniXNU.git reference-repos/UniXNU
           mkdir -p work/turnip
@@ -158,7 +141,7 @@ jobs:
           sh tools/build-turnip-ios.sh ios
 
       - name: Build metal2vulkan bridge (libnative_metal_bridge.a)
-        if: steps.scope.outputs.full == 'true' && steps.cache-m2v-lib.outputs.cache-hit != 'true'
+        if: steps.cache-m2v-lib.outputs.cache-hit != 'true'
         run: |
           rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
           git init -q work/metal2vulkan
@@ -171,12 +154,11 @@ jobs:
           sh tools/build-m2v-bridge.sh ios
 
       - name: Build SweetMetal2.bundle
-        if: steps.scope.outputs.full == 'true'
         run: |
           sh phone/metal2/build.sh
 
       - name: Build dash + dropbearmulti + toybox for iOS 16 arm64 SSH shell
-        if: steps.scope.outputs.full == 'true' && steps.cache-shell.outputs.cache-hit != 'true'
+        if: steps.cache-shell.outputs.cache-hit != 'true'
         continue-on-error: true
         run: |
           mkdir -p work/userland/stage work/userland/src
@@ -248,18 +230,12 @@ jobs:
       - name: Package userland bundle
         run: |
           mkdir -p dist-userland/bin dist-userland/Extensions dist-userland/lib dist-userland/HAL dist-userland/Applications
-          if [ -d phone/metal2/out/SweetMetal2.bundle ]; then
-            cp -R phone/metal2/out/SweetMetal2.bundle dist-userland/Extensions/
-          fi
-          if [ -d phone/media/out ]; then
-            cp phone/media/out/libsweet_media.dylib phone/media/out/libsweet_sysfix.dylib dist-userland/lib/
-          fi
-          if [ -d phone/audio/out/HakiosAudio.driver ]; then
-            cp -R phone/audio/out/HakiosAudio.driver dist-userland/HAL/
-          fi
+          cp -R phone/metal2/out/SweetMetal2.bundle dist-userland/Extensions/
+          cp phone/media/out/libsweet_media.dylib phone/media/out/libsweet_sysfix.dylib dist-userland/lib/
+          cp -R phone/audio/out/HakiosAudio.driver dist-userland/HAL/
           cp -R phone/store/out/SweetStore.app dist-userland/Applications/
           cp phone/store/out/sweetstored dist-userland/bin/
-          cp phone/metal2/out/m2vtest dist-userland/bin/ 2>/dev/null || true
+          cp phone/metal2/out/m2vtest dist-userland/bin/
           cp phone/wifi/out/wland dist-userland/bin/
           cp phone/gpu/out/gpu phone/gpu/out/pmem dist-userland/bin/
           cp phone/tools/out/* dist-userland/bin/

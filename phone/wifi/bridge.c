@@ -6,20 +6,93 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/sysctl.h>
 #include "flamewlan.h"
 #include "link.h"
 #include "radio.h"
 #include "bridge.h"
 
 static int bfd = -1;
-static int hello_sent;
+static int hello_sent, configd_checked;
 static int scan_pending, join_pending;
 static unsigned scans_at;
-static uint64_t scan_deadline, join_deadline, last_bg_scan;
+static uint64_t hello_ms, scan_deadline, join_deadline, last_bg_scan;
 int bridge_joins;	/* wifid has asked for a network (or to leave): wland's own wlan.conf join stands down */
+
+#define SC_PREFS	"/private/var/preferences/SystemConfiguration/preferences.plist"
+#define SC_NETIF	"/private/var/preferences/SystemConfiguration/NetworkInterfaces.plist"
+
+static void bridge_console(const char *msg)
+{
+	int cfd = open("/dev/console", O_WRONLY | O_NOCTTY);
+	if (cfd >= 0) {
+		(void)write(cfd, msg, strlen(msg));
+		close(cfd);
+	}
+}
+
+static int has_ascii(const uint8_t *buf, size_t len, const char *needle)
+{
+	size_t nlen = strlen(needle);
+	if (!nlen || len < nlen)
+		return 0;
+	for (size_t i = 0; i + nlen <= len; i++) {
+		if (!memcmp(buf + i, needle, nlen))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * configd starts at boot (~13 s) before wland finishes booting the modem + WCN3990 (~22 s), so on the
+ * first boot without Wi-Fi it writes a SystemConfiguration preferences.plist with no en0 NetworkService.
+ * Once FW_HELLO has published en0 + RedwoodWLAN in IORegistry, check preferences.plist and, if en0 is
+ * missing, move the stale pre-Wi-Fi plist aside and SIGTERM configd so launchd respawns it with en0 live.
+ */
+static void ensure_en0_configd(void)
+{
+	static uint8_t buf[65536];
+	int has_en0 = 0;
+	int fd = open(SC_PREFS, O_RDONLY);
+	if (fd >= 0) {
+		ssize_t n = read(fd, buf, sizeof(buf));
+		close(fd);
+		if (n > 0 && has_ascii(buf, (size_t)n, "en0"))
+			has_en0 = 1;
+	}
+	if (has_en0) {
+		printf("[%6llu] bridge: SystemConfiguration already has en0\n", (unsigned long long)link_ms());
+		return;
+	}
+	if (fd >= 0) {
+		(void)rename(SC_PREFS, SC_PREFS ".pre-wifi");
+		(void)rename(SC_NETIF, SC_NETIF ".pre-wifi");
+	}
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	size_t len = 0;
+	int killed = 0;
+	if (sysctl(mib, 3, NULL, &len, NULL, 0) == 0 && len > 0) {
+		len += len / 4;
+		struct kinfo_proc *p = malloc(len);
+		if (p && sysctl(mib, 3, p, &len, NULL, 0) == 0) {
+			int count = (int)(len / sizeof(*p));
+			for (int i = 0; i < count; i++) {
+				if (!strcmp(p[i].kp_proc.p_comm, "configd") &&
+				    kill(p[i].kp_proc.p_pid, SIGTERM) == 0)
+					killed++;
+			}
+		}
+		free(p);
+	}
+	printf("[%6llu] bridge: seeded en0 in SystemConfiguration (killed %d configd)\n",
+	       (unsigned long long)link_ms(), killed);
+	bridge_console("wland: seeded en0 in SystemConfiguration (restarted configd)\n");
+}
 
 static void bridge_send(uint16_t type, const void *data, size_t len)
 {
@@ -107,8 +180,8 @@ static void on_join(const struct fw_join *j)
 	ssid[j->ssid_len] = 0;
 	if (radio_joined() && cl == j->ssid_len && !memcmp(cur, j->ssid, cl)) {
 		printf("[%6llu] bridge: join '%s': joined already\n", (unsigned long long)link_ms(), ssid);
-		bridge_status(FW_JOIN_DONE, 0);
 		bridge_link(1);
+		bridge_status(FW_JOIN_DONE, 0);
 		return;
 	}
 	if (j->key_kind == FW_KEY_PASSPHRASE && j->key_len >= 8 && j->key_len <= 63) {
@@ -142,7 +215,14 @@ void bridge_poll(void)
 		memcpy(h.address, radio_mac, 6);
 		bridge_send(FW_HELLO, &h, sizeof(h));
 		hello_sent = 1;
-		printf("[%6llu] bridge: hello: the kernel makes en0\n", (unsigned long long)link_ms());
+		hello_ms = link_ms();
+		configd_checked = 0;
+		printf("[%6llu] bridge: hello: the kernel makes en0\n", (unsigned long long)hello_ms);
+		bridge_console("wland: FW_HELLO sent -> en0 live\n");
+	}
+	if (hello_sent && !configd_checked && link_ms() - hello_ms >= 800) {
+		configd_checked = 1;
+		ensure_en0_configd();
 	}
 	for (int n = 0; n < 32; n++) {
 		ssize_t r = read(bfd, m, sizeof(m));

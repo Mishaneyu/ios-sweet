@@ -1440,6 +1440,13 @@ static char sweetMemoryOwnerKey;
 - (BOOL)isLowPower {return NO;}
 - (BOOL)isRemovable {return NO;}
 - (BOOL)isHeadless {return NO;}
+- (NSUInteger)gpuCoreCount {return 2;}
+- (NSUInteger)maxVertexAmplificationCount {return 1;}
+- (BOOL)supportsVertexAmplificationCount:(NSUInteger)count {return count==1;}
+- (NSUInteger)maxComputeThreadgroupMemory {return 32768;}
+- (BOOL)isLargeMRTSupported {return NO;}
+- (BOOL)supportsComputeCompressedTextureWrite {return NO;}
+- (BOOL)supportsConditionalLoadStore {return NO;}
 // supportsFamily: and the other queries the runtime answers are installed from it (installAnswers); supportsFamily: also answers the target
 // hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). No legacy feature set is claimed: the
 // base implementation reads Apple tables this device does not have.
@@ -1732,6 +1739,7 @@ static void installAnswers(Class cls) {
  uint32_t kind=0;
  for(size_t i=0;const char *name=nmb_device_answer_selector(i,&kind);i++) {
   SEL sel=sel_registerName(name);uint64_t value=0;
+  if(class_getInstanceMethod([NBDeviceMethods class],sel))continue;
   switch(kind) {
   case NMB_ANSWER_COUNT: case NMB_ANSWER_FLAG:
    if(!nmb_device_answer(gDevice,name,0,&value)){NBLOG(@"native-metal: no device answer: %@",lastError());continue;}

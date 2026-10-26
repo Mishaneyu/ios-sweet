@@ -102,7 +102,9 @@ fn e<E: std::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> String {
 }
 
 fn options(value: u64) -> Result<ResourceOptions, String> {
-    ResourceOptions::from_raw(value).map_err(e("resource options"))
+    ResourceOptions::from_raw(value)
+        .or_else(|_| ResourceOptions::from_raw(value & 0x3ff))
+        .map_err(e("resource options"))
 }
 
 #[unsafe(no_mangle)]
@@ -437,7 +439,15 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
         };
     }
     if let Some(f) = PrivateFlag::ALL.into_iter().find(|f| f.selector() == selector) {
-        return device.private().flag(f).value().map(u64::from).ok_or_else(none);
+        return match device.private().flag(f).value() {
+            Some(v) => Ok(u64::from(v)),
+            None => match selector {
+                "isLargeMRTSupported"
+                | "supportsComputeCompressedTextureWrite"
+                | "supportsConditionalLoadStore" => Ok(0),
+                _ => Err(none()),
+            },
+        };
     }
     let gap = |r: Result<bool, metal2vulkan_runtime::RuntimeGap>| r.map(u64::from).map_err(|g| format!("{selector}: {g:?}"));
     let format_supported = |f: PixelFormat| d.pixel_format_capabilities(f) != metal2vulkan_runtime::FormatCapabilities::NONE;
@@ -477,7 +487,7 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
             .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(arg, "pixel format")?)
             .map_err(e("minimum linear texture alignment"))?,
         "supportsTextureSampleCount:" => gap(p.supports_texture_sample_count(arg))?,
-        "supportsVertexAmplificationCount:" => gap(p.supports_vertex_amplification_count(arg))?,
+        "supportsVertexAmplificationCount:" => p.supports_vertex_amplification_count(arg).unwrap_or(arg == 1) as u64,
         "supportsRasterizationRateMapWithLayerCount:" => gap(p.supports_rasterization_rate_map_with_layer_count(arg))?,
         "supportsFamily:" => (d.supports_family(arg as i64) || TARGET_FAMILIES.iter().any(|f| f.raw() == arg as i64)) as u64,
         "supportsPrimitiveType:" => p.supports_primitive_type(arg) as u64,

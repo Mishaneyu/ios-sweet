@@ -15,6 +15,7 @@
 
 static const struct { const char *service, *domain; uint32_t instance; } db[] = {
 	{ "tms/servreg", "msm/modem/root_pd", 180 },
+	{ "tms/pdr_enabled", "msm/modem/root_pd", 180 },
 	{ "gps/gps_service", "msm/modem/root_pd", 180 },
 	{ "kernel/elf_loader", "msm/modem/wlan_pd", 180 },
 	{ "tms/servreg", "msm/modem/wlan_pd", 180 },
