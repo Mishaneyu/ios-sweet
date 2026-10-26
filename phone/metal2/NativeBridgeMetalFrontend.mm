@@ -196,7 +196,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 }
 static uint64_t sweetTexelBytes(MTLPixelFormat f);
 static bool sweetBlock(MTLPixelFormat f, uint32_t *bw, uint32_t *bh, uint32_t *bytes);
-@interface NSObject (NBTextureViewDesc)
+@protocol NBTextureViewDesc <NSObject>
 - (MTLPixelFormat)pixelFormat;
 - (MTLTextureType)textureType;
 - (NSRange)levelRange;
@@ -264,9 +264,11 @@ NB_RESOURCE_SPI
 }
 - (id<MTLTexture>)newTextureViewWithDescriptor:(id)d {
  if(!d)return nil;
- const MTLPixelFormat format=[d pixelFormat]?:self.pixelFormat;
- const MTLTextureType type=[d textureType];
- NSRange levels=[d levelRange],slices=[d sliceRange];
+ id<NBTextureViewDesc> desc=(id<NBTextureViewDesc>)d;
+ const MTLPixelFormat df=[desc pixelFormat];
+ const MTLPixelFormat format=(df!=MTLPixelFormatInvalid)?df:self.pixelFormat;
+ const MTLTextureType type=[desc textureType];
+ NSRange levels=[desc levelRange],slices=[desc sliceRange];
  if(!levels.length)levels=NSMakeRange(0,MAX((NSUInteger)1,self.mipmapLevelCount));
  if(!slices.length) {
   const NSUInteger mult=([self textureType]==MTLTextureTypeCube || [self textureType]==MTLTextureTypeCubeArray)?6:1;
