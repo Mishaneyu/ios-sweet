@@ -1,9 +1,25 @@
 # Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-26, 04:20 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-26, 07:25 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
+
+### HACKIOS PERIPHERALS, RUNTIME FIXES, AUDIO HAL & MEDIA/SYSFIX DYLIBS BUILT ON `feat/hackios-port` (Kernel 0200, 2026-10-26, 07:25)
+- **Isolated branch `feat/hackios-port` (commits `0ad8f81` + `245f27e`)**:
+  - **Kernel 0200 (`xnu/patches/0200-rmx1931-hackios-peripherals.patch`)** — built cleanly with `-Weverything -Werror` on GitHub Actions `macos-15` (`xnu.yml` run `40255592224`, artifact `xnu-kernel` `12622024693`):
+    - **AMFI & Sandbox (`bsd/kern/sweet_amfi.c`)**: AMFI `0x5a` (`0xffULL` unless FairPlay-encrypted, allowing `DYLD_INSERT_LIBRARIES` on `__RESTRICT` daemons), AMFI `0x60` (`0x86ULL` for ExtensionKit/PlugInKit/Shortcuts), Sandbox op `4` (`CFFIXED_USER_HOME=` stack lookup returning `0` on match and `ENOENT` when absent), and entitlement-matched `sweet_sandbox_priv_grant` table (`privs=0` disables).
+    - **Process & exec injection (`bsd/kern/kern_exec.c`, `bsd/kern/bsd_init.c`)**: `kern.exec_inject` sysctl + boot-time `sweet_exec_inject_init()` (`/private/var/local/inject.conf` or auto-detected `/usr/local/lib/libsweet_*.dylib`, gated on `sweetinject=1`), `xpcproxy` `pidversion` preservation across `exec` (`xpcproxy_idversion=1` restores stock), and persona-less `posix_spawn` credential adoption (`spawn_validate_persona` / `spawn_persona_adopt`).
+    - **RMX1931 Battery (`bsd/dev/rmx1931_battery.{c,h}`, `bsd/dev/sweet_spmi.c`, `iokit/Kernel/arm/SweetBattery.cpp`)**: strictly read-only TI `BQ28Z610`/`BQ27541` (`0x55`, `EAST` TLMM `0x03500000` `GPIO 27/28`, 2S SuperVOOC pack normalization, pin restore on non-RMX1931 boards) + read-only `PM8150B` SID `2` SMB5 observer (`0x1310`/`0x1006`) feeding `IOPMPowerSource` via `SweetBatteryReport()` + `kern.rmx1931.battery_*` sysctls (`rmxbattery=0` disables).
+    - **RMX1931 Audio Sink (`bsd/dev/rmx1931_audio.c`)**: `/dev/hakios-audio` (`0666`) non-blocking 48 kHz 16-bit stereo sink + `HAKIOS_AUDIO_SET_VOLUME` ioctl + playback stretch logger (`rmxaudio=0` disables).
+    - **RMX1931 Flashlight (`bsd/dev/rmx1931_torch.c`)**: `/dev/hakios-torch` (`0666`) driving `PM8150L` SID `5` `0xd300` (`PPID 0x5d3`, `qpnp-flash-led-v2` channel 0), capped at `125 mA` and `30 s` continuous on-time (`rmxtorch_max_s=N`), with `PM8150L` SID `4` `0x2400` temp-alarm, battery `>= 45 C`, and VPH droop/fault cutoffs (`rmxtorch=0` disables).
+    - **RMX1931 Haptics (`bsd/dev/rmx1931_haptic.c`)**: `/dev/hakios-haptic` (`0666`) driving Awinic `AW8697` (`0x5a`, `SOUTH` TLMM `0x03d00000` `GPIO 98/99`, reset `GPIO 116`) in closed-loop `170 Hz` (`LRA_0619`) `CONT` mode with zero-crossing `AUTO_BRK` braking, `97` drive ceiling, `1000 ms` max activation + cooldown, and `SYSINT` fault cutoff (`rmxhaptic=0` disables).
+  - **Userland & Host Tooling** — built cleanly on GitHub Actions `macos-15` (`userland.yml` run `40253488169`, artifact `ios-userland` `12622330392`):
+    - `phone/media/` (`libsweet_media.dylib` for `mediaserverd`: skips `BWCoreImageFilterRenderer` portrait GLES prewarm, registers `VCPHEVC.videocodec` software HEVC encoder, bridges `FigFlashlight` on `20H392`/`20F66` to `/dev/hakios-torch`, and prepares CMCapture graph shims; `libsweet_sysfix.dylib` for `containermanagerd` `personasAreSupported -> NO` and `SpringBoard` JPEG/PNG app snapshots).
+    - `phone/audio/` (`HakiosAudio.driver` CoreAudio HAL plug-in presenting `"Speaker"`, `"Hawking"`, `"Actuator"` -> `/dev/hakios-haptic`, and `"Codec"`).
+    - `tools/mkadt.py` (preserves `/product` child subnodes `camera` `flash=1`, `haptics` `closed-loop=1`, `audio`, `facetime`, `maps`), `tools/sweet-root-tweaks.py`, and `tools/rmx1931-install-hackios.sh`.
+- **Open (after merging with main Wi-Fi/display work)**:
+  1. Re-generate `rmx1931-hi.adt` via `tools/mkadt.py --highmem` (adds `/product/camera` & `/product/haptics`), install `ios-userland` via `tools/rmx1931-install-hackios.sh`, and boot-test on RMX1931 hardware (`launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 ufslogsecs=2 sweetgpu=1 sweetmtl=2 sweetusb=2 sweetusbframes=0 rmxtouchdelay=2`) to verify `RMX BATTERY`, Control Center torch (`RMX TORCH`), UIKit haptics (`RMX HAPTIC`), HEIC wallpapers, and `RMX AUDIO`.
 
 ### INTERACTIVE iOS 16.7.16 UI ON RMX1931 (Boot #6, kernel 0127) + ROOT CAUSE OF CPU FALLBACK FIXED IN KERNEL 0128 (2026-10-26, 04:20)
 - **Boot #6 (`shim/out/shim-rmx1931-ios.img`, kernel `0127`, 16 GiB iOS 16.7.16 `20H392` HFS+ root on `/dev/block/sda16`)**:
