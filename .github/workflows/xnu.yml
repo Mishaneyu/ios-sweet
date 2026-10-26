@@ -131,7 +131,7 @@ jobs:
         run: bash build.sh
 
       - name: Package build tree for local compiles
-        if: always()
+        if: failure()
         run: |
           # Generated headers, config option headers, mig output and the patched
           # source: enough to re-run any single compile command from the log locally.
@@ -146,14 +146,14 @@ jobs:
           ls -la buildtree.tgz
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: failure()
         with:
           name: xnu-buildtree
           path: buildtree.tgz
           retention-days: 7
 
       - name: Inspect closed KDK support libs
-        if: always()
+        if: failure()
         run: |
           mkdir -p out-debug/kdk-libs
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
