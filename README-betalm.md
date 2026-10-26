@@ -71,6 +71,7 @@ Everything that depends on the real hardware is listed under
 | 0092 | CPU clusters to full speed through the OSM hardware DCVS (ios-flame's `sweet_cpufreq.c`; ABL leaves them slow). `sweetcpufreq=0` keeps ABL's speed, `=N` caps at N MHz |
 | 0093 | **Wi-Fi from ios-flame** (Pixel 4, same SM8150 + WCN3990; ios-topaz/HackiOS code inside, APSL 2.0): `/dev/wlan` to the userland radio (wland), `en0` + Apple80211 ioctls for wifid, IO80211Controller/IONetworkInterface registry entries, IOKit quiesce, keystore wrap; 10-bit surfaces as BGRA for WebKit's content process. With `mkadt.py`'s `wlan` node launchd starts wifid |
 | 0094 | Addresses from the **live** device tree (`/sys/firmware/fdt`, after LG's dtbo): zap shader at pil_gpu_region 0x99915000 (the boot image's base DT said 0x98715000, inside LG's SLPI region), GPU pool 0xb0400000 + 1020 MB (clear of LG's ramoops at 0xb0000000) |
+| 0095 | Time of day from the PM8150 RTC (ios-flame 0099) plus boot-arg `sweetrtcoff` (Android: `date +%s` minus `/sys/class/rtc/rtc0/since_epoch`); publishing IORTC also removes IOKit's 30 s wait at every boot |
 
 `tools/mkadt.py`: Kryo 485 topology and clocks, 1080×2248, `lge,betalm`
 compatible, 3 GiB RAM default. `tools/sweet-log-pull.sh -p NAME`: read the
@@ -219,6 +220,7 @@ Lines to look for: `SWEET: boot-args` (has the shim's `shim.*` report),
 | `sweetmtl=1/2` | Publish the Metal accelerator (2: ios-flame's SweetMetal2, metal2vulkan + Turnip; needs the bundle in the root) |
 | `sweetfb_hz=60` | Present up to 60 frames/s (the old images used 30) |
 | `sweetcpufreq=N` | 1 (default) full speed, 0 leave ABL's speed, N: at most N MHz |
+| `sweetrtcoff=N` | Seconds to add to the PM8150 RTC for the time of day |
 | `sweettouch=0` | Touch driver off |
 | `sweettouchi2cus=N` | Bit-banged I²C half clock period in µs (default 2, about 200 kHz) |
 | `sweettouchfingers=N` | Object slots read per report when bit-banging (default 2; up to 10) |
