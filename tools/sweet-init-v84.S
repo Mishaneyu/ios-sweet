@@ -255,7 +255,7 @@ lit_a:		.quad	0x1122334455667788
 lit_b:		.quad	0xaabbccddeeff0011
 lit_c:		.quad	0x0123456789abcdef
 dbl_neg42:	.quad	0xc045000000000000	/* -42.0 */
-dbl_wrap5:	.quad	0x41f00000016e0000	/* 4294967301.75 = 2^32 + 5.75 */
+dbl_wrap5:	.quad	0x41f00000005c0000	/* 4294967301.75 = 2^32 + 5.75 */
 dbl_nan:	.quad	0x7ff8000000000000	/* quiet NaN */
 five_sec:
 	.quad	5

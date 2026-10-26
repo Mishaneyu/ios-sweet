@@ -191,6 +191,7 @@ def build(seed=None, qemu=False, highmem=False, d22ap=False):
             ('sidp-rom-manifest-hash', SIDP_MANIFEST_HASH),
             ('effective-security-mode-ap', u32(1)),
             ('effective-production-status-sep', u32(0)),
+            ('kernel-ctrr-to-be-enabled', u32(1)),
             ('image4-supported', b''),
             ('display-corner-radius', u32(39)),
         ]
@@ -323,7 +324,7 @@ def build(seed=None, qemu=False, highmem=False, d22ap=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs, pram]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':

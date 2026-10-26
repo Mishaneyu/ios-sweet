@@ -301,9 +301,10 @@ def main():
     mon = f'{out}/mon.sock'
     if os.path.exists(mon):
         os.unlink(mon)
-    # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
+    # virt RAM starts at 0x40000000: cover both the payload's RAM and
+    # bsd/dev/sweet_ufs.c's SWEET_MIRROR_PA (0x1fe000000..0x1fe401000 < 0x200000000 = 0x40000000 + 7G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
-    ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
+    ram_gib = max(7, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',

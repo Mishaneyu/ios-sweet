@@ -1,9 +1,20 @@
 # Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-26, 04:20 local** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-26, 15:42 IST** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
+
+### Kernel 0135 built cleanly on CI; Gate 1 preflight findings folded into kernel 0136 (2026-10-26)
+- CI [40295879220](https://github.com/nithinyadavamaraboina-online/ios-rmx1931/actions/runs/40295879220) (`7852c4a`, kernel `0135`) PASSED compilation, final link and packaging. Downloaded `kernel.development.sweet` (`work/boot/kernel-26-0135`, `21,315,648` B) and verified SHA-256 `a905e3d7a19fec3583907f8582ec3b854398cd33248195aea2fae68ae9bc163d`.
+- QEMU `virt` (`-cpu cortex-a76`) diagnostic runs against `0135` exposed five clean bring-up deltas in `xnu-12377.121.6` + host tools:
+  1. `tools/qemu-sweet.py`: raised `ram_gib = max(7, ...)` so QEMU `virt` RAM (`0x40000000..0x200000000`) covers `/pram` (`0x1fd000000`) and `SWEET_MIRROR_PA` (`0x1fe000000`).
+  2. `tools/mkadt.py`: added `/chosen/kernel-ctrr-to-be-enabled = u32(1)` for `D421AP` (required by `ml_unsafe_kernel_text_init()` under `DEVELOPMENT` in `xnu-12377`) and included `/pram` in `--qemu` ADTs so `PE_init_panicheader()` / `SavePanicInfo()` never hit `assert(panic_info)`.
+  3. `tools/sweet-init-v84.S`: corrected the `dbl_wrap5` IEEE-754 float64 literal (`4294967301.75` = `0x41f00000005c0000`; `0x41f00000016e0000` was `4294967318.875`).
+  4. `SweetCPU.cpp` (`0136`): in `xnu-12377` under `!USE_APPLEARMSMP`, `ml_processor_register()` calls `processor_boot()` directly and `processor_start()` (`processor_start_from_kext`) is stubbed to `KERN_FAILURE` (`5`). Moved `ml_processor_register()` into `SweetCPU::startAll()`'s sequential CPU loop (`0..num_cpus-1`) and dropped the obsolete `processor_start()` call.
+  5. `sweet_spmi.c`, `sweet_keys.c`, `SweetPlatformExpert.cpp`, `kern_exec.c` (`0136`): guarded Qualcomm SPMI (`0x0c440000`), `flame_wdt_start()` (`0x17c10000`), and `sweet_log_mirror_start()` on `/sweet-ufs` with synthetic `IORTC` publication when `/sweet-ufs` is absent (eliminating the unmapped MMIO abort and 30 s `IOKitInitializeTime` stall on QEMU), and defaulted `unentitled_ios_sim_launch` to `true` on `ARM64_BOARD_CONFIG_SWEET`.
+- Pending: build `0136` on CI, download and SHA-256 verify the untouched `kernel.development.sweet` artifact, run official Gate 1a (`sweet-init-v84.macho`) and Gate 1b (`ios26-qemu-dyld.img`), then proceed to Gate 2 (`RMX1931` non-destructive `rd=md0` hardware boot).
+
 
 ### Existing kmem RNG fallback was compiled out (kernel 0135, 2026-10-26)
 - CI [40287156631](https://github.com/nithinyadavamaraboina-online/ios-rmx1931/actions/runs/40287156631) (`c1788f5`, kernel 0134) PASSED compilation, final link and packaging.

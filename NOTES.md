@@ -136,3 +136,4 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 - iOS 26 patch 0134: match Firehose chunk-count configuration and ABI to libdispatch; prevent early-boot log copy from corrupting buffer header.
 
 - 0135 iOS 26: use `ARM64_BOARD_CONFIG_SWEET` and declare `early_random` in `corecrypto_rand.c` to activate the existing allocator RNG fallback without a registered corecrypto provider.
+- 0136 iOS 26: register/boot `SweetCPU` sequentially via `ml_processor_register` (`processor_start` is stubbed in `xnu-12377`), guard Qualcomm SPMI/WDT/mirror on `/sweet-ufs` with synthetic `IORTC` for QEMU, and default `unentitled_ios_sim_launch` to `true` on `SWEET`.
