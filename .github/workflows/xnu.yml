@@ -68,22 +68,26 @@ jobs:
 
           # 3. Keep dxb's own conditional check loop for dxb/patches/26.0 (which has commented-out/26.0-only
           #    patches), then stage & apply all xnu/patches-26 scripts and patches fail-fast
-          old_patches = """        for PATCH in "${PATCH_DIR}"/*.patch; do
-            if git apply --check "$PATCH" 2> /dev/null; then
-                running "Applying patch: ${PATCH}"
-                git apply "$PATCH"
-            fi
-        done"""
-          new_patches = old_patches + """
-        SWEET_PATCH_DIR="${GITHUB_WORKSPACE}/xnu/patches-26"
-        for SCRIPT in "${SWEET_PATCH_DIR}"/*.sh; do
-            running "Running sweet stage script: ${SCRIPT}"
-            bash "${SCRIPT}"
-        done
-        for PATCH in "${SWEET_PATCH_DIR}"/*.patch; do
-            running "Applying sweet patch: ${PATCH}"
-            git apply --verbose "$PATCH"
-        done"""
+          old_patches = (
+              '        for PATCH in "${PATCH_DIR}"/*.patch; do\n'
+              '            if git apply --check "$PATCH" 2> /dev/null; then\n'
+              '                running "Applying patch: ${PATCH}"\n'
+              '                git apply "$PATCH"\n'
+              '            fi\n'
+              '        done'
+          )
+          new_patches = (
+              old_patches + '\n'
+              '        SWEET_PATCH_DIR="${GITHUB_WORKSPACE}/xnu/patches-26"\n'
+              '        for SCRIPT in "${SWEET_PATCH_DIR}"/*.sh; do\n'
+              '            running "Running sweet stage script: ${SCRIPT}"\n'
+              '            bash "${SCRIPT}"\n'
+              '        done\n'
+              '        for PATCH in "${SWEET_PATCH_DIR}"/*.patch; do\n'
+              '            running "Applying sweet patch: ${PATCH}"\n'
+              '            git apply --verbose "$PATCH"\n'
+              '        done'
+          )
           assert old_patches in s, "Failed to find patch loop in dxb/build.sh"
           s = s.replace(old_patches, new_patches, 1)
 
