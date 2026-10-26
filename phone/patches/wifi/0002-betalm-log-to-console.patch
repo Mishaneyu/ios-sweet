@@ -1,0 +1,18 @@
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -736,7 +736,14 @@
+ 		fclose(f);
+ 	}
+ 	rename(WLAND_LOG, WLAND_LOG ".prev");
+-	if (freopen(WLAND_LOG, "a", stdout))
++	/*
++	 * LG G8S: no SSH yet, so the only log that leaves the phone is the
++	 * kernel's persistent console ring (read from recovery): log there,
++	 * unless /var/local/wland.filelog asks for the file.
++	 */
++	if (access("/var/local/wland.filelog", F_OK) != 0 && freopen("/dev/console", "a", stdout))
++		dup2(fileno(stdout), 2);
++	else if (freopen(WLAND_LOG, "a", stdout))
+ 		dup2(fileno(stdout), 2);
+ 	setvbuf(stdout, NULL, _IONBF, 0);
+ 	printf("wland auto: boot %ld, memory limit 2048 MB -> %d\n", (long)bt.tv_sec, mrc);
