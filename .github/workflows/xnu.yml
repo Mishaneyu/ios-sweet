@@ -16,7 +16,7 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main, master, upgrade_ios_version_target]
+    branches: [main, master, upgrade_ios_version_target, "ci/**"]
     paths:
       - "xnu/patches-26/**"
       - "xnu/patches/**"

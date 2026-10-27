@@ -1,0 +1,368 @@
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index 5d744a9..ef2b9da 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -72,8 +72,12 @@ type_name(int32_t type)
+ 		{ 44, "HARDWARE_VERSION" }, { 46, "RSN_IE" }, { 47, "BACKGROUND_SCAN" }, { 48, "AP_IE_LIST" }, { 49, "STATS" },
+ 		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" }, { 66, "MCS_INDEX_SET" },
+ 		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
+-		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
+-		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
++		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 96, "VIRTUAL_IF_ROLE" },
++		{ 97, "VIRTUAL_IF_PARENT" }, { 103, "CURRENT_NETWORK" }, { 106, "RSSI_BOUNDS" }, { 107, "ROAM" },
++		{ 115, "POWER_DEBUG_INFO" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" }, { 383, "SET_PROPERTY" },
++		{ 473, "MIMO_CONFIG" }, { 481, "HEARTBEAT" }, { 483, "EXTERNAL_POWER_STATE" }, { 485, "APP_STATE" },
++		{ 512, "INFRA_ENUMERATED" }, { 560, "PROTOCOL_CLEANUP_COMPLETE" }, { 564, "FILTER_MONITOR_EVENTS" },
++		{ 582, "REAL_TIME_3PARTY_APP" },
+ 	};
+ 
+ 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+@@ -114,13 +118,17 @@ struct apple80211_channels_info {
+ 	uint8_t unknown_3[3600];
+ } __attribute__((packed));
+ 
+-/* SCAN_REQ (10): 5456 bytes */
++#define SCAN_REQUEST_IOS16_BYTES        5456
++#define SCAN_RESULT_IOS16_BYTES         1164
++#define SCAN_RESULT_IOS16_ELEMENTS      1024
++
++/* SCAN_REQ (10): 5528 bytes in iOS 26 (5456 bytes in iOS 16.5) */
+ struct apple80211_scan_request {
+ 	uint32_t version, bss_type;
+ 	uint8_t bssid[6], unused_0[2];
+ 	uint32_t ssid_length;
+ 	uint8_t ssid[32];
+-	uint32_t scan_type;                     /* 1: asking, 2: listening only */
++	uint32_t scan_type;                     /* 1: asking, 2: listening only, 3: fast */
+ 	uint32_t phy_mode;
+ 	uint16_t dwell_ms, unused_1;
+ 	uint32_t rest_ms;
+@@ -130,10 +138,12 @@ struct apple80211_scan_request {
+ 	uint32_t unused_2;
+ 	uint32_t name_count;                    /* networks asked for by name, each in 56 bytes */
+ 	uint8_t names[10][56];
+-	uint32_t short_ssid, unused_3;
++	uint32_t short_ssid;
++	char scan_uuid[64];
++	uint8_t ios26_tail[12];
+ };
+ 
+-/* SCAN_RESULT (11) and CURRENT_NETWORK (103): 1164 bytes */
++/* SCAN_RESULT (11) and CURRENT_NETWORK (103): 2272 bytes in iOS 26 (1164 bytes in iOS 16.5) */
+ struct apple80211_scan_result {
+ 	uint32_t version;
+ 	struct apple80211_channel channel;
+@@ -147,19 +157,35 @@ struct apple80211_scan_result {
+ 	uint32_t age_ms;
+ 	uint8_t flags, unused_2;
+ 	uint16_t elements_length;               /* comes in as the room there is */
+-	uint8_t elements[1024];
++	uint8_t elements[2048];
++	char scan_uuid[64];
++	uint8_t ios26_tail[20];
+ };
+ 
+-/* ASSOCIATE (20): 592 bytes; of what follows the key (the RSN element wifid built, flags) nothing is used */
++/* ASSOCIATE (20): 908 bytes in iOS 26 (auth_lower/auth_upper widened to 32-bit, shifting what follows by +4 bytes) */
+ struct apple80211_assoc {
+ 	uint32_t version;
+-	uint16_t mode, auth_lower, auth_upper, unused_0;
++	uint16_t mode, unused_0;
++	uint32_t auth_lower, auth_upper;
+ 	uint32_t ssid_length;
+ 	uint8_t ssid[32];
+ 	uint8_t bssid[6], unused_1[2];
+ 	uint32_t key_version, key_length, key_cipher;   /* cipher 10: a passphrase as typed; 6: the key (from 64 hex digits) */
+ 	uint16_t key_flags, key_index;
+ 	uint8_t key[64];
++	uint8_t rest[768];
++};
++
++/* ASSOCIATE (20) in iOS 16.5: 592 bytes */
++struct apple80211_assoc_ios16 {
++	uint32_t version;
++	uint16_t mode, auth_lower, auth_upper, unused_0;
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint8_t bssid[6], unused_1[2];
++	uint32_t key_version, key_length, key_cipher;
++	uint16_t key_flags, key_index;
++	uint8_t key[64];
+ 	uint8_t rest[0x250 - 0x88];
+ };
+ 
+@@ -177,19 +203,25 @@ struct apple80211_link_changed {
+ 	uint8_t unused_3[4];
+ };
+ 
+-_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
++_Static_assert(sizeof(struct apple80211_assoc) == 908 && offsetof(struct apple80211_assoc, ssid_length) == 0x10 &&
++    offsetof(struct apple80211_assoc, key) == 0x4c && offsetof(struct apple80211_assoc, rest) == 0x8c,
++    "the association request as iOS 26 has it");
++_Static_assert(sizeof(struct apple80211_assoc_ios16) == 592 && offsetof(struct apple80211_assoc_ios16, key) == 0x48,
+     "the association request as iOS 16.5 has it");
+ _Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
+     "the link event as iOS 16.5 reads it");
+ _Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as iOS 16.5 has it");
+ _Static_assert(sizeof(struct apple80211_channels_info) == 10016 && offsetof(struct apple80211_channels_info, number) == 0x32e &&
+     offsetof(struct apple80211_channels_info, flags) == 0x12d0, "the channels' description as iOS 16.5 has it");
+-_Static_assert(sizeof(struct apple80211_scan_request) == 5456 && offsetof(struct apple80211_scan_request, channels) == 0x48 &&
+-    offsetof(struct apple80211_scan_request, flags) == 0x1308 && offsetof(struct apple80211_scan_request, names) == 0x1318,
+-    "the scan request as iOS 16.5 has it");
+-_Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct apple80211_scan_result, ssid_length) == 0x60 &&
+-    offsetof(struct apple80211_scan_result, age_ms) == 0x84 && offsetof(struct apple80211_scan_result, elements) == 0x8c,
+-    "a scan's result as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_scan_request) == 5528 && offsetof(struct apple80211_scan_request, channels) == 0x48 &&
++    offsetof(struct apple80211_scan_request, flags) == 0x1308 && offsetof(struct apple80211_scan_request, names) == 0x1318 &&
++    offsetof(struct apple80211_scan_request, short_ssid) == 0x1548 &&
++    offsetof(struct apple80211_scan_request, scan_uuid) == 0x154c,
++    "the scan request as iOS 26 has it");
++_Static_assert(sizeof(struct apple80211_scan_result) == 2272 && offsetof(struct apple80211_scan_result, ssid_length) == 0x60 &&
++    offsetof(struct apple80211_scan_result, age_ms) == 0x84 && offsetof(struct apple80211_scan_result, elements) == 0x8c &&
++    offsetof(struct apple80211_scan_result, scan_uuid) == 0x88c,
++    "a scan's result as iOS 26 has it");
+ 
+ /* Apple80211's events (APPLE80211_M_...) */
+ enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
+@@ -201,6 +233,7 @@ static LCK_GRP_DECLARE(apple80211_lock_group, "redwood-apple80211");
+ static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
+ static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
+ static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
++static char last_scan_uuid[64];                 /* UUID of the last SCAN_REQ, for SCAN_RESULT / CURRENT_NETWORK */
+ 
+ /* ---- channels ---------------------------------------------------------------------------------------- */
+ 
+@@ -240,20 +273,58 @@ give(const struct apple80211req *request, const void *data, size_t length)
+ 	       request->req_len);
+ }
+ 
++static bool
++valid_scan_uuid(const char uuid[64])
++{
++	if ((uint8_t)uuid[0] <= 0x20 || (uint8_t)uuid[0] >= 0x7f) {
++		return false;
++	}
++	for (unsigned i = 1; i < 64; i++) {
++		uint8_t c = (uint8_t)uuid[i];
++
++		if (c == 0) {
++			return true;
++		}
++		if (c < 0x20 || c >= 0x7f) {
++			return false;
++		}
++	}
++	return false;
++}
++
+ /* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
+ static int
+ give_network(const struct apple80211req *request, const struct redwood_sta_bss *bss)
+ {
+-	struct apple80211_scan_result *result = kalloc_data(sizeof(*result), Z_WAITOK | Z_ZERO);
+-	unsigned room = sizeof(result->elements);
++	struct apple80211_scan_result *result;
++	unsigned max_room, room;
++	size_t in_len;
++	char uuid[64] = { 0 };
+ 	int error;
+ 
++	if (request->req_data == USER_ADDR_NULL || request->req_len < SCAN_RESULT_IOS16_BYTES) {
++		return EINVAL;
++	}
++	result = kalloc_data(sizeof(*result), Z_WAITOK | Z_ZERO);
+ 	if (result == NULL) {
+ 		return ENOMEM;
+ 	}
+-	if (request->req_len >= sizeof(*result) && copyin(request->req_data, result, offsetof(struct apple80211_scan_result,
+-	    elements)) == 0 && result->elements_length < room) {
+-		room = result->elements_length;
++	max_room = request->req_len >= sizeof(*result) ? sizeof(result->elements) : SCAN_RESULT_IOS16_ELEMENTS;
++	room = max_room;
++	in_len = request->req_len < sizeof(*result) ? request->req_len : sizeof(*result);
++	if (copyin(request->req_data, result, in_len) == 0) {
++		if (result->elements_length != 0 && result->elements_length < room) {
++			room = result->elements_length;
++		}
++		if (in_len >= offsetof(struct apple80211_scan_result, scan_uuid) + sizeof(result->scan_uuid) &&
++		    valid_scan_uuid(result->scan_uuid)) {
++			memcpy(uuid, result->scan_uuid, sizeof(uuid));
++		}
++	}
++	if (uuid[0] == '\0') {
++		lck_mtx_lock(&apple80211_lock);
++		memcpy(uuid, last_scan_uuid, sizeof(uuid));
++		lck_mtx_unlock(&apple80211_lock);
+ 	}
+ 	bzero(result, sizeof(*result));
+ 	result->version = 1;
+@@ -278,7 +349,8 @@ give_network(const struct apple80211req *request, const struct redwood_sta_bss *
+ 			}
+ 		}
+ 	}
+-	error = give(request, result, sizeof(*result));
++	memcpy(result->scan_uuid, uuid, sizeof(result->scan_uuid));
++	error = copyout(result, request->req_data, in_len);
+ 	kfree_data(result, sizeof(*result));
+ 	return error;
+ }
+@@ -300,13 +372,13 @@ get(struct apple80211req *request)
+ 	}
+ 	case 12: {
+ 		/*
+-		 * What the card can do, a bit each (apple80211_var.h: APPLE80211_CAP_*): the 13 bytes are the
+-		 * bits alone, from the first (the framework hands in a buffer that begins after the old
+-		 * header's version word). AES, AES-CCM, power management, short slot and preamble, WPA2, WME,
+-		 * short guard interval at 20 MHz. Read wrong, the framework sees no WPA2 and builds no join
+-		 * for a WPA2 network ("Unable to join").
++		 * What the card can do, a bit each (apple80211_var.h: APPLE80211_CAP_*): 21 bytes in iOS 26
++		 * (13 bytes in iOS 16.5), the bits alone, from the first (the framework hands in a buffer that
++		 * begins after the old header's version word). AES, AES-CCM, power management, short slot and
++		 * preamble, WPA2, WME, short guard interval at 20 MHz. Read wrong, the framework sees no WPA2
++		 * and builds no join for a WPA2 network ("Unable to join").
+ 		 */
+-		uint8_t bits[13] = { 0 };
++		uint8_t bits[21] = { 0 };
+ 		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
+ 
+ 		for (unsigned i = 0; i < sizeof(has); i++) {
+@@ -314,6 +386,14 @@ get(struct apple80211req *request)
+ 		}
+ 		return give(request, bits, sizeof(bits));
+ 	}
++	case 51: {                              /* the regulatory country code: 3-byte NUL-terminated ASCII */
++		static const char country[3] = "IN";
++
++		if (request->req_data == USER_ADDR_NULL || request->req_len < sizeof(country)) {
++			return EINVAL;
++		}
++		return copyout(country, request->req_data, sizeof(country));
++	}
+ 	case 19: {                              /* the radio's power: one radio. Until the driver is up it counts as on: it */
+ 		struct {                        /* is being brought up, and iOS asks this once, early */
+ 			uint32_t version, radios, state[4];
+@@ -462,18 +542,20 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
+ 	unsigned unknown = 0;
+ 	int error;
+ 
+-	if (request->req_len != sizeof(*asked)) {
++	if (request->req_data == USER_ADDR_NULL ||
++	    (request->req_len != sizeof(*asked) && request->req_len != SCAN_REQUEST_IOS16_BYTES)) {
+ 		return EINVAL;
+ 	}
+ 	if (!redwood_sta_present()) {
+ 		return EBUSY;                   /* (the radio is still being brought up: the framework tries again) */
+ 	}
+-	asked = kalloc_data(sizeof(*asked), Z_WAITOK);
++	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
+ 	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
+-	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, sizeof(*asked))) != 0) {
++	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, request->req_len)) != 0) {
+ 		error = asked == NULL || what == NULL ? ENOMEM : error;
+ 		goto out;
+ 	}
++	asked->scan_uuid[sizeof(asked->scan_uuid) - 1] = '\0';
+ 	if (asked->ssid_length <= sizeof(what->ssid)) {
+ 		what->ssid_length = (uint8_t)asked->ssid_length;
+ 		memcpy(what->ssid, asked->ssid, asked->ssid_length);
+@@ -498,6 +580,10 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
+ 	} else {
+ 		lck_mtx_lock(&apple80211_lock);
+ 		result_next = 0;
++		bzero(last_scan_uuid, sizeof(last_scan_uuid));
++		if (valid_scan_uuid(asked->scan_uuid)) {
++			memcpy(last_scan_uuid, asked->scan_uuid, sizeof(last_scan_uuid));
++		}
+ 		lck_mtx_unlock(&apple80211_lock);
+ 		error = redwood_sta_ask_scan(what);
+ 	}
+@@ -514,17 +600,47 @@ out:
+ static int
+ set_join(const struct apple80211req *request, char *said, size_t said_size)
+ {
+-	struct apple80211_assoc *asked;
+-	struct redwood_sta_join *what;
++	struct apple80211_assoc *asked = NULL;
++	struct apple80211_assoc_ios16 *legacy = NULL;
++	struct redwood_sta_join *what = NULL;
+ 	int error;
+ 
+-	if (request->req_len < offsetof(struct apple80211_assoc, rest)) {
++	if (request->req_data == USER_ADDR_NULL ||
++	    (request->req_len < sizeof(*asked) && request->req_len != sizeof(*legacy))) {
+ 		return EINVAL;
+ 	}
+ 	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
+ 	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
+-	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest))) != 0) {
+-		error = asked == NULL || what == NULL ? ENOMEM : error;
++	if (asked == NULL || what == NULL) {
++		error = ENOMEM;
++		goto out;
++	}
++	if (request->req_len >= sizeof(*asked)) {
++		error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest));
++	} else {
++		legacy = kalloc_data(sizeof(*legacy), Z_WAITOK | Z_ZERO);
++		if (legacy == NULL) {
++			error = ENOMEM;
++			goto out;
++		}
++		error = copyin(request->req_data, legacy, offsetof(struct apple80211_assoc_ios16, rest));
++		if (error == 0) {
++			asked->version = legacy->version;
++			asked->mode = legacy->mode;
++			asked->auth_lower = legacy->auth_lower;
++			asked->auth_upper = legacy->auth_upper;
++			asked->ssid_length = legacy->ssid_length;
++			memcpy(asked->ssid, legacy->ssid, sizeof(asked->ssid));
++			memcpy(asked->bssid, legacy->bssid, sizeof(asked->bssid));
++			asked->key_version = legacy->key_version;
++			asked->key_length = legacy->key_length;
++			asked->key_cipher = legacy->key_cipher;
++			asked->key_flags = legacy->key_flags;
++			asked->key_index = legacy->key_index;
++			memcpy(asked->key, legacy->key, sizeof(asked->key));
++		}
++	}
++	if (error != 0) {
+ 		goto out;
+ 	}
+ 	/* (lengths and kinds only: the name, the access point and the key stay out of the log) */
+@@ -538,7 +654,7 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
+ 	what->ssid_length = (uint8_t)asked->ssid_length;
+ 	memcpy(what->ssid, asked->ssid, asked->ssid_length);
+ 	memcpy(what->bssid, asked->bssid, sizeof(what->bssid));
+-	if (asked->key_length == 0) {
++	if (asked->key_length == 0 || asked->key_cipher == 0) {
+ 		what->security = REDWOOD_STA_OPEN;
+ 	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= 8 && asked->key_length <= 63) {
+ 		what->security = REDWOOD_STA_WPA2_PSK;
+@@ -556,6 +672,10 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
+ 	lck_mtx_unlock(&apple80211_lock);
+ 	error = redwood_sta_ask_join(what);
+ out:
++	if (legacy != NULL) {
++		memset_s(legacy, sizeof(*legacy), 0, sizeof(*legacy));
++		kfree_data(legacy, sizeof(*legacy));
++	}
+ 	if (asked != NULL) {
+ 		memset_s(asked, sizeof(*asked), 0, sizeof(*asked));
+ 		kfree_data(asked, sizeof(*asked));
+@@ -589,6 +709,16 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+ 	}
+ 	case 10:
+ 		return set_scan(request, said, said_size);
++	case 383:                               /* SET_PROPERTY */
++	case 473:                               /* MIMO_CONFIG */
++	case 481:                               /* HEARTBEAT */
++	case 483:                               /* EXTERNAL_POWER_STATE */
++	case 485:                               /* APP_STATE */
++	case 512:                               /* INFRA_ENUMERATED */
++	case 560:                               /* PROTOCOL_CLEANUP_COMPLETE */
++	case 564:                               /* FILTER_MONITOR_EVENTS */
++	case 582:                               /* REAL_TIME_3PARTY_APP */
++		return 0;
+ 	default:
+ 		return EOPNOTSUPP;
+ 	}

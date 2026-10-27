@@ -1,0 +1,746 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 9fc3fd5..8b0fbda 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -665,6 +665,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 		frame.dw = PANEL_W;
+ 		frame.dh = (uint32_t)(((uint64_t)h * PANEL_W + w / 2) / w);
+ 	}
++	if (PANEL_H > frame.dh && PANEL_H - frame.dh <= 2) {
++		frame.dh = PANEL_H;
++	}
++	if (PANEL_W > frame.dw && PANEL_W - frame.dw <= 2) {
++		frame.dw = PANEL_W;
++	}
+ 	frame.dx = (PANEL_W - frame.dw) / 2;
+ 	frame.dy = (PANEL_H - frame.dh) / 2;
+ 	uint32_t ext = corner_radius ? sweet_display_corner_extent(corner_radius) : 0;
+@@ -1022,8 +1028,9 @@ static bool gpool_ready;
+ static LCK_MTX_DECLARE(sweet_gpool_lock, &sweet_gpu_grp);
+ 
+ /* First fit: the physical address of `bytes` (rounded to 16 KB), zeroing is the caller's. 0 = ok. */
++int sweet_gpu_pool_try_alloc(uint64_t bytes, uint64_t *pa);
+ int
+-sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa)
++sweet_gpu_pool_try_alloc(uint64_t bytes, uint64_t *pa)
+ {
+ 	uint64_t size = (bytes + GPOOL_UNIT - 1) & ~(GPOOL_UNIT - 1);
+ 	int rc = -1;
+@@ -1056,16 +1063,25 @@ sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa)
+ 			break;
+ 		}
+ 	}
+-	if (rc) {
+-		gpool_failures++;
+-	}
+ 	lck_mtx_unlock(&sweet_gpool_lock);
+-	if (rc) {
+-		a6_log("pool: no %llu bytes free (%llu MB in use)\n", size, gpool_used >> 20);
+-	}
+ 	return rc;
+ }
+ 
++int
++sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa)
++{
++	if (sweet_gpu_pool_try_alloc(bytes, pa) == 0) {
++		return 0;
++	}
++	uint64_t size = (bytes + GPOOL_UNIT - 1) & ~(GPOOL_UNIT - 1);
++	lck_mtx_lock(&sweet_gpool_lock);
++	gpool_failures++;
++	uint64_t used = gpool_used;
++	lck_mtx_unlock(&sweet_gpool_lock);
++	a6_log("pool: no %llu bytes free (%llu MB in use)\n", size, used >> 20);
++	return -1;
++}
++
+ void
+ sweet_gpu_pool_free(uint64_t pa, uint64_t bytes)
+ {
+@@ -1170,6 +1186,29 @@ sweet_gpu_unmap_at(uint64_t iova, uint64_t len)
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+ }
+ 
++void sweet_gpu_unmap_at_batch(const uint64_t *iovas, const uint64_t *lens, unsigned count);
++void
++sweet_gpu_unmap_at_batch(const uint64_t *iovas, const uint64_t *lens, unsigned count)
++{
++	if (count == 0) {
++		return;
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	if (gpu_ready) {
++		bool any = false;
++		for (unsigned i = 0; i < count; i++) {
++			if (iovas[i] >= WIN_BASE && lens[i] != 0) {
++				a6_unmap(&gpu, iovas[i], lens[i]);
++				any = true;
++			}
++		}
++		if (any) {
++			a6_tlb_flush(&gpu);
++		}
++	}
++	lck_mtx_unlock(&sweet_gpu_lock);
++}
++
+ /* Queue up to A6_SUBMIT_MAX IBs: the fence, 0 when the GPU is not usable, or 0 with *busy when the ring is full. */
+ uint32_t
+ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy)
+@@ -1231,7 +1270,20 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
+ 		if (ns >= timeout_ns) {
+ 			return sweet_gpu_fence_done(fence) ? 0 : 1;
+ 		}
+-		delay(20);
++		if (ns < 60000ULL) {
++			delay(10);
++		} else if (!ml_at_interrupt_context()) {
++			uint64_t rem_ns = timeout_ns - ns;
++			if (rem_ns >= 1000000ULL) {
++				delay_for_interval(1, (uint32_t)NSEC_PER_MSEC);
++			} else if (rem_ns >= 100000ULL) {
++				delay_for_interval((uint32_t)(rem_ns / 1000ULL), (uint32_t)NSEC_PER_USEC);
++			} else {
++				delay(10);
++			}
++		} else {
++			delay(250);
++		}
+ 	}
+ }
+ 
+@@ -1280,7 +1332,7 @@ sweet_gpu_diag_snapshot(struct sweet_diag_gpu *out)
+ 	for (unsigned i = 0; i < sizeof(gpool_ranges) / sizeof(gpool_ranges[0]); i++) {
+ 		total_pool += gpool_ranges[i].size;
+ 	}
+-	uint32_t cap = 256, resv = 160;
++	uint32_t cap = 384, resv = 160;
+ 	PE_parse_boot_argn("sweetgpucap", &cap, sizeof(cap));
+ 	PE_parse_boot_argn("sweetgpureserve", &resv, sizeof(resv));
+ 
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 54faed2..08b7cd1 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -59,12 +59,15 @@ int sweet_gpu_window_alloc(uint64_t *base, uint64_t *size);
+ void sweet_gpu_window_free(uint64_t base);
+ int sweet_gpu_map_at(uint64_t iova, const uint64_t *pages, uint32_t npages);
+ void sweet_gpu_unmap_at(uint64_t iova, uint64_t len);
++void sweet_gpu_unmap_at_batch(const uint64_t *iovas, const uint64_t *lens, unsigned count);
+ uint32_t sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy);
+ uint32_t sweet_gpu_last_fence(void);
++bool sweet_gpu_fence_done(uint32_t fence);
+ int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);
+ bool sweet_gpu_lost(uint64_t *epoch, uint32_t last_fence);
+ uint64_t sweet_gpu_recoveries(void);
+ uint64_t sweet_gpu_timestamp(void);
++int sweet_gpu_pool_try_alloc(uint64_t bytes, uint64_t *pa);
+ int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
+ uint64_t sweet_gpu_pool_avail(void);
+ void sweet_gpu_pool_free(uint64_t pa, uint64_t bytes);
+@@ -95,6 +98,8 @@ class SweetAcceleratorUserClient;
+ static void sweet_accel_diag_init_lock(void);
+ static void sweet_accel_client_add(SweetAcceleratorUserClient *c);
+ static void sweet_accel_client_remove(SweetAcceleratorUserClient *c);
++static uint32_t sweet_v2_reap_retired(void);
++static void sweet_v2_reap_window(uint64_t win_base, uint64_t win_size);
+ 
+ class SweetAccelerator : public IOAcceleratorES {
+ 	OSDeclareDefaultStructors(SweetAccelerator);
+@@ -218,27 +223,36 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
+ 
+ /*
+  * The GPU pool is shared by every process (944 MB): one app must not take what the compositor needs. Others
+- * hold at most sweetgpucap MB each (default 256) and never take the last sweetgpureserve MB (default 160),
++ * hold at most sweetgpucap MB each (default 384) and never take the last sweetgpureserve MB (default 160),
+  * which stay for backboardd and SpringBoard. A refused buffer is VK_ERROR_OUT_OF_DEVICE_MEMORY in Turnip.
+  */
+-bool
+-SweetAcceleratorUserClient::v2PoolAllowed(uint64_t len)
++static void
++sweet_v2_pool_limits(uint64_t *cap_bytes, uint64_t *reserve_bytes)
+ {
+ 	static uint32_t cap_mb, reserve_mb;
+ 	if (cap_mb == 0) {
+-		uint32_t v = 256;
++		uint32_t v = 384;
+ 		PE_parse_boot_argn("sweetgpucap", &v, sizeof(v));
+ 		reserve_mb = 160;
+ 		PE_parse_boot_argn("sweetgpureserve", &reserve_mb, sizeof(reserve_mb));
+ 		cap_mb = v ? v : 0xffffffffu;
+ 	}
++	*cap_bytes = (uint64_t)cap_mb << 20;
++	*reserve_bytes = (uint64_t)reserve_mb << 20;
++}
++
++bool
++SweetAcceleratorUserClient::v2PoolAllowed(uint64_t len)
++{
++	uint64_t cap_bytes = 0, reserve_bytes = 0;
++	sweet_v2_pool_limits(&cap_bytes, &reserve_bytes);
+ 	if (fSystem) {
+ 		return true;
+ 	}
+ 	const char *why = NULL;
+-	if (fPoolBytes + len > ((uint64_t)cap_mb << 20)) {
++	if (fPoolBytes + len > cap_bytes) {
+ 		why = "its cap";
+-	} else if (sweet_gpu_pool_avail() < len + ((uint64_t)reserve_mb << 20)) {
++	} else if (sweet_gpu_pool_avail() < len + reserve_bytes) {
+ 		why = "the compositor's reserve";
+ 	}
+ 	if (why != NULL && !fCapLogged) {
+@@ -252,6 +266,9 @@ SweetAcceleratorUserClient::v2PoolAllowed(uint64_t len)
+ IOReturn
+ SweetAcceleratorUserClient::clientClose(void)
+ {
++	if (fV2) {
++		(void)sweet_v2_reap_retired();
++	}
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+@@ -269,6 +286,12 @@ SweetAcceleratorUserClient::free(void)
+ 	if (closeFence != 0 && (fV2 ? sweet_gpu_wait_fence_ns(closeFence, 2000000000ULL) : sweet_gpu_wait_fence(closeFence, 2000))) {
+ 		IOLog("SWEET MTL: client freed with fence %u still pending\n", closeFence);
+ 	}
++	if (fV2) {
++		(void)sweet_v2_reap_retired();
++		if (fWinSize != 0) {
++			sweet_v2_reap_window(fWinBase, fWinSize);
++		}
++	}
+ 	if (fBO != NULL) {
+ 		IOLog("SWEET MTL: v2 %s closed (GPU pool: %llu MB held, peak %llu MB)\n", fName, fPoolBytes >> 20, fPoolPeak >> 20);
+ 		for (uint32_t i = 0; i < fBOCap; i++) {
+@@ -639,6 +662,237 @@ sweet_pool_release(IOMemoryDescriptor *md, uint64_t pa)
+ 	IOLockUnlock(sweet_zombie_lock);
+ }
+ 
++/*
++ * Deferred BO retirement ring: BoFree detaches the BO from the client immediately without spinning on
++ * the GPU ring, keeps its SMMU PTEs and wired/pool pages alive until sweet_gpu_last_fence() completes,
++ * and reaps completed entries in batches (one TLB flush per batch).
++ */
++#define SWEET_V2_RETIRE_CAP     256
++#define SWEET_V2_REAP_BATCH     16
++
++struct sweet_v2_retired {
++	IOMemoryDescriptor *md;
++	uint64_t bytes;
++	uint64_t iova;
++	uint64_t pool_pa;
++	uint32_t fence;
++	bool imported;
++};
++
++static IOLock *sweet_retire_lock;
++static struct sweet_v2_retired sweet_retire_ring[SWEET_V2_RETIRE_CAP];
++static uint32_t sweet_retire_head;
++static volatile uint32_t sweet_retire_count;
++
++static void
++sweet_retire_init_lock(void)
++{
++	if (sweet_retire_lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, l, &sweet_retire_lock)) {
++			IOLockFree(l);
++		}
++	}
++}
++
++static void
++sweet_v2_finish_retired_batch(const struct sweet_v2_retired *batch, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		if (batch[i].md == NULL) {
++			continue;
++		}
++		if (batch[i].imported) {
++			batch[i].md->complete();
++			batch[i].md->release();
++		} else {
++			sweet_pool_release(batch[i].md, batch[i].pool_pa);
++		}
++	}
++}
++
++static uint32_t
++sweet_v2_reap_retired(void)
++{
++	if (sweet_retire_lock == NULL || __atomic_load_n(&sweet_retire_count, __ATOMIC_ACQUIRE) == 0) {
++		return 0;
++	}
++	uint32_t total = 0;
++	for (;;) {
++		struct sweet_v2_retired batch[SWEET_V2_REAP_BATCH];
++		uint64_t iovas[SWEET_V2_REAP_BATCH];
++		uint64_t lens[SWEET_V2_REAP_BATCH];
++		uint32_t n = 0, unmaps = 0;
++
++		IOLockLock(sweet_retire_lock);
++		while (sweet_retire_count > 0 && n < SWEET_V2_REAP_BATCH) {
++			struct sweet_v2_retired *e = &sweet_retire_ring[sweet_retire_head];
++			if (e->fence != 0 && !sweet_gpu_fence_done(e->fence)) {
++				break;
++			}
++			batch[n] = *e;
++			if (e->iova != 0) {
++				iovas[unmaps] = e->iova;
++				lens[unmaps] = e->bytes;
++				unmaps++;
++			}
++			bzero(e, sizeof(*e));
++			sweet_retire_head = (sweet_retire_head + 1) % SWEET_V2_RETIRE_CAP;
++			__atomic_store_n(&sweet_retire_count, sweet_retire_count - 1, __ATOMIC_RELEASE);
++			n++;
++		}
++		if (unmaps > 0) {
++			sweet_gpu_unmap_at_batch(iovas, lens, unmaps);
++		}
++		IOLockUnlock(sweet_retire_lock);
++
++		if (n == 0) {
++			break;
++		}
++		sweet_v2_finish_retired_batch(batch, n);
++		total += n;
++		if (n < SWEET_V2_REAP_BATCH) {
++			break;
++		}
++	}
++	return total;
++}
++
++static bool
++sweet_v2_wait_oldest_retired(void)
++{
++	if (sweet_retire_lock == NULL) {
++		return false;
++	}
++	IOLockLock(sweet_retire_lock);
++	if (sweet_retire_count == 0) {
++		IOLockUnlock(sweet_retire_lock);
++		return false;
++	}
++	uint32_t fence = sweet_retire_ring[sweet_retire_head].fence;
++	IOLockUnlock(sweet_retire_lock);
++
++	if (fence != 0) {
++		(void)sweet_gpu_wait_fence_ns(fence, 2000000000ULL);
++	}
++	uint32_t reaped = sweet_v2_reap_retired();
++	sweet_zombie_sweep();
++	return reaped > 0;
++}
++
++static void
++sweet_v2_reap_for_iova(uint64_t iova, uint64_t bytes)
++{
++	(void)sweet_v2_reap_retired();
++	if (sweet_retire_lock == NULL || __atomic_load_n(&sweet_retire_count, __ATOMIC_ACQUIRE) == 0) {
++		return;
++	}
++	uint64_t end = iova + bytes;
++	for (;;) {
++		uint32_t wait_fence = 0;
++		bool overlap = false;
++		IOLockLock(sweet_retire_lock);
++		for (uint32_t i = 0; i < sweet_retire_count; i++) {
++			const struct sweet_v2_retired *e =
++			    &sweet_retire_ring[(sweet_retire_head + i) % SWEET_V2_RETIRE_CAP];
++			if (e->iova != 0 && e->iova < end && iova < e->iova + e->bytes) {
++				wait_fence = e->fence;
++				overlap = true;
++			}
++		}
++		IOLockUnlock(sweet_retire_lock);
++		if (!overlap) {
++			break;
++		}
++		if (wait_fence != 0) {
++			(void)sweet_gpu_wait_fence_ns(wait_fence, 2000000000ULL);
++		}
++		if (sweet_v2_reap_retired() == 0) {
++			break;
++		}
++	}
++}
++
++static void
++sweet_v2_reap_window(uint64_t win_base, uint64_t win_size)
++{
++	if (sweet_retire_lock == NULL || __atomic_load_n(&sweet_retire_count, __ATOMIC_ACQUIRE) == 0) {
++		return;
++	}
++	uint64_t win_end = win_base + win_size;
++	for (;;) {
++		struct sweet_v2_retired batch[SWEET_V2_REAP_BATCH];
++		uint64_t iovas[SWEET_V2_REAP_BATCH];
++		uint64_t lens[SWEET_V2_REAP_BATCH];
++		uint32_t n = 0, unmaps = 0;
++
++		IOLockLock(sweet_retire_lock);
++		uint32_t rem = 0, old_count = sweet_retire_count;
++		for (uint32_t i = 0; i < old_count; i++) {
++			struct sweet_v2_retired cur =
++			    sweet_retire_ring[(sweet_retire_head + i) % SWEET_V2_RETIRE_CAP];
++			if (n < SWEET_V2_REAP_BATCH && cur.iova >= win_base && cur.iova < win_end) {
++				batch[n++] = cur;
++				iovas[unmaps] = cur.iova;
++				lens[unmaps] = cur.bytes;
++				unmaps++;
++			} else {
++				sweet_retire_ring[(sweet_retire_head + rem) % SWEET_V2_RETIRE_CAP] = cur;
++				rem++;
++			}
++		}
++		for (uint32_t i = rem; i < old_count; i++) {
++			bzero(&sweet_retire_ring[(sweet_retire_head + i) % SWEET_V2_RETIRE_CAP],
++			    sizeof(sweet_retire_ring[0]));
++		}
++		__atomic_store_n(&sweet_retire_count, rem, __ATOMIC_RELEASE);
++		if (unmaps > 0) {
++			sweet_gpu_unmap_at_batch(iovas, lens, unmaps);
++		}
++		IOLockUnlock(sweet_retire_lock);
++
++		if (n == 0) {
++			break;
++		}
++		sweet_v2_finish_retired_batch(batch, n);
++	}
++}
++
++static void
++sweet_v2_retire_bo(const SweetV2BO *dead)
++{
++	if (dead->md == NULL) {
++		return;
++	}
++	sweet_retire_init_lock();
++	for (;;) {
++		IOLockLock(sweet_retire_lock);
++		if (sweet_retire_count < SWEET_V2_RETIRE_CAP) {
++			uint32_t tail = (sweet_retire_head + sweet_retire_count) % SWEET_V2_RETIRE_CAP;
++			sweet_retire_ring[tail].md = dead->md;
++			sweet_retire_ring[tail].bytes = dead->bytes;
++			sweet_retire_ring[tail].iova = dead->iova;
++			sweet_retire_ring[tail].pool_pa = dead->pool_pa;
++			sweet_retire_ring[tail].imported = dead->imported;
++			sweet_retire_ring[tail].fence = dead->iova != 0 ? sweet_gpu_last_fence() : 0;
++			__atomic_store_n(&sweet_retire_count, sweet_retire_count + 1, __ATOMIC_RELEASE);
++			IOLockUnlock(sweet_retire_lock);
++			return;
++		}
++		IOLockUnlock(sweet_retire_lock);
++		if (!sweet_v2_wait_oldest_retired()) {
++			if (dead->iova != 0) {
++				sweet_gpu_unmap_at(dead->iova, dead->bytes);
++			}
++			struct sweet_v2_retired one = {
++				dead->md, dead->bytes, dead->iova, dead->pool_pa, 0, dead->imported
++			};
++			sweet_v2_finish_retired_batch(&one, 1);
++			return;
++		}
++	}
++}
++
+ /* Unmap from the GPU, unwire, drop (pool memory: once no task maps it any more) */
+ void
+ SweetAcceleratorUserClient::v2Release(SweetV2BO *bo)
+@@ -704,13 +958,25 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 			return kIOReturnBadArgument;
+ 		}
+ 		/* memory XNU does not manage (sweet_gpu.c: no cacheable alias), zeroed through a WC kernel view */
++		(void)sweet_v2_reap_retired();
+ 		sweet_zombie_sweep();
+ 		uint64_t len = round_page_64(rq->bytes), pa = 0;
++		uint64_t cap_bytes = 0, reserve_bytes = 0;
++		sweet_v2_pool_limits(&cap_bytes, &reserve_bytes);
++		while (!fSystem && fPoolBytes + len <= cap_bytes &&
++		    sweet_gpu_pool_avail() < len + reserve_bytes &&
++		    sweet_v2_wait_oldest_retired()) {
++		}
+ 		if (!v2PoolAllowed(len)) {
+ 			return kIOReturnNoMemory;
+ 		}
+-		if (sweet_gpu_pool_alloc(len, &pa)) {
+-			return kIOReturnNoMemory;
++		while (sweet_gpu_pool_try_alloc(len, &pa)) {
++			if (!sweet_v2_wait_oldest_retired()) {
++				if (sweet_gpu_pool_alloc(len, &pa)) {
++					return kIOReturnNoMemory;
++				}
++				break;
++			}
+ 		}
+ 		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, len, kIODirectionInOut);
+ 		IOMemoryMap *km = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+@@ -783,14 +1049,27 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		}
+ 		IOLockLock(fLock);
+ 		SweetV2BO *bo = v2Find(rq->handle);
++		uint64_t map_bytes = bo != NULL ? bo->bytes : 0;
+ 		IOReturn r = kIOReturnSuccess;
+ 		if (bo == NULL) {
+ 			r = kIOReturnBadArgument;
+ 		} else if (bo->iova != 0) {
+ 			r = kIOReturnBusy;
+-		} else if (rq->iova < fWinBase || rq->iova + bo->bytes > fWinBase + fWinSize || rq->iova + bo->bytes < rq->iova) {
++		} else if (rq->iova < fWinBase || rq->iova + map_bytes > fWinBase + fWinSize || rq->iova + map_bytes < rq->iova) {
+ 			r = kIOReturnBadArgument;
+ 		}
++		IOLockUnlock(fLock);
++		if (r != kIOReturnSuccess) {
++			return r;
++		}
++		sweet_v2_reap_for_iova(rq->iova, map_bytes);
++		IOLockLock(fLock);
++		bo = v2Find(rq->handle);
++		if (bo == NULL || bo->bytes != map_bytes) {
++			r = kIOReturnBadArgument;
++		} else if (bo->iova != 0) {
++			r = kIOReturnBusy;
++		}
+ 		/* the pages in 4K steps (16K VM pages, any 4K-aligned import), mapped in pieces */
+ 		for (uint64_t off = 0; r == kIOReturnSuccess && off < bo->bytes;) {
+ 			uint32_t n = 0;
+@@ -819,21 +1098,24 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 	}
+ 	case NativeAdrenoMethodBoFree: {
+ 		V2_IN(NativeAdrenoAbiBoFree);
+-		/*
+-		 * Submits are asynchronous: drain any queued GPU work before unmapping SMMU PTEs or returning
+-		 * physical pool pages to gpool (where the next BoAlloc immediately zeroes them).
+-		 */
+-		uint32_t fence = sweet_gpu_last_fence();
+-		if (fence != 0) {
+-			(void)sweet_gpu_wait_fence_ns(fence, 2000000000ULL);
+-		}
++		(void)sweet_v2_reap_retired();
++		SweetV2BO dead;
++		bzero(&dead, sizeof(dead));
+ 		IOLockLock(fLock);
+ 		SweetV2BO *bo = v2Find(rq->handle);
+ 		if (bo != NULL) {
+-			v2Release(bo);
++			dead = *bo;
++			if (!dead.imported) {
++				fPoolBytes -= dead.md->getLength();
++			}
++			bzero(bo, sizeof(*bo));
+ 		}
+ 		IOLockUnlock(fLock);
+-		return bo != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
++		if (dead.md == NULL) {
++			return kIOReturnBadArgument;
++		}
++		sweet_v2_retire_bo(&dead);
++		return kIOReturnSuccess;
+ 	}
+ 	case NativeAdrenoMethodBoCpuMap: {
+ 		V2_IN(NativeAdrenoAbiBoCpuMap);
+@@ -853,6 +1135,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 	case NativeAdrenoMethodSubmit: {
+ 		V2_IN(NativeAdrenoAbiSubmit);
+ 		V2_OUT(NativeAdrenoAbiSubmitReply);
++		(void)sweet_v2_reap_retired();
+ 		if (rq->buffer_count == 0 || rq->buffer_count > NativeAdrenoAbiMaxBuffers || rq->reserved) {
+ 			return kIOReturnBadArgument;
+ 		}
+@@ -909,10 +1192,12 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 	}
+ 	case NativeAdrenoMethodCreateQueue: {
+ 		V2_OUT(NativeAdrenoAbiQueueReply);
++		(void)sweet_v2_reap_retired();
+ 		rp->queue = 1;                  /* one ring: every queue is queue 0 */
+ 		return kIOReturnSuccess;
+ 	}
+ 	case NativeAdrenoMethodCloseQueue:
++		(void)sweet_v2_reap_retired();
+ 		return kIOReturnSuccess;
+ 	default:
+ 		return kIOReturnUnsupported;
+@@ -930,6 +1215,7 @@ sweet_accel_diag_init_lock(void)
+ 	if (gAccelClientsLock == NULL) {
+ 		gAccelClientsLock = IOLockAlloc();
+ 	}
++	sweet_retire_init_lock();
+ }
+ 
+ static void
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b9369c8..dc07f26 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -90,15 +90,14 @@ enum {
+ #define SWEET_FB_VSYNC_US               16667
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+- * The iOS userland only has status bar / layout data for real iPhone
+- * screens (UIKit: "No status bar visual provider for screen", the red
+- * rdar://45025538 bar for 360x800 points). The display is therefore
+- * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
++ * The iOS userland picks status bar / home-screen metrics from /product
++ * artwork-device-subtype (2436 = D421AP Split1125) while IOMobileFramebuffer
++ * presents a full 20:9 1125x2499 (375x833 points @3x) canvas that scales onto
++ * the 1080x2400 panel edge-to-edge with zero black bars.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+-#define SWEET_FB_LOGICAL_H              2436
++#define SWEET_FB_LOGICAL_H              2499
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -633,9 +632,20 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		IOLockUnlock(fLock);
+ 		IOLog("SWEET FB: frames now scaled to fit by the GPU (panel stride %u)\n", fRowBytes);
+ 	}
++	static int always_clean = -1;
++	if (always_clean < 0) {
++		uint32_t v = 0;
++		PE_parse_boot_argn("sweetfb_alwaysclean", &v, sizeof(v));
++		always_clean = (int)(v != 0);
++	}
++	bool dirty = always_clean || s->takeCpuDirty();
++	uintptr_t kva = dirty ? s->kernelAddress() : 0;
+ 	uint32_t dx = 0, dy = 0, dw = 0, dh = 0;
+-	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
++	int rc = sweet_gpu_present(slot, kva, s->offset, s->width, s->height, s->bytesPerRow,
+ 	    fRowBytes, fCornerRadius, &dx, &dy, &dw, &dh);
++	if (rc && dirty) {
++		s->markCpuDirty();
++	}
+ 	s->release();
+ 	if (rc) {
+ 		return gpu_fallback(7, "GPU blit failed");
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index 73d9267..670fa89 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -275,10 +275,14 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	static uint32_t aks_ok_logged;
++	if (ret != kIOReturnSuccess ||
++	    (aks_ok_logged < 8 && __atomic_fetch_add(&aks_ok_logged, 1u, __ATOMIC_RELAXED) < 8)) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 6e372f8..7bbbedf 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -224,6 +224,7 @@ sweet_surface_alloc(void)
+ 		return NULL;
+ 	}
+ 	bzero(s->state->getBytesNoCopy(), page_size);
++	s->fCpuDirty = 1u;
+ 	return s;
+ }
+ 
+@@ -1104,13 +1105,17 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
++IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
++		__atomic_add_fetch(&s->fCpuWriteLocks, 1, __ATOMIC_ACQ_REL);
++		s->markCpuDirty();
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+@@ -1124,8 +1129,15 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
+-	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+-	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
++	bool writable = !((uintptr_t)options & kIOSurfaceLockReadOnly);
++	if (writable) {
++		s->markCpuDirty();
++		SInt32 cur = __atomic_load_n(&s->fCpuWriteLocks, __ATOMIC_RELAXED);
++		while (cur > 0 && !__atomic_compare_exchange_n(&s->fCpuWriteLocks, &cur,
++		    cur - 1, true, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
++		}
++	}
++	IOReturn ret = sweet_surface_seed_out(s, seedOut, writable);
+ 	s->release();
+ 	return ret;
+ }
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 4ba58dc..84da428 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -40,10 +40,25 @@ public:
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	volatile UInt32           fCpuDirty;    /* CPU cache lines may hold unwritten pixels */
++	volatile SInt32           fCpuWriteLocks;
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
++	void markCpuDirty()
++	{
++		__atomic_store_n(&fCpuDirty, 1u, __ATOMIC_RELEASE);
++	}
++
++	bool takeCpuDirty()
++	{
++		if (__atomic_load_n(&fCpuWriteLocks, __ATOMIC_ACQUIRE) > 0) {
++			return true;
++		}
++		return __atomic_exchange_n(&fCpuDirty, 0u, __ATOMIC_ACQ_REL) != 0;
++	}
++
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+ 	uintptr_t kernelAddress();
+ };
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 45cdcfe..29ce4c7 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -460,7 +460,7 @@ SweetHIDTouch::start(IOService *provider)
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? SWEET_PANEL_H : 2436;
++	fLogicalH = native ? SWEET_PANEL_H : 2499;
+ 	fOffX = (fLogicalW - SWEET_PANEL_W) / 2;
+ 	fOffY = (fLogicalH - SWEET_PANEL_H) / 2;
+ 	fCornerRadius = SWEET_DISPLAY_CORNER_DEFAULT;
+@@ -513,7 +513,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	/*
+-	 * Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp):
++	 * Panel pixels -> the presented 1125x2499 display (SweetFramebuffer.cpp):
+ 	 * the centre crop of the CPU copy, or the GPU's fit (sweet_display_fit_*).
+ 	 */
+ 	IOFixed nx, ny;
