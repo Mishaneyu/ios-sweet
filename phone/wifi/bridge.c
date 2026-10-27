@@ -214,6 +214,7 @@ void bridge_poll(void)
 		struct fw_hello h;
 		memcpy(h.address, radio_mac, 6);
 		bridge_send(FW_HELLO, &h, sizeof(h));
+		bridge_list(0);
 		hello_sent = 1;
 		hello_ms = link_ms();
 		configd_checked = 0;

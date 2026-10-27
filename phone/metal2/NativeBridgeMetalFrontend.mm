@@ -63,7 +63,8 @@ static void noteProblem(NSString *what) {
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }
 extern "C" void sm2_logs(const char *);
-#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];sm2_logs(nbText.UTF8String);noteProblem(nbText);}while(0)
+static std::atomic<uint64_t> gLoggedCount;
+#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];if(gLoggedCount.fetch_add(1,std::memory_order_relaxed)<64)sm2_logs(nbText.UTF8String);noteProblem(nbText);}while(0)
 // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
 static void noteFormat(uint32_t format,bool made) {
@@ -1975,23 +1976,18 @@ static char sweetMemoryOwnerKey;
  return sweetBlock(format,&bw,&bh,&bb)?0:64;
 }
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
- (void)options;
+ uint64_t out[2]={0,256};
+ if(gDevice && nmb_device_heap_buffer_size_and_align(gDevice,length,options,out))
+  return {(NSUInteger)out[0],(NSUInteger)out[1]};
  const NSUInteger align=MAX((NSUInteger)256,(NSUInteger)getpagesize());
  return {(MAX((NSUInteger)1,length)+align-1)&~(align-1),align};
 }
 - (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d {
- const NSUInteger align=MAX((NSUInteger)4096,(NSUInteger)getpagesize());
- if(!d)return {0,align};
- const uint64_t w=MAX((uint64_t)1,d.width),h=MAX((uint64_t)1,d.height),
-                dp=MAX((uint64_t)1,d.depth),a=MAX((uint64_t)1,d.arrayLength),
-                s=MAX((uint64_t)1,d.sampleCount);
- uint32_t bw=0,bh=0,bb=0;
- uint64_t base=sweetBlock(d.pixelFormat,&bw,&bh,&bb)
-     ? ((w+bw-1)/bw)*((h+bh-1)/bh)*bb
-     : w*h*sweetTexelBytes(d.pixelFormat);
- if(d.mipmapLevelCount>1)base=base*3/2;
- const NSUInteger sz=(NSUInteger)((base*dp*a*s+align-1)&~(align-1));
- return {MAX(align,sz),align};
+ NmbTextureDescriptor descriptor;uint64_t out[2]={0,4096};
+ if(gDevice && textureDescriptor(d,&descriptor) && nmb_device_heap_texture_size_and_align(gDevice,&descriptor,out))
+  return {(NSUInteger)out[0],(NSUInteger)out[1]};
+ NBLOG(@"native-metal: heapTextureSizeAndAlign refused: %@",lastError());
+ return {0,(NSUInteger)MAX((NSUInteger)4096,(NSUInteger)getpagesize())};
 }
 - (NSUInteger)currentAllocatedSize {return 0;}
 - (uint64_t)recommendedMaxWorkingSetSize {return 512ull*1024*1024;}

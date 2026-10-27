@@ -626,6 +626,35 @@ pub extern "C" fn nmb_buffer_gpu_address(buffer: *const NmbBuffer) -> u64 {
 
 pub struct NmbHeap(Heap);
 
+/// `heapBufferSizeAndAlignWithLength:options:` into the caller's two words (`size`, `align`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_heap_buffer_size_and_align(device: *const NmbDevice, length: u64, options_word: u64, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null size and align".into());
+        }
+        let sa = get(device)?.0.heap_buffer_size_and_align(length, options(options_word)?);
+        // SAFETY: the header's two words.
+        unsafe { std::slice::from_raw_parts_mut(out, 2) }.copy_from_slice(&[sa.size, sa.align]);
+        Ok(true)
+    })
+}
+
+/// `heapTextureSizeAndAlignWithDescriptor:` into the caller's two words (`size`, `align`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_heap_texture_size_and_align(device: *const NmbDevice, descriptor: *const NmbTextureDescriptor, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null size and align".into());
+        }
+        let descriptor = texture_descriptor(descriptor)?;
+        let sa = get(device)?.0.heap_texture_size_and_align(&descriptor).map_err(e("heap texture size and align"))?;
+        // SAFETY: the header's two words.
+        unsafe { std::slice::from_raw_parts_mut(out, 2) }.copy_from_slice(&[sa.size, sa.align]);
+        Ok(true)
+    })
+}
+
 /// `newHeapWithDescriptor:`: type (0 automatic, 1 placement), size, resource options. Sparse heaps are not made here.
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_new(device: *mut NmbDevice, heap_type: u64, size: u64, options_word: u64) -> *mut NmbHeap {

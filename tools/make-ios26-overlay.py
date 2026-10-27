@@ -245,6 +245,7 @@ def main():
 
     build_ver, prod_ver = '23F84', '26.5.2'
     jetsam_bytes, j_uid, j_gid, j_mode = None, 0, 0, 0o644
+    blastdoor_plists = []
     if args.launchd_plist:
         with open(args.launchd_plist, 'rb') as f:
             raw_plist = f.read()
@@ -272,6 +273,18 @@ def main():
                 print(f'jetsamproperties.D421.plist: raised {j_raised} limits to >= 64 MB')
             except FileNotFoundError:
                 pass
+            for bd_rel in (
+                'System/Library/PrivateFrameworks/MessagesBlastDoorSupport.framework/XPCServices/MessagesBlastDoorService.xpc/Info.plist',
+                'System/Library/PrivateFrameworks/IDSBlastDoorSupport.framework/XPCServices/IDSBlastDoorService.xpc/Info.plist',
+            ):
+                try:
+                    raw_bd, bd_uid, bd_gid, bd_mode = hfs.read_file('/' + bd_rel)
+                    bd_plist = plistlib.loads(raw_bd)
+                    if isinstance(bd_plist.get('XPCService'), dict):
+                        bd_plist['XPCService']['ReslideSharedCache'] = False
+                    blastdoor_plists.append((bd_rel, plistlib.dumps(bd_plist, fmt=plistlib.FMT_BINARY), bd_mode, bd_uid, bd_gid))
+                except FileNotFoundError:
+                    pass
         finally:
             hfs.close()
 
@@ -464,6 +477,18 @@ def main():
                 if os.path.isfile(os.path.join(bin_dir, 'dropbearmulti')):
                     for link in ('dropbear', 'dbclient', 'dropbearkey', 'scp'):
                         add_ustar_symlink(tf, f'private/var/local/bin/{link}', 'dropbearmulti')
+                idle_xpc_path = os.path.join(bin_dir, 'sweet-idle-xpc')
+                if os.path.isfile(idle_xpc_path):
+                    with open(idle_xpc_path, 'rb') as f:
+                        idle_xpc_bytes = f.read()
+                    for bd_bin in (
+                        'System/Library/PrivateFrameworks/MessagesBlastDoorSupport.framework/XPCServices/MessagesBlastDoorService.xpc/MessagesBlastDoorService',
+                        'System/Library/PrivateFrameworks/IDSBlastDoorSupport.framework/XPCServices/IDSBlastDoorService.xpc/IDSBlastDoorService',
+                    ):
+                        add_ustar_bytes(tf, bd_bin, idle_xpc_bytes, mode=0o755)
+
+        for bd_rel, bd_bytes, bd_mode, bd_uid, bd_gid in blastdoor_plists:
+            add_ustar_bytes(tf, bd_rel, bd_bytes, mode=bd_mode, uid=bd_uid, gid=bd_gid)
 
         if args.mtl2_clients is not None:
             add_ustar_bytes(tf, 'private/var/local/mtl2-clients',
@@ -480,10 +505,7 @@ def main():
             mode=0o644,
         )
 
-        rm_paths = [
-            'System/Library/PrivateFrameworks/MessagesBlastDoorSupport.framework/XPCServices/MessagesBlastDoorService.xpc/Info.plist',
-            'System/Library/PrivateFrameworks/IDSBlastDoorSupport.framework/XPCServices/IDSBlastDoorService.xpc/Info.plist',
-        ]
+        rm_paths = []
         if args.selftest_bin:
             with open(args.selftest_bin, 'rb') as f:
                 add_ustar_bytes(tf, 'private/var/local/bin/sweet-selftest', f.read(), mode=0o755)
@@ -502,7 +524,8 @@ def main():
                 'private/var/local/selftest.log',
                 'private/var/local/mcm.log',
             ])
-        add_ustar_bytes(tf, '.sweet-rm', ('\n'.join(rm_paths) + '\n').encode('ascii'), mode=0o644)
+        if rm_paths:
+            add_ustar_bytes(tf, '.sweet-rm', ('\n'.join(rm_paths) + '\n').encode('ascii'), mode=0o644)
 
         for spec in args.extra:
             parts = spec.split(':')
