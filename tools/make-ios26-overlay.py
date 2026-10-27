@@ -480,6 +480,10 @@ def main():
             mode=0o644,
         )
 
+        rm_paths = [
+            'System/Library/PrivateFrameworks/MessagesBlastDoorSupport.framework/XPCServices/MessagesBlastDoorService.xpc/Info.plist',
+            'System/Library/PrivateFrameworks/IDSBlastDoorSupport.framework/XPCServices/IDSBlastDoorService.xpc/Info.plist',
+        ]
         if args.selftest_bin:
             with open(args.selftest_bin, 'rb') as f:
                 add_ustar_bytes(tf, 'private/var/local/bin/sweet-selftest', f.read(), mode=0o755)
@@ -492,11 +496,13 @@ def main():
             add_ustar_bytes(tf, 'private/var/local/selftest.log', b'', mode=0o666)
             add_ustar_bytes(tf, 'private/var/local/mcm.log', b'', mode=0o666)
         else:
-            add_ustar_bytes(tf, '.sweet-rm',
-                            b'private/var/local/bin/sweet-selftest\n'
-                            b'private/var/local/bin/sweet-selftest.sh\n'
-                            b'private/var/local/selftest.log\n'
-                            b'private/var/local/mcm.log\n', mode=0o644)
+            rm_paths.extend([
+                'private/var/local/bin/sweet-selftest',
+                'private/var/local/bin/sweet-selftest.sh',
+                'private/var/local/selftest.log',
+                'private/var/local/mcm.log',
+            ])
+        add_ustar_bytes(tf, '.sweet-rm', ('\n'.join(rm_paths) + '\n').encode('ascii'), mode=0o644)
 
         for spec in args.extra:
             parts = spec.split(':')
