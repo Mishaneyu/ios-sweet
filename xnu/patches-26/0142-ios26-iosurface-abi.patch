@@ -1,0 +1,331 @@
+From 63489c9fbc08c9ee0a4202e47506015f09e783a3 Mon Sep 17 00:00:00 2001
+From: XNU 26 Rebase <rebase@local>
+Date: Tue, 27 Oct 2026 17:23:16 +0000
+Subject: [PATCH] flame 0142: iOS 26 IOSurfaceRootUserClient ABI (0x28 limits,
+ 0xc68 lock result, 0xa0 bulk)
+
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 196 ++++++++++++++++++++++++------
+ 1 file changed, 161 insertions(+), 35 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 6c2f4aa..6e372f8 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -44,6 +44,8 @@ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
+ 	kSweetSurfaceSetYCbCrMatrix     = 5,
++	kSweetSurfaceWrapClientImage    = 6,
++	kSweetSurfaceWrapClientMemory   = 7,
+ 	kSweetSurfaceLimits             = 13,
+ 	kSweetSurfaceSetBulkAttachments = 27,
+ 	kSweetSurfaceLookupFromPort     = 34,
+@@ -59,7 +61,8 @@ enum {
+ 	kSweetSurfaceTrapReleaseFailed  = 5,
+ };
+ 
+-#define SWEET_SURFACE_RESULT_SIZE       0xa68
++#define SWEET_SURFACE_RESULT_SIZE_16    0xa68u
++#define SWEET_SURFACE_RESULT_SIZE_26    0xc68u
+ #define SWEET_SURFACE_MAX_ID            4096
+ #define SWEET_SURFACE_MAX_DIM           16384
+ #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
+@@ -67,10 +70,13 @@ enum {
+ #define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+-#define SWEET_SURFACE_STATE_YCBCR       0x24    /* u32 YCbCr matrix in the state page */
+-#define SWEET_SURFACE_STATE_BULK        0x30    /* 112-byte bulk attachments in the state page */
+-#define SWEET_SURFACE_BULK_SIZE         112u
+-#define SWEET_SURFACE_BULK_IN_SIZE      0x88u   /* 112B data + u64 size + u64 mask + u32 id */
++#define SWEET_SURFACE_STATE_YCBCR_26    0x2c    /* u32 YCbCr matrix in iOS 26 state page */
++#define SWEET_SURFACE_STATE_BULK_16     0x30    /* 112-byte bulk attachments (iOS 16) */
++#define SWEET_SURFACE_STATE_BULK_26     0x34    /* 132-byte bulk attachments (iOS 26) */
++#define SWEET_SURFACE_BULK_SIZE_16      112u
++#define SWEET_SURFACE_BULK_IN_SIZE_16   0x88u   /* 112B data + u64 size + u64 mask + u32 id */
++#define SWEET_SURFACE_BULK_SIZE_26      0x84u   /* 132B data in iOS 26 */
++#define SWEET_SURFACE_BULK_IN_SIZE_26   0xa0u   /* 132B data + pad + u64 size + u64 mask + u32 id */
+ #define SWEET_SURFACE_MAX_EXT           4096u
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+@@ -520,16 +526,17 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+ 
+-static uint64_t sweet_surf_logged;      /* selectors / traps already logged (< 64) */
++static uint64_t sweet_surf_sel_logged;  /* externalMethod selectors already logged (< 64) */
++static uint64_t sweet_surf_trap_logged; /* traps already logged (< 64) */
+ 
+ static void
+ sweet_surf_log_once(const char *what, uint32_t n)
+ {
+-	uint32_t bit = (what[0] == 't' ? 48 : 0) + n;
+-	if (bit >= 64 || (sweet_surf_logged & (1ULL << bit))) {
++	uint64_t *maskp = (what[0] == 't') ? &sweet_surf_trap_logged : &sweet_surf_sel_logged;
++	if (n >= 64 || (*maskp & (1ULL << n))) {
+ 		return;
+ 	}
+-	sweet_surf_logged |= 1ULL << bit;
++	*maskp |= 1ULL << n;
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+ 	IOLog("SWEET SURF: %s %s %u\n", name, what, n);
+@@ -654,11 +661,21 @@ put64(uint8_t *p, uint32_t off, uint64_t v)
+ 	memcpy(p + off, &v, 8);
+ }
+ 
+-/* IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). */
++static uint32_t
++sweet_struct_out_cap(const IOExternalMethodArguments *args)
++{
++	if (args->structureOutputDescriptor != NULL) {
++		IOByteCount len = args->structureOutputDescriptor->getLength();
++		return len > 0xffffffffULL ? 0xffffffffU : (uint32_t)len;
++	}
++	return args->structureOutput != NULL ? args->structureOutputSize : 0;
++}
++
++/* Legacy iOS 16 lock result (0xa68 bytes, copied to IOSurfaceClient + 0x68; also used by tools). */
+ static void
+-sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
++sweet_surface_fill_result_16(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+-	bzero(out, SWEET_SURFACE_RESULT_SIZE);
++	bzero(out, SWEET_SURFACE_RESULT_SIZE_16);
+ 	put64(out, 0x00, ref->data->getAddress());
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+@@ -702,6 +719,54 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 	}
+ }
+ 
++/* iOS 26 IOSurface.framework lock result (0xc68 bytes, copied to IOSurfaceClient + 0x70). */
++static void
++sweet_surface_fill_result_26(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
++{
++	bzero(out, SWEET_SURFACE_RESULT_SIZE_26);
++	put64(out, 0x00, ref->data->getAddress());
++	put64(out, 0x08, ref->state->getAddress());
++	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
++	put32(out, 0x18, s->id);
++	put64(out, 0x20, s->allocSize);
++	put64(out, 0x28, s->width);
++	put64(out, 0x30, s->height);
++	put64(out, 0x38, s->bytesPerRow);
++	put64(out, 0x40, s->offset);
++	put32(out, 0x48, s->pixelFormat);
++	put64(out, 0x50, s->allocSize);
++	put32(out, 0x58, s->planeCount);
++	memcpy(out + 0x60, &s->bytesPerElement, 2);
++	out[0x62] = s->elementWidth;
++	out[0x63] = s->elementHeight;
++	put32(out, 0x64, s->cacheMode);
++	put32(out, 0x70, s->parentID);
++	put32(out, 0x74, 1);
++	if (s->planeCount == 0) {
++		uint8_t *p0 = out + 0x88;
++		put32(p0, 0x88, s->planes[0].extRight);
++		put32(p0, 0x8c, s->planes[0].extBottom);
++		put32(p0, 0x90, s->planes[0].extLeft);
++		put32(p0, 0x94, s->planes[0].extTop);
++	}
++	for (uint32_t i = 0; i < s->planeCount; i++) {
++		uint8_t *p = out + 0x88 + i * 0x98;
++		const struct sweet_surface_plane *pl = &s->planes[i];
++		put64(p, 0x00, pl->width);
++		put64(p, 0x08, pl->height);
++		put64(p, 0x18, pl->offset);
++		put64(p, 0x20, pl->bytesPerRow);
++		put64(p, 0x28, pl->size);
++		memcpy(p + 0x30, &pl->bytesPerElement, 2);
++		p[0x32] = pl->elementWidth;
++		p[0x33] = pl->elementHeight;
++		put32(p, 0x88, pl->extRight);
++		put32(p, 0x8c, pl->extBottom);
++		put32(p, 0x90, pl->extLeft);
++		put32(p, 0x94, pl->extTop);
++	}
++}
++
+ static IOReturn
+ sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+ {
+@@ -725,22 +790,29 @@ sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+ IOReturn
+ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
+ {
++	uint32_t outCap = sweet_struct_out_cap(args);
++	bool is26 = (outCap >= SWEET_SURFACE_RESULT_SIZE_26);
++	uint32_t resLen = is26 ? SWEET_SURFACE_RESULT_SIZE_26 : SWEET_SURFACE_RESULT_SIZE_16;
+ 	SweetSurfaceRef *ref = NULL;
+ 	bool existing = false;
+ 	IOReturn ret = addRef(s, &ref, &existing);
+ 	if (ret != kIOReturnSuccess) {
+ 		return ret;
+ 	}
+-	uint8_t *out = (uint8_t *)IOMallocZeroData(SWEET_SURFACE_RESULT_SIZE);
++	uint8_t *out = (uint8_t *)IOMallocZeroData(resLen);
+ 	if (out == NULL) {
+ 		ret = kIOReturnNoMemory;
+ 	} else {
+-		sweet_surface_fill_result(s, ref, out);
++		if (is26) {
++			sweet_surface_fill_result_26(s, ref, out);
++		} else {
++			sweet_surface_fill_result_16(s, ref, out);
++		}
+ 		if (existing) {
+ 			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
+ 		}
+-		ret = sweet_struct_out(args, out, SWEET_SURFACE_RESULT_SIZE);
+-		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
++		ret = sweet_struct_out(args, out, resLen);
++		IOFreeData(out, resLen);
+ 	}
+ 	if (ret != kIOReturnSuccess && !existing) {
+ 		/* The caller never learns the id: undo this create/lookup. */
+@@ -833,13 +905,25 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 
+ 	switch (selector) {
+ 	case kSweetSurfaceLimits: {
+-		uint8_t limits[0x18] = { 0 };
+-		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);
+-		put32(limits, 0x4, SWEET_SURFACE_ROW_ALIGN - 1);
+-		limits[0x16] = 1;
++		uint32_t outCap = sweet_struct_out_cap(args);
+ 		sweet_surf_log_once("sel", selector);
+-		return sweet_struct_out(args, limits, sizeof(limits));
++		if (outCap >= 0x28) {
++			uint8_t limits26[0x28] = { 0 };
++			put32(limits26, 0x00, SWEET_SURFACE_ROW_ALIGN - 1);
++			put32(limits26, 0x04, SWEET_SURFACE_ROW_ALIGN - 1);
++			limits26[0x22] = 1;
++			return sweet_struct_out(args, limits26, sizeof(limits26));
++		}
++		uint8_t limits16[0x18] = { 0 };
++		put32(limits16, 0x00, SWEET_SURFACE_ROW_ALIGN - 1);
++		put32(limits16, 0x04, SWEET_SURFACE_ROW_ALIGN - 1);
++		limits16[0x16] = 1;
++		return sweet_struct_out(args, limits16, sizeof(limits16));
+ 	}
++	case kSweetSurfaceWrapClientImage:
++	case kSweetSurfaceWrapClientMemory:
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
+ 	case kSweetSurfaceCreate:
+ 		return create(args);
+ 	case kSweetSurfaceLookup: {
+@@ -873,7 +957,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		}
+ 		uint32_t matrix = (uint32_t)args->scalarInput[1];
+ 		IOLockLock(sweet_surface_lock);
+-		put32((uint8_t *)s->state->getBytesNoCopy(), SWEET_SURFACE_STATE_YCBCR, matrix);
++		put32((uint8_t *)s->state->getBytesNoCopy(), SWEET_SURFACE_STATE_YCBCR_26, matrix);
+ 		__asm__ volatile("dmb ish" ::: "memory");
+ 		IOLockUnlock(sweet_surface_lock);
+ 		s->release();
+@@ -881,38 +965,70 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		return kIOReturnSuccess;
+ 	}
+ 	case kSweetSurfaceSetBulkAttachments: {
+-		uint8_t inBuf[SWEET_SURFACE_BULK_IN_SIZE];
++		uint8_t inBuf[SWEET_SURFACE_BULK_IN_SIZE_26];
++		uint32_t inLen = 0;
+ 		if (args->structureInputDescriptor != NULL) {
+-			if (args->structureInputDescriptor->getLength() < SWEET_SURFACE_BULK_IN_SIZE) {
++			IOByteCount dlen = args->structureInputDescriptor->getLength();
++			if (dlen >= SWEET_SURFACE_BULK_IN_SIZE_26) {
++				inLen = SWEET_SURFACE_BULK_IN_SIZE_26;
++			} else if (dlen >= SWEET_SURFACE_BULK_IN_SIZE_16) {
++				inLen = SWEET_SURFACE_BULK_IN_SIZE_16;
++			} else {
+ 				return kIOReturnBadArgument;
+ 			}
+-			args->structureInputDescriptor->readBytes(0, inBuf, SWEET_SURFACE_BULK_IN_SIZE);
+-		} else if (args->structureInput != NULL && args->structureInputSize >= SWEET_SURFACE_BULK_IN_SIZE) {
+-			memcpy(inBuf, args->structureInput, SWEET_SURFACE_BULK_IN_SIZE);
++			args->structureInputDescriptor->readBytes(0, inBuf, inLen);
++		} else if (args->structureInput != NULL && args->structureInputSize >= SWEET_SURFACE_BULK_IN_SIZE_26) {
++			inLen = SWEET_SURFACE_BULK_IN_SIZE_26;
++			memcpy(inBuf, args->structureInput, inLen);
++		} else if (args->structureInput != NULL && args->structureInputSize >= SWEET_SURFACE_BULK_IN_SIZE_16) {
++			inLen = SWEET_SURFACE_BULK_IN_SIZE_16;
++			memcpy(inBuf, args->structureInput, inLen);
+ 		} else {
+ 			return kIOReturnBadArgument;
+ 		}
++		bool is26 = (inLen >= SWEET_SURFACE_BULK_IN_SIZE_26);
+ 		uint64_t bulkSize = 0, mask = 0;
+ 		uint32_t surfID = 0;
+-		memcpy(&bulkSize, inBuf + 0x70, 8);
+-		memcpy(&mask, inBuf + 0x78, 8);
+-		memcpy(&surfID, inBuf + 0x80, 4);
+-		if (bulkSize > SWEET_SURFACE_BULK_SIZE) {
+-			return kIOReturnBadArgument;
++		if (is26) {
++			memcpy(&bulkSize, inBuf + 0x88, 8);
++			memcpy(&mask, inBuf + 0x90, 8);
++			memcpy(&surfID, inBuf + 0x98, 4);
++			if (bulkSize > SWEET_SURFACE_BULK_SIZE_26) {
++				return kIOReturnBadArgument;
++			}
++		} else {
++			memcpy(&bulkSize, inBuf + 0x70, 8);
++			memcpy(&mask, inBuf + 0x78, 8);
++			memcpy(&surfID, inBuf + 0x80, 4);
++			if (bulkSize > SWEET_SURFACE_BULK_SIZE_16) {
++				return kIOReturnBadArgument;
++			}
+ 		}
+ 		SweetSurface *s = sweet_surface_copy(surfID);
+ 		if (s == NULL) {
+ 			return kIOReturnNotFound;
+ 		}
+-		static const struct { uint8_t off, len; } fields[15] = {
++		struct bulk_field { uint8_t off, len; };
++		static const struct bulk_field fields16[15] = {
+ 			{  0, 32 }, { 32, 16 }, { 48,  8 },
+ 			{ 56,  1 }, { 57,  1 }, { 58,  1 }, { 59,  1 },
+ 			{ 60,  1 }, { 61,  1 }, { 62,  1 }, { 63,  1 },
+ 			{ 64, 24 }, { 88,  4 }, { 92,  8 }, { 100, 12 },
+ 		};
+-		uint8_t *dst = (uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_BULK;
++		static const struct bulk_field fields26[22] = {
++			{ 0x00, 32 }, { 0x20, 16 }, { 0x30,  8 },
++			{ 0x38,  1 }, { 0x39,  1 }, { 0x3a,  1 }, { 0x3b,  1 },
++			{ 0x3c,  1 }, { 0x3d,  1 }, { 0x3e,  1 }, { 0x3f,  1 },
++			{ 0x40, 24 }, { 0x58,  4 }, { 0x5c,  8 }, { 0x64,  1 },
++			{ 0x68,  8 }, { 0x70,  4 }, { 0x65,  1 }, { 0x66,  1 },
++			{ 0x74, 12 }, { 0x80,  2 }, { 0x82,  2 },
++		};
++		const struct bulk_field *fields = is26 ? fields26 : fields16;
++		unsigned nfields = is26 ? 22u : 15u;
++		uint8_t *dst = (uint8_t *)s->state->getBytesNoCopy() +
++		    (is26 ? SWEET_SURFACE_STATE_BULK_26 : SWEET_SURFACE_STATE_BULK_16);
+ 		IOLockLock(sweet_surface_lock);
+-		for (unsigned bit = 0; bit < 15; bit++) {
++		for (unsigned bit = 0; bit < nfields; bit++) {
+ 			if (!(mask & (1ULL << bit)) || fields[bit].off >= bulkSize) {
+ 				continue;
+ 			}
+@@ -1034,6 +1150,16 @@ static IOExternalTrap sweet_surface_traps[] = {
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+ 	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
++	[6]                              = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[7]                              = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[8]                              = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[9]                              = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[10]                             = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[11]                             = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[12]                             = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[13]                             = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[14]                             = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[15]                             = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+ };
+ 
+ IOExternalTrap *
+-- 
+2.43.0
+
