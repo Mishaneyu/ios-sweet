@@ -22,6 +22,8 @@ typedef void (*qrtr_cb_t)(const struct qrtr_hdr *h, const uint8_t *data, uint32_
 extern int verbose_link;
 extern unsigned link_stats[4];	/* remote RX_DONE, RX_DONE_W_REUSE, our intent requests */
 extern void (*link_idle)(void);	/* called every poll round */
+extern void (*link_sleep)(unsigned ms);	/* optional sleep/poll hook for adaptive idle */
+void link_note_activity(void);	/* keep 1 ms poll for 50 ms after RX/TX */
 uint64_t link_ms(void);		/* since the first call */
 int link_up(qrtr_cb_t cb, unsigned timeout_ms);
 int link_poll(unsigned ms);		/* handle what arrived; for ms (0 = just once) */

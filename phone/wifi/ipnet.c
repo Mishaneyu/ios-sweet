@@ -450,6 +450,7 @@ static void ipnet_rx(const uint8_t *e, uint32_t len)
 	uint32_t af = htonl(AF_INET);
 	memcpy(out, &af, 4);
 	memcpy(out + 4, p, tot);
+	link_note_activity();
 	write(tun, out, 4 + tot);
 }
 
@@ -489,6 +490,7 @@ void ipnet_poll(void)
 		ssize_t r = read(tun, in, sizeof(in));
 		if (r <= 4)
 			break;
+		link_note_activity();
 		uint32_t af;
 		memcpy(&af, in, 4);
 		if (ntohl(af) == AF_INET)

@@ -103,6 +103,7 @@ static void bridge_send(uint16_t type, const void *data, size_t len)
 	memcpy(m, &h, sizeof(h));
 	if (len)
 		memcpy(m + sizeof(h), data, len);
+	link_note_activity();
 	if (write(bfd, m, sizeof(h) + len) < 0 && type != FW_RX)
 		printf("[%6llu] bridge: write type %u: %s\n", (unsigned long long)link_ms(), type, strerror(errno));
 }
@@ -229,6 +230,7 @@ void bridge_poll(void)
 		ssize_t r = read(bfd, m, sizeof(m));
 		if (r < (ssize_t)sizeof(struct fw_hdr))
 			break;
+		link_note_activity();
 		struct fw_hdr h;
 		memcpy(&h, m, sizeof(h));
 		const uint8_t *p = m + sizeof(h);

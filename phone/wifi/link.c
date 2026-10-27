@@ -31,6 +31,8 @@ static qrtr_cb_t qrtr_cb;
 int verbose_link = 1;
 unsigned link_stats[4];
 void (*link_idle)(void);
+void (*link_sleep)(unsigned ms);
+static uint64_t last_active_ms;
 #define LOG(...) do { if (verbose_link) { printf("[%6llu] ", (unsigned long long)link_ms()); printf(__VA_ARGS__); } } while (0)
 
 static uint64_t now_ms(void)
@@ -38,6 +40,11 @@ static uint64_t now_ms(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+void link_note_activity(void)
+{
+	last_active_ms = now_ms();
 }
 
 static uint64_t t0;
@@ -203,6 +210,7 @@ static int rx_one(void)
 			uint32_t n = rxoff;
 			rxoff = 0;
 			glink_send(GLINK_CMD_RX_DONE_W_REUSE, LCID, p2, NULL, 0);
+			link_note_activity();
 			handle_data(rxbuf, n);
 			return 1;
 		}
@@ -220,6 +228,7 @@ static int rx_one(void)
 		break;
 	}
 	glink_rx_advance(adv);
+	link_note_activity();
 	return 1;
 }
 
@@ -232,8 +241,18 @@ int link_poll(unsigned ms)
 			n++;
 		if (link_idle)
 			link_idle();
-		if (ms)
-			delay_ms(1);
+		if (ms) {
+			uint64_t cur = now_ms();
+			unsigned step = (cur - last_active_ms < 50) ? 1u : 8u;
+			if (cur < end && end - cur < step)
+				step = (unsigned)(end - cur);
+			if (step) {
+				if (link_sleep)
+					link_sleep(step);
+				else
+					delay_ms(step);
+			}
+		}
 	} while (now_ms() < end);
 	return n;
 }
@@ -268,6 +287,7 @@ static int find_intent(uint32_t len)
 /* One packet into one of the modem's intents (requested if none fits), in chunks of 8K as Linux does. */
 int link_send(const void *data, uint32_t len)
 {
+	link_note_activity();
 	uint64_t start = now_ms(), end = start + 3000;
 	int i, asked = 0;
 	while ((i = find_intent(len)) < 0) {

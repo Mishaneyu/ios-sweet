@@ -40,6 +40,7 @@
 #include "radio.h"
 #include "ipnet.h"
 #include "bridge.h"
+#include "qrtr_mux.h"
 
 /* cmd-db aux levels (as in the GPU's arc votes) */
 /* Every cmd-db entry: name, RPMh slave (3 ARC, 4 VRM, 5 BCM), address. */
@@ -260,24 +261,31 @@ static int smp2p_in_value(const char *name, uint32_t *v)
  * (slave-kernel: 0 err-fatal, 1 ready, 2 handover, 3 stop-ack).
  */
 static uint32_t modem_state = 0xffffffff;
+static uint64_t smp2p_in_pa, slave_kernel_pa;
 static void smp2p_service(void)
 {
-	uint64_t ip;
 	uint32_t sz, v;
 	if (!smp2p_out_pa && smem_get(SMEM_HOST_MODEM, SMP2P_OUT, &smp2p_out_pa, &sz))
 		return;
-	if (smem_get(SMEM_HOST_MODEM, SMP2P_IN, &ip, &sz) == 0) {
-		uint32_t want = (rd32(ip + 16) & 1) ? 2 : 0;
+	if (!smp2p_in_pa && smem_get(SMEM_HOST_MODEM, SMP2P_IN, &smp2p_in_pa, &sz))
+		return;
+	if (smp2p_in_pa) {
+		uint32_t want = (rd32(smp2p_in_pa + 16) & 1) ? 2 : 0;
 		if ((rd32(smp2p_out_pa + 16) & 2) != want) {
 			wr32(smp2p_out_pa + 16, (rd32(smp2p_out_pa + 16) & ~2u) | want);
 			kick(IPC_MODEM_SMP2P);
 			printf("smp2p: restart %s\n", want ? "acked" : "ack cleared");
 		}
 	}
-	if (smp2p_in_value("slave-kernel", &v) == 0 && v != modem_state) {
-		printf("[%6llu] smp2p: modem state %x%s%s%s%s\n", (unsigned long long)link_ms(), v, v & 1 ? " ERR-FATAL" : "", v & 2 ? " ready" : "",
-		       v & 4 ? " handover" : "", v & 8 ? " stop-ack" : "");
-		modem_state = v;
+	if (!slave_kernel_pa)
+		(void)smp2p_in_entry("slave-kernel", &slave_kernel_pa);
+	if (slave_kernel_pa) {
+		v = rd32(slave_kernel_pa);
+		if (v != modem_state) {
+			printf("[%6llu] smp2p: modem state %x%s%s%s%s\n", (unsigned long long)link_ms(), v, v & 1 ? " ERR-FATAL" : "", v & 2 ? " ready" : "",
+			       v & 4 ? " handover" : "", v & 8 ? " stop-ack" : "");
+			modem_state = v;
+		}
 	}
 }
 
@@ -499,6 +507,8 @@ static int boot_modem(void)
 	if (smp2p_in_entry("slave-kernel", &ve) == 0)
 		wr32(ve, 0);
 	modem_state = 0xffffffff;
+	smp2p_in_pa = 0;
+	slave_kernel_pa = 0;
 	rc = scm(5, 1, PAS_MODEM, 0, 0, &r1);
 	printf("boot: auth and reset -> %lld/%llx\n", (long long)rc, (unsigned long long)r1);
 	if (rc || r1)
@@ -543,6 +553,10 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			tftp_handle(h, d, n);
 			return;
 		}
+		if (h->dst_port >= QRTR_MUX_PORT_BASE && h->dst_port < QRTR_MUX_PORT_BASE + QRTR_MUX_MAX_CLIENTS) {
+			(void)qrtr_mux_deliver_data(h->dst_port, h->src_node, h->src_port, d, n);
+			return;
+		}
 		printf("qrtr: < DATA %u:%x -> %u:%x, %u bytes\n", h->src_node, h->src_port, h->dst_node, h->dst_port, n);
 		return;
 	}
@@ -553,8 +567,11 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		qrtr_send(QRTR_TYPE_HELLO, QRTR_PORT_CTRL, h->src_node, QRTR_PORT_CTRL, hello, sizeof(hello));
 	} else if (w[0] == QRTR_TYPE_NEW_SERVER) {
 		printf("qrtr:   server service %#x instance %#x at %u:%x\n", w[1], w[2], w[3], w[4]);
+		qrtr_mux_on_ctrl(w[0], w[1], w[2], w[3], w[4]);
 		if (w[1] == WLFW_SERVICE)
 			wlfw_new_server(w[3], w[4]);
+	} else if (w[0] == QRTR_TYPE_DEL_SERVER) {
+		qrtr_mux_on_ctrl(w[0], w[1], w[2], w[3], w[4]);
 	}
 }
 
@@ -638,11 +655,17 @@ static void on_usr1(int sig)
 
 static void net_idle(void)
 {
+	static uint64_t last_smp2p;
+	uint64_t now = link_ms();
 	if (drop_asked) {
 		drop_asked = 0;
 		radio_disconnect();
 	}
-	smp2p_service();
+	if (!last_smp2p || now - last_smp2p >= 25) {
+		last_smp2p = now;
+		smp2p_service();
+	}
+	qrtr_mux_poll();
 	radio_poll();
 	ipnet_poll();
 	bridge_poll();
@@ -663,6 +686,8 @@ static int net(unsigned secs)
 	if (getenv("WLAND_VERBOSE"))
 		verbose_link = atoi(getenv("WLAND_VERBOSE"));
 	link_idle = net_idle;
+	link_sleep = qrtr_mux_wait;
+	signal(SIGPIPE, SIG_IGN);
 	signal(SIGUSR1, on_usr1);
 	signal(SIGCHLD, SIG_IGN);	/* netsvc children (ipnet.c) reap themselves */
 	if (link_up(net_cb, 5000)) {
@@ -670,6 +695,8 @@ static int net(unsigned secs)
 		return -1;
 	}
 	wland_console("wland: modem GLINK/QRTR up\n");
+	if (qrtr_mux_open())
+		printf("net: no qrtr-mux\n");
 	if (rmtfs_init())
 		printf("net: no rmtfs\n");
 	if (pdmapper_init() || tftp_init())

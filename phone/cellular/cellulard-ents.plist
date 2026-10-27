@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.systemstatus.publisher.domains</key>
+	<array>
+		<string>telephony</string>
+		<string>calling</string>
+		<string>data-access</string>
+	</array>
+	<key>com.apple.systemstatus.domains</key>
+	<array>
+		<string>telephony</string>
+		<string>calling</string>
+		<string>data-access</string>
+	</array>
+	<key>com.apple.CommCenter.fine-grained</key>
+	<array>
+		<string>spi</string>
+		<string>identity</string>
+		<string>sim-authentication</string>
+		<string>data-usage</string>
+		<string>cellular-plan</string>
+	</array>
+	<key>com.apple.coretelephony.Identity.get</key>
+	<true/>
+	<key>com.apple.private.network.socket-delegate</key>
+	<true/>
+	<key>com.apple.SystemConfiguration.SCDynamicStore-write-access</key>
+	<true/>
+	<key>com.apple.SystemConfiguration.SCPreferences-write-access</key>
+	<true/>
+</dict>
+</plist>

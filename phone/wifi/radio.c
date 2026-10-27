@@ -312,8 +312,10 @@ static void ce_poll(void)
 			ce_post(c);
 			posted = 1;
 		}
-		if (posted)
+		if (posted) {
 			ce_wr(c, DR_WR_IDX, s->dst_wr);
+			link_note_activity();
+		}
 	}
 }
 
@@ -334,6 +336,7 @@ static int ce_send(uint32_t c, const void *data, uint32_t len, uint32_t transfer
 	s->src_wr = (slot + 1) & mask;
 	s->tx++;
 	wr32(SHADOW_PA + 4 * c, s->src_wr);		/* shadow SR write index of CE c */
+	link_note_activity();
 	return 0;
 }
 
