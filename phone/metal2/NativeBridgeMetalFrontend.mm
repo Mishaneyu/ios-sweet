@@ -12,6 +12,7 @@
 #import <objc/runtime.h>
 #include <algorithm>
 #include <atomic>
+#include <initializer_list>
 #include <mutex>
 #include <pthread.h>
 #include <string>
@@ -1427,7 +1428,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 }
 - (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {
  NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
- if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
+ if(!handle){if(!strstr(nmb_last_error(),"OutOfMemory(Heap)"))NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
  buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
 }
@@ -1450,7 +1451,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 - (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
  NmbTexture *handle=nmb_heap_new_texture(_handle,&descriptor,offset);
- if(!handle){NBLOG(@"native-metal: heap texture refused: %@",lastError());return nil;}
+ if(!handle){if(!strstr(nmb_last_error(),"OutOfMemory(Heap)"))NBLOG(@"native-metal: heap texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.parentHeap=(id<MTLHeap>)self;texture.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLTexture>)texture;
 }
@@ -1515,20 +1516,28 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 
 // Creation and archive population must use the same complete supported descriptor.
 static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipelineDescriptor *p,NSError **error) {
- if(!d || ![(id)d.computeFunction isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign compute function");return false;}
+ if(!d || ![(id)d.computeFunction isKindOfClass:[NBFunction class]]){
+  NBLOG(@"native-metal: compute descriptor refused: foreign compute function (%s)",d && d.computeFunction?object_getClassName(d.computeFunction):"nil");
+  if(error)*error=nbError(@"foreign compute function");
+  return false;
+ }
  // Metal may materialize empty stage/linked descriptors on access. Preserve the
  // default meaning while refusing state this frontend cannot yet represent.
  MTLStageInputOutputDescriptor *stage=d.stageInputDescriptor;
- bool empty=!stage || (stage.indexType==MTLIndexTypeUInt16 && stage.indexBufferIndex==0);
+ bool empty=true;
  for(NSUInteger index=0;stage && index<31;++index) {
-  MTLAttributeDescriptor *a=stage.attributes[index];MTLBufferLayoutDescriptor *b=stage.layouts[index];
-  empty=empty && a.format==MTLAttributeFormatInvalid && !a.offset && !a.bufferIndex && !b.stride &&
-        b.stepFunction==MTLStepFunctionPerVertex && b.stepRate==1;
+  MTLAttributeDescriptor *a=stage.attributes[index];
+  if(a && a.format!=MTLAttributeFormatInvalid){empty=false;break;}
  }
- if(!empty){if(error)*error=nbError(@"compute stage inputs are not implemented");return false;}
+ if(!empty){
+  NBLOG(@"native-metal: compute descriptor refused: stage inputs not implemented (%@)",[(NBFunction *)d.computeFunction name]);
+  if(error)*error=nbError(@"compute stage inputs are not implemented");
+  return false;
+ }
  MTLLinkedFunctions *linked=d.linkedFunctions;
  if(linked.functions.count || linked.binaryFunctions.count || linked.privateFunctions.count || linked.groups.count ||
     d.preloadedLibraries.count || d.insertLibraries.count) {
+  NBLOG(@"native-metal: compute descriptor refused: linked/dynamic libraries (%@)",[(NBFunction *)d.computeFunction name]);
   if(error)*error=nbError(@"compute linked/dynamic libraries are not implemented");return false;
  }
  p->function=[(NBFunction *)d.computeFunction handle];p->max_threads=d.maxTotalThreadsPerThreadgroup;
@@ -1749,8 +1758,9 @@ static char sweetMemoryOwnerKey;
 // gets the pitch its length implies where the required one does not fit.
 - (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {
  const size_t page=(size_t)getpagesize();
- if(!bytes || !d || !length || ((uintptr_t)bytes&(page-1)) || d.textureType!=MTLTextureType2D || d.mipmapLevelCount>1 || d.arrayLength>1 || d.sampleCount>1){
-  NBLOG(@"native-metal: newTextureWithBytesNoCopy refused (%p %lu type %lu levels %lu)",bytes,(unsigned long)length,(unsigned long)d.textureType,(unsigned long)d.mipmapLevelCount);
+ if(!d || !d.width || !d.height)return nil;
+ if(!bytes || !length || ((uintptr_t)bytes&(page-1)) || d.textureType!=MTLTextureType2D || d.mipmapLevelCount>1 || d.arrayLength>1 || d.sampleCount>1){
+  NBLOG(@"native-metal: newTextureWithBytesNoCopy refused (%p %lu %lux%lu type %lu levels %lu)",bytes,(unsigned long)length,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.textureType,(unsigned long)d.mipmapLevelCount);
   return nil;
  }
  uint32_t bw=0,bh=0,bb=0;
@@ -1776,7 +1786,8 @@ static char sweetMemoryOwnerKey;
 }
 - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBacked:(BOOL)backed {
  (void)backed;
- if(!d || d.textureType!=MTLTextureType2D || d.mipmapLevelCount>1 || d.arrayLength>1 || d.sampleCount>1){
+ if(!d || !d.width || !d.height)return nil;
+ if(d.textureType!=MTLTextureType2D || d.mipmapLevelCount>1 || d.arrayLength>1 || d.sampleCount>1){
   NBLOG(@"native-metal: newTextureLayoutWithDescriptor refused (type %lu levels %lu)",(unsigned long)d.textureType,(unsigned long)d.mipmapLevelCount);
   return nil;
  }
@@ -1897,8 +1908,11 @@ static char sweetMemoryOwnerKey;
  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);gTimePipeline.add(pipelineBegan);
- if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
+ if(!handle){NBLOG(@"native-metal: compute pipeline (%@) refused: %@",[(NBFunction *)function name],lastError());return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);}
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+}
+- (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)error {
+ return [(id<MTLDevice>)self newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error];
 }
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
                                                        reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
@@ -1909,12 +1923,39 @@ static char sweetMemoryOwnerKey;
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);gTimePipeline.add(pipelineBegan);
- if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
+ if(!handle){NBLOG(@"native-metal: compute pipeline (%@) refused: %@",[(NBFunction *)d.computeFunction name],lastError());return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);}
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
+- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:(void (^)(id<MTLComputePipelineState>,NSError *))completionHandler {
+ NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function error:&error];
+ if(completionHandler)dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{completionHandler(state,error);});
+}
+- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options completionHandler:(void (^)(id<MTLComputePipelineState>,MTLComputePipelineReflection *,NSError *))completionHandler {
+ NSError *error=nil;MTLComputePipelineReflection *reflection=nil;
+ id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:options reflection:&reflection error:&error];
+ if(completionHandler)dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{completionHandler(state,reflection,error);});
+}
+- (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d completionHandler:(void (^)(id<MTLComputePipelineState>,NSError *))completionHandler {
+ NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithDescriptor:d error:&error];
+ if(completionHandler)dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{completionHandler(state,error);});
+}
+- (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options completionHandler:(void (^)(id<MTLComputePipelineState>,MTLComputePipelineReflection *,NSError *))completionHandler {
+ NSError *error=nil;MTLComputePipelineReflection *reflection=nil;
+ id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithDescriptor:d options:options reflection:&reflection error:&error];
+ if(completionHandler)dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{completionHandler(state,reflection,error);});
+}
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
  return [(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error];
+}
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d completionHandler:(void (^)(id<MTLRenderPipelineState>,NSError *))completionHandler {
+ NSError *error=nil;id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d error:&error];
+ if(completionHandler)dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{completionHandler(state,error);});
+}
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options completionHandler:(void (^)(id<MTLRenderPipelineState>,MTLRenderPipelineReflection *,NSError *))completionHandler {
+ NSError *error=nil;MTLRenderPipelineReflection *reflection=nil;
+ id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:options reflection:&reflection error:&error];
+ if(completionHandler)dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{completionHandler(state,reflection,error);});
 }
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
                                                         reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error {
@@ -2098,16 +2139,35 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  // drivers get it from their IOGPU base class. Conformance only answers conformsToProtocol:, the methods are still looked up one by one.
  if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
  // SweetMetal2: Metal checks textures against its private implementation protocol too, and NSLogs "texture is not a
- // MTLTextureImplementation." on every miss (~600 lines/s from backboardd while scrolling).
- {Protocol *tp=objc_getProtocol("MTLTextureImplementation");if(tp)class_addProtocol([NBTexture class],tp);
+ // MTLTextureImplementation." on every miss (~600 lines/s from backboardd while scrolling). iOS 26 also checks MTLFunction
+ // conformance in MTLRenderPipelineDescriptor / MTLComputePipelineDescriptor setters.
+ auto adopt=[](Class c,std::initializer_list<const char *> names){
+  for(const char *n:names)if(Protocol *p=objc_getProtocol(n))class_addProtocol(c,p);
+ };
+ adopt([NBFunction class],{"MTLFunction"});
+ adopt([NBLibrary class],{"MTLLibrary"});
+ adopt([NBBuffer class],{"MTLBuffer","MTLResource","MTLAllocation"});
+ adopt([NBTexture class],{"MTLTexture","MTLTextureImplementation","MTLResource","MTLAllocation"});
+ adopt([NBHeap class],{"MTLHeap","MTLAllocation"});
+ adopt([NBSampler class],{"MTLSamplerState"});
+ adopt([NBDepthStencil class],{"MTLDepthStencilState"});
+ adopt([NBRenderPipeline class],{"MTLRenderPipelineState"});
+ adopt([NBComputePipeline class],{"MTLComputePipelineState"});
+ adopt([NBQueue class],{"MTLCommandQueue"});
+ adopt([NBCommandBuffer class],{"MTLCommandBuffer"});
+ adopt([NBEncoder class],{"MTLCommandEncoder"});
+ adopt([NBRenderEncoder class],{"MTLRenderCommandEncoder"});
+ adopt([NBComputeEncoder class],{"MTLComputeCommandEncoder"});
+ adopt([NBBlitEncoder class],{"MTLBlitCommandEncoder"});
+ adopt([NBEvent class],{"MTLEvent"});
+ adopt([NBSharedEvent class],{"MTLSharedEvent"});
+ adopt([NBFence class],{"MTLFence"});
+ adopt([NBBinaryArchive class],{"MTLBinaryArchive"});
+ adopt([NBResidencySet class],{"MTLResidencySet","MTLResidencySetSPI"});
+ adopt([NBResourceGroup class],{"MTLResourceGroupSPI"});
+ adopt([SweetTextureLayout class],{"MTLTextureLayout"});
+ {Protocol *tp=objc_getProtocol("MTLTextureImplementation");
   NBLOG(@"native-metal: MTLTextureImplementation %s",tp?([NBTexture conformsToProtocol:tp]?"adopted":"not adopted"):"missing");}
- if(Protocol *rp=objc_getProtocol("MTLResidencySet"))class_addProtocol([NBResidencySet class],rp);
- if(Protocol *rps=objc_getProtocol("MTLResidencySetSPI"))class_addProtocol([NBResidencySet class],rps);
- if(Protocol *ap=objc_getProtocol("MTLAllocation")) {
-  class_addProtocol([NBBuffer class],ap);
-  class_addProtocol([NBTexture class],ap);
-  class_addProtocol([NBHeap class],ap);
- }
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
  return gDeviceObject;
