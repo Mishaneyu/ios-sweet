@@ -8,19 +8,22 @@ use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::{
-    BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
-    PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
-    TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
+    BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, FunctionOptions, IndexType, PixelFormat,
+    PrimitiveTopologyClass, PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter,
+    StencilOperation, TextureType, TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
 };
 use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
-    VertexDescriptor,
+    ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunction, LinkedFunctions, RenderPipelineDescriptor, StageSource,
+    VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime::{
-    BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
-    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
-    MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+    BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, FunctionDescriptor as RuntimeFunctionDescriptor,
+    GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder, ComputePipelineState,
+    DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap,
+    HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction, MetalLevel, Origin, PipelineOption,
+    PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder,
+    RenderPassDescriptor, RenderPipelineState, ResourceOptions, SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size,
+    StoreAction, SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
@@ -1018,6 +1021,33 @@ pub struct NmbConstant {
 }
 
 /// # Safety
+/// `constants` holds `count` entries whose names are C strings (or null) and whose bytes hold `length` bytes.
+unsafe fn constant_values(constants: *const NmbConstant, count: u32) -> Result<FunctionConstantValues, String> {
+    if constants.is_null() && count > 0 {
+        return Err("null constants".into());
+    }
+    // SAFETY: the caller's contract.
+    let constants = if count == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(constants, count as usize) } };
+    let mut values = FunctionConstantValues::defaults();
+    for c in constants {
+        if c.bytes.is_null() {
+            return Err("constant without bytes".into());
+        }
+        // SAFETY: the caller's contract.
+        let bytes = unsafe { std::slice::from_raw_parts(c.bytes as *const u8, c.length as usize) };
+        let value = FunctionConstantValue::new(raw::<DataType>(c.kind, "constant type")?, bytes.to_vec());
+        if c.name.is_null() {
+            values.by_index.insert(u32::try_from(c.index).map_err(e("constant index"))?, value);
+        } else {
+            // SAFETY: the caller's contract.
+            let key = unsafe { CStr::from_ptr(c.name) }.to_str().map_err(e("constant name"))?;
+            values.by_name.insert(key.to_string(), value);
+        }
+    }
+    Ok(values)
+}
+
+/// # Safety
 /// `name` is a C string; `constants` holds `count` entries whose names are C strings (or null) and whose bytes hold `length` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_function_new_specialized(library: *mut NmbLibrary, name: *const c_char, constants: *const NmbConstant,
@@ -1028,24 +1058,44 @@ pub unsafe extern "C" fn nmb_function_new_specialized(library: *mut NmbLibrary, 
         }
         // SAFETY: the caller's contract.
         let name = unsafe { CStr::from_ptr(name) }.to_str().map_err(e("function name"))?;
-        let constants = if count == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(constants, count as usize) } };
-        let mut values = FunctionConstantValues::defaults();
-        for c in constants {
-            if c.bytes.is_null() {
-                return Err("constant without bytes".into());
-            }
+        let values = unsafe { constant_values(constants, count)? };
+        let function = get(library)?.0.new_function_with_name_constant_values(name, &values).map_err(e("specialized function"))?;
+        Ok(boxed(NmbFunction(function)))
+    })
+}
+
+/// # Safety
+/// `name` is a C string; `specialized_name` is null or a C string; when `has_constants`, `constants` holds `count` entries.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_function_new_with_descriptor(
+    library: *mut NmbLibrary,
+    name: *const c_char,
+    specialized_name: *const c_char,
+    options_word: u64,
+    constants: *const NmbConstant,
+    count: u32,
+    has_constants: bool,
+) -> *mut NmbFunction {
+    guard(std::ptr::null_mut(), || {
+        if name.is_null() {
+            return Err("null function name".into());
+        }
+        // SAFETY: the caller's contract.
+        let name = unsafe { CStr::from_ptr(name) }.to_str().map_err(e("function name"))?;
+        let mut descriptor = RuntimeFunctionDescriptor::new(name);
+        if !specialized_name.is_null() {
             // SAFETY: the caller's contract.
-            let bytes = unsafe { std::slice::from_raw_parts(c.bytes as *const u8, c.length as usize) };
-            let value = FunctionConstantValue::new(raw::<DataType>(c.kind, "constant type")?, bytes.to_vec());
-            if c.name.is_null() {
-                values.by_index.insert(u32::try_from(c.index).map_err(e("constant index"))?, value);
-            } else {
-                // SAFETY: the caller's contract.
-                let key = unsafe { CStr::from_ptr(c.name) }.to_str().map_err(e("constant name"))?;
-                values.by_name.insert(key.to_string(), value);
+            let sname = unsafe { CStr::from_ptr(specialized_name) }.to_str().map_err(e("specialized function name"))?;
+            if !sname.is_empty() {
+                descriptor.specialized_name = Some(sname.to_owned());
             }
         }
-        let function = get(library)?.0.new_function_with_name_constant_values(name, &values).map_err(e("specialized function"))?;
+        descriptor.options = raw::<FunctionOptions>(options_word, "function options")?;
+        if has_constants {
+            // SAFETY: the caller's contract.
+            descriptor.constant_values = Some(unsafe { constant_values(constants, count)? });
+        }
+        let function = get(library)?.0.new_function_with_descriptor(&descriptor).map_err(e("function descriptor"))?;
         Ok(boxed(NmbFunction(function)))
     })
 }
@@ -1066,6 +1116,64 @@ pub struct NmbComputePipeline(ComputePipelineState);
 pub struct NmbRenderPipeline(RenderPipelineState);
 pub struct NmbSampler(SamplerState);
 pub struct NmbDepthStencil(DepthStencilState);
+
+#[repr(C)]
+pub struct NmbLinkedGroup {
+    pub name: *const c_char,
+    pub functions: *const *mut NmbFunction,
+    pub count: u32,
+}
+
+#[repr(C)]
+pub struct NmbLinkedFunctions {
+    pub functions: *const *mut NmbFunction,
+    pub function_count: u32,
+    pub private_functions: *const *mut NmbFunction,
+    pub private_function_count: u32,
+    pub binary_functions: *const *mut NmbFunction,
+    pub binary_function_count: u32,
+    pub groups: *const NmbLinkedGroup,
+    pub group_count: u32,
+}
+
+fn linked_list(ptr: *const *mut NmbFunction, count: u32) -> Result<Vec<LinkedFunction>, String> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err("null linked function list".into());
+    }
+    // SAFETY: the caller provides `count` valid function handle pointers for the duration of the call.
+    let slice = unsafe { std::slice::from_raw_parts(ptr, count as usize) };
+    let mut out = Vec::with_capacity(slice.len());
+    for &f in slice {
+        out.push(get(f)?.0.linked_function());
+    }
+    Ok(out)
+}
+
+fn linked_functions(raw_linked: &NmbLinkedFunctions) -> Result<LinkedFunctions, String> {
+    let mut out = LinkedFunctions::new();
+    out.functions = linked_list(raw_linked.functions, raw_linked.function_count)?;
+    out.private_functions = linked_list(raw_linked.private_functions, raw_linked.private_function_count)?;
+    out.binary_functions = linked_list(raw_linked.binary_functions, raw_linked.binary_function_count)?;
+    if raw_linked.group_count > 0 {
+        if raw_linked.groups.is_null() {
+            return Err("null linked groups".into());
+        }
+        // SAFETY: the caller provides `group_count` valid group records for the duration of the call.
+        let groups = unsafe { std::slice::from_raw_parts(raw_linked.groups, raw_linked.group_count as usize) };
+        for g in groups {
+            if g.name.is_null() {
+                return Err("null linked group name".into());
+            }
+            // SAFETY: the caller provides a valid C string for each group's name.
+            let name = unsafe { CStr::from_ptr(g.name) }.to_str().map_err(e("linked group name"))?;
+            out.groups.insert(name.to_owned(), linked_list(g.functions, g.count)?);
+        }
+    }
+    Ok(out)
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_compute_pipeline_new(device: *mut NmbDevice, function: *mut NmbFunction) -> *mut NmbComputePipeline {
@@ -1088,6 +1196,7 @@ pub unsafe extern "C" fn nmb_compute_pipeline_new_with_options(device: *mut NmbD
 #[repr(C)]
 pub struct NmbComputePipelineDescriptor {
     pub function: *mut NmbFunction,
+    pub linked: NmbLinkedFunctions,
     pub max_threads: u64,
     pub multiple_of_execution_width: u64,
     pub indirect: u64,
@@ -1098,11 +1207,12 @@ pub struct NmbComputePipelineDescriptor {
 
 fn compute_descriptor(descriptor: *const NmbComputePipelineDescriptor) -> Result<ComputePipelineDescriptor, String> {
     let d = get(descriptor)?;
-    let mut out = ComputePipelineDescriptor::new(StageSource::Function(get(d.function)?.0.function_descriptor()));
+    let stage = get(d.function)?.0.function_descriptor().with_linked(linked_functions(&d.linked)?);
+    let mut out = ComputePipelineDescriptor::new(StageSource::Function(stage));
     out.max_total_threads_per_threadgroup = if d.max_threads == 0 { None } else { Some(u32::try_from(d.max_threads).map_err(e("compute max threads"))?) };
     out.threadgroup_size_is_multiple_of_execution_width = d.multiple_of_execution_width != 0;
     out.support_indirect_command_buffers = d.indirect != 0;
-    out.max_call_stack_depth = u32::try_from(d.max_call_stack_depth).map_err(e("compute stack depth"))?;
+    out.max_call_stack_depth = u32::try_from(d.max_call_stack_depth.max(1)).map_err(e("compute stack depth"))?;
     out.support_adding_binary_functions = d.adding_binary_functions != 0;
     for (index, &mutability) in d.mutability.iter().enumerate() {
         if mutability != 0 {
@@ -1170,12 +1280,18 @@ pub struct NmbVertexLayout {
 pub struct NmbRenderPipelineDescriptor {
     pub vertex: *mut NmbFunction,
     pub fragment: *mut NmbFunction,
+    pub vertex_linked: NmbLinkedFunctions,
+    pub fragment_linked: NmbLinkedFunctions,
     pub colors: [NmbColorAttachment; 8],
     pub depth_format: u64,
     pub stencil_format: u64,
     pub samples: u64,
     pub topology: u64,
     pub rasterization: u64,
+    pub max_vertex_call_stack_depth: u64,
+    pub max_fragment_call_stack_depth: u64,
+    pub adding_vertex_binary_functions: u64,
+    pub adding_fragment_binary_functions: u64,
     pub vertex_inputs: u64,
     pub attributes: [NmbVertexAttribute; 31],
     pub layouts: [NmbVertexLayout; 31],
@@ -1232,9 +1348,11 @@ pub unsafe extern "C" fn nmb_render_pipeline_new_with_options(device: *mut NmbDe
 
 fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<RenderPipelineDescriptor, String> {
         let d = get(descriptor)?;
-        let mut out = RenderPipelineDescriptor::new(StageSource::Function(get(d.vertex)?.0.function_descriptor()));
+        let vertex = get(d.vertex)?.0.function_descriptor().with_linked(linked_functions(&d.vertex_linked)?);
+        let mut out = RenderPipelineDescriptor::new(StageSource::Function(vertex));
         if !d.fragment.is_null() {
-            out.fragment = Some(StageSource::Function(get(d.fragment)?.0.function_descriptor()));
+            let fragment = get(d.fragment)?.0.function_descriptor().with_linked(linked_functions(&d.fragment_linked)?);
+            out.fragment = Some(StageSource::Function(fragment));
         }
         for (slot, c) in out.color_attachments.iter_mut().zip(d.colors.iter()) {
             if c.format == 0 {
@@ -1256,6 +1374,10 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
         out.raster_sample_count = d.samples.max(1) as u32;
         out.input_primitive_topology = raw::<PrimitiveTopologyClass>(d.topology, "topology")?;
         out.rasterization_enabled = d.rasterization != 0;
+        out.max_vertex_call_stack_depth = u32::try_from(d.max_vertex_call_stack_depth.max(1)).map_err(e("vertex stack depth"))?;
+        out.max_fragment_call_stack_depth = u32::try_from(d.max_fragment_call_stack_depth.max(1)).map_err(e("fragment stack depth"))?;
+        out.support_adding_vertex_binary_functions = d.adding_vertex_binary_functions != 0;
+        out.support_adding_fragment_binary_functions = d.adding_fragment_binary_functions != 0;
         if d.vertex_inputs != 0 {
             let mut inputs = VertexDescriptor::new();
             for (i, a) in d.attributes.iter().enumerate() {

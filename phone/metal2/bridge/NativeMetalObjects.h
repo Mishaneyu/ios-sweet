@@ -119,6 +119,8 @@ NmbFunction *nmb_function_new(NmbLibrary *, const char *name);
  * indexed value; bytes holds the value's bytes. */
 struct NmbConstant {uint64_t type, index; const char *name; const void *bytes; uint64_t length;};
 NmbFunction *nmb_function_new_specialized(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
+NmbFunction *nmb_function_new_with_descriptor(NmbLibrary *, const char *name, const char *specialized_name, uint64_t options,
+                                              const struct NmbConstant *constants, uint32_t count, bool has_constants);
 void nmb_function_release(NmbFunction *);
 /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
 uint64_t nmb_function_type(const NmbFunction *);
@@ -128,6 +130,21 @@ void nmb_compute_pipeline_release(NmbComputePipeline *);
 uint64_t nmb_compute_pipeline_max_threads(const NmbComputePipeline *);
 uint64_t nmb_compute_pipeline_execution_width(const NmbComputePipeline *);
 
+struct NmbLinkedGroup {
+    const char *name;
+    NmbFunction *const *functions;
+    uint32_t count;
+};
+struct NmbLinkedFunctions {
+    NmbFunction *const *functions;
+    uint32_t function_count;
+    NmbFunction *const *private_functions;
+    uint32_t private_function_count;
+    NmbFunction *const *binary_functions;
+    uint32_t binary_function_count;
+    const struct NmbLinkedGroup *groups;
+    uint32_t group_count;
+};
 struct NmbColorAttachment {
     uint64_t format, write_mask, blending, source_rgb, destination_rgb, rgb_operation, source_alpha, destination_alpha, alpha_operation;
 };
@@ -135,8 +152,11 @@ struct NmbVertexAttribute {uint64_t format, offset, buffer;};
 struct NmbVertexLayout {uint64_t stride, step_function, step_rate;};
 struct NmbRenderPipelineDescriptor {
     NmbFunction *vertex, *fragment;
+    struct NmbLinkedFunctions vertex_linked, fragment_linked;
     struct NmbColorAttachment colors[8];
     uint64_t depth_format, stencil_format, samples, topology, rasterization;
+    uint64_t max_vertex_call_stack_depth, max_fragment_call_stack_depth;
+    uint64_t adding_vertex_binary_functions, adding_fragment_binary_functions;
     uint64_t vertex_inputs; /* 0: no vertex descriptor */
     struct NmbVertexAttribute attributes[31];
     struct NmbVertexLayout layouts[31];
@@ -147,6 +167,7 @@ NmbRenderPipeline *nmb_render_pipeline_new(NmbDevice *, const struct NmbRenderPi
 struct NmbPipelineOptions {uint64_t flags; NmbBinaryArchive *const *archives; size_t archive_count;};
 struct NmbComputePipelineDescriptor {
     NmbFunction *function;
+    struct NmbLinkedFunctions linked;
     uint64_t max_threads, multiple_of_execution_width, indirect, max_call_stack_depth, adding_binary_functions;
     uint64_t mutability[31];
 };

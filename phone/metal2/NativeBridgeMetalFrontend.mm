@@ -382,12 +382,12 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
 @interface NBFunction : NBObject
 @property(nonatomic) NmbFunction *handle;
 @property(nonatomic,copy) NSString *name;
+@property(nonatomic) MTLFunctionOptions options;
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
 @end
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
-- (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
 @end
 // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
 @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
@@ -430,47 +430,68 @@ static uint64_t constantBytes(uint64_t type) {
 static std::string quartzCoreCallers();
 @implementation NBLibrary
 - (void)dealloc {nmb_library_release(_handle);}
+- (id<MTLFunction>)makeFunctionWithName:(NSString *)name specializedName:(NSString *)specializedName options:(MTLFunctionOptions)options
+                         constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
+ if(!name){if(error)*error=nbError(@"a function name is required");return nil;}
+ MTLFunctionConstantValues *snapshot=nil;
+ NSArray *indexed=nil,*named=nil;
+ std::vector<NmbConstant> constants;
+ if(values) {
+  if(!methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
+   NBLOG(@"native-metal: %@: unqualified function constant values (%s)",name,object_getClassName(values));
+   if(error)*error=nbError(@"unqualified function constant values");return nil;
+  }
+  snapshot=[values copy];
+  indexed=[snapshot newIndexedConstantArray];named=[snapshot newNamedConstantArray];
+  for(unsigned group=0;group<2;group++)for(id value in (group?named:indexed)) {
+   if(!methodABI(value,@selector(dataType),"Q16@0:8") || !methodABI(value,@selector(data),"^v16@0:8") ||
+      !methodABI(value,group?@selector(name):@selector(index),group?"@16@0:8":"Q16@0:8")) {
+    NBLOG(@"native-metal: %@: unqualified constant value ABI (%s)",name,object_getClassName(value));
+    if(error)*error=nbError(@"unqualified constant value ABI");return nil;
+   }
+   id<NBOriginalConstantValue> v=value;
+   const uint64_t bytes=constantBytes(v.dataType);
+   if(!bytes || !v.data){NBLOG(@"native-metal: %@: constant type %lu is not qualified",name,(unsigned long)v.dataType);
+    if(error)*error=nbError([NSString stringWithFormat:@"constant type %lu is not qualified",(unsigned long)v.dataType]);return nil;}
+   constants.push_back({v.dataType,group?0:v.index,group?v.name.UTF8String:nullptr,v.data,bytes});
+  }
+ }
+ std::string text;
+ if(!gJournalPath.empty()) {
+  for(const NmbConstant &c:constants) {
+   char head[32];if(!c.name)snprintf(head,sizeof head,"#%llu",(unsigned long long)c.index);
+   text+=text.empty()?"":" ";text+=c.name?c.name:head;snprintf(head,sizeof head,":%llu:",(unsigned long long)c.type);text+=head;
+   for(uint64_t i=0;i<c.length;i++){snprintf(head,sizeof head,"%02x",((const uint8_t *)c.bytes)[i]);text+=head;}
+  }
+ }
+ const char *sname=specializedName.length?specializedName.UTF8String:nullptr;
+ const uint64_t functionBegan=nowUs();
+ NmbFunction *handle=nmb_function_new_with_descriptor(_handle,name.UTF8String,sname,(uint64_t)options,constants.data(),(uint32_t)constants.size(),values!=nil);
+ gTimeFunction.add(functionBegan);
+ (void)indexed;(void)named;(void)snapshot;
+ // One S line per specialization (int-155: every QuartzCore pipeline was made on its draw, and a refused generic function would leave its
+ // generic pipeline unmade without a word): the function, its constants, the time, the refusal and QuartzCore's callers.
+ if((values || sname || options) && !gJournalPath.empty()) {
+  char head[96];snprintf(head,sizeof head,"S t=%llu us=%llu ok=%d name=",(unsigned long long)((functionBegan-gJournalBegan)/1000),
+      (unsigned long long)(nowUs()-functionBegan),handle?1:0);
+  std::string desc=std::string(name.UTF8String?:"?");
+  if(sname){desc+="->";desc+=sname;}
+  journal(head+desc+" k="+text+(handle?std::string():" err="+std::string(lastError().UTF8String?:"?"))+" | "+quartzCoreCallers());
+ }
+ if(!handle){
+  if(values || sname || options)noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
+  if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",name,lastError()]);return nil;
+ }
+ NBFunction *function=[NBFunction new];function.handle=handle;function.name=specializedName.length?specializedName:name;function.options=options;
+ function.functionType=(MTLFunctionType)nmb_function_type(handle);function.constantsText=text;
+ if(error)*error=nil;return (id<MTLFunction>)function;
+}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
- if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
+ if(!name || !values) {
   NBLOG(@"native-metal: %@: unqualified function constant values (%s)",name,values?object_getClassName(values):"nil");
   if(error)*error=nbError(@"unqualified function constant values");return nil;
  }
- MTLFunctionConstantValues *snapshot=[values copy];
- NSArray *indexed=[snapshot newIndexedConstantArray],*named=[snapshot newNamedConstantArray];
- std::vector<NmbConstant> constants;
- for(unsigned group=0;group<2;group++)for(id value in (group?named:indexed)) {
-  if(!methodABI(value,@selector(dataType),"Q16@0:8") || !methodABI(value,@selector(data),"^v16@0:8") ||
-     !methodABI(value,group?@selector(name):@selector(index),group?"@16@0:8":"Q16@0:8")) {
-   NBLOG(@"native-metal: %@: unqualified constant value ABI (%s)",name,object_getClassName(value));
-   if(error)*error=nbError(@"unqualified constant value ABI");return nil;
-  }
-  id<NBOriginalConstantValue> v=value;
-  const uint64_t bytes=constantBytes(v.dataType);
-  if(!bytes || !v.data){NBLOG(@"native-metal: %@: constant type %lu is not qualified",name,(unsigned long)v.dataType);
-   if(error)*error=nbError([NSString stringWithFormat:@"constant type %lu is not qualified",(unsigned long)v.dataType]);return nil;}
-  constants.push_back({v.dataType,group?0:v.index,group?v.name.UTF8String:nullptr,v.data,bytes});
- }
- std::string text;
- for(const NmbConstant &c:constants) {
-  char head[32];if(!c.name)snprintf(head,sizeof head,"#%llu",(unsigned long long)c.index);
-  text+=text.empty()?"":" ";text+=c.name?c.name:head;snprintf(head,sizeof head,":%llu:",(unsigned long long)c.type);text+=head;
-  for(uint64_t i=0;i<c.length;i++){snprintf(head,sizeof head,"%02x",((const uint8_t *)c.bytes)[i]);text+=head;}
- }
- const uint64_t functionBegan=nowUs();
- NmbFunction *handle=nmb_function_new_specialized(_handle,name.UTF8String,constants.data(),(uint32_t)constants.size());gTimeFunction.add(functionBegan);
- // One S line per specialization (int-155: every QuartzCore pipeline was made on its draw, and a refused generic function would leave its
- // generic pipeline unmade without a word): the function, its constants, the time, the refusal and QuartzCore's callers.
- if(!gJournalPath.empty()) {
-  char head[96];snprintf(head,sizeof head,"S t=%llu us=%llu ok=%d name=",(unsigned long long)((functionBegan-gJournalBegan)/1000),
-      (unsigned long long)(nowUs()-functionBegan),handle?1:0);
-  journal(head+std::string(name.UTF8String?:"?")+" k="+text+(handle?std::string():" err="+std::string(lastError().UTF8String?:"?"))+" | "+quartzCoreCallers());
- }
- if(!handle){
-  noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
-  if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
- }
- NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
- function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
+ return [self makeFunctionWithName:name specializedName:nil options:MTLFunctionOptionNone constantValues:values error:error];
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
@@ -478,13 +499,7 @@ static std::string quartzCoreCallers();
 }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)pipelineLibrary error:(NSError **)error {
  (void)pipelineLibrary;
- if(!values) {
-  if(!name){if(error)*error=nbError(@"a function name is required");return nil;}
-  id<MTLFunction> function=[self newFunctionWithName:name];
-  if(!function){if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",name,lastError()]);return nil;}
-  if(error)*error=nil;return function;
- }
- return [self newFunctionWithName:name constantValues:values error:error];
+ return [self makeFunctionWithName:name specializedName:nil options:MTLFunctionOptionNone constantValues:values error:error];
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)pipelineLibrary completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values pipelineLibrary:pipelineLibrary error:&error];
@@ -492,27 +507,20 @@ static std::string quartzCoreCallers();
 }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values functionCache:(id)cache error:(NSError **)error {
  (void)cache;
- return [self newFunctionWithName:name constantValues:values pipelineLibrary:nil error:error];
+ return [self makeFunctionWithName:name specializedName:nil options:MTLFunctionOptionNone constantValues:values error:error];
 }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values functionCache:(id)cache specializedName:(NSString *)specializedName error:(NSError **)error {
  (void)cache;
- id<MTLFunction> function=[self newFunctionWithName:name constantValues:values pipelineLibrary:nil error:error];
- if(function && specializedName.length && [(id)function isKindOfClass:[NBFunction class]])((NBFunction *)function).name=specializedName;
- return function;
+ return [self makeFunctionWithName:name specializedName:specializedName options:MTLFunctionOptionNone constantValues:values error:error];
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values functionCache:(id)cache specializedName:(NSString *)specializedName completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values functionCache:cache specializedName:specializedName error:&error];
  if(handler)handler(function,error);
 }
 - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
-// The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
-// runtime does when the function is made.
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
- if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
- if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
- id<MTLFunction> function=[self newFunctionWithName:d.name];
- if(!function){if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
- if(error)*error=nil;return function;
+ if(!d){if(error)*error=nbError(@"a function descriptor is required");return nil;}
+ return [self makeFunctionWithName:d.name specializedName:d.specializedName options:d.options constantValues:d.constantValues error:error];
 }
 - (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithDescriptor:d error:&error];
@@ -521,6 +529,10 @@ static std::string quartzCoreCallers();
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d destinationArchive:(id<MTLBinaryArchive>)archive error:(NSError **)error {
  (void)archive;
  return [self newFunctionWithDescriptor:d error:error];
+}
+- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d destinationArchive:(id<MTLBinaryArchive>)archive completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+ (void)archive;
+ [self newFunctionWithDescriptor:d completionHandler:handler];
 }
 - (NSArray<NSString *> *)functionNames {
  NSMutableArray *names=[NSMutableArray array];
@@ -664,7 +676,7 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) uint64_t committedUs;
 @property(nonatomic) uint32_t commitIndex;
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
-@property(nonatomic,strong) NSMutableSet *surfaces;
+@property(nonatomic,strong) NSMutableSet *surfaces,*writtenSurfaces;
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
 @property(nonatomic,strong) NSMutableSet *resourceOwners;
@@ -718,7 +730,12 @@ static void waitForResource(id resource) {
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
- if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(texture && [(NBTexture *)texture surface]) {
+  NBTexture *t=(NBTexture *)texture;
+  [_commandBuffer.surfaces addObject:t];
+  const MTLTextureUsage u=t.usage;
+  if(!u || (u&MTLTextureUsageShaderWrite))[_commandBuffer.writtenSurfaces addObject:t];
+ }
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
@@ -735,10 +752,13 @@ static void waitForResource(id resource) {
  NmbFence *handle=[(NBFence *)fence handle];
  [self check:update?nmb_encoder_update_fence(_handle,handle,stages):nmb_encoder_wait_fence(_handle,handle,stages) what:update?"updateFence":"waitForFence"];
 }
-- (void)retainUsedResource:(id)r {
+- (void)retainUsedResource:(id)r usage:(MTLResourceUsage)u {
  if(!r)return;
  [_commandBuffer.resourceOwners addObject:r];
- if([r isKindOfClass:[NBTexture class]] && [(NBTexture *)r surface])[_commandBuffer.surfaces addObject:r];
+ if([r isKindOfClass:[NBTexture class]] && [(NBTexture *)r surface]) {
+  [_commandBuffer.surfaces addObject:r];
+  if(u&MTLResourceUsageWrite)[_commandBuffer.writtenSurfaces addObject:r];
+ }
 }
 - (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
 - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
@@ -786,9 +806,9 @@ static void waitForResource(id resource) {
 }
 - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
 - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)u;[self retainUsedResource:r];}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {[self retainUsedResource:r usage:u];}
 - (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u {
- (void)u;for(NSUInteger i=0;i<c && r;i++)[self retainUsedResource:r[i]];
+ for(NSUInteger i=0;i<c && r;i++)[self retainUsedResource:r[i] usage:u];
 }
 - (void)useHeap:(id<MTLHeap>)h {if(h)[self.commandBuffer.resourceOwners addObject:h];}
 - (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c {
@@ -924,13 +944,13 @@ static void waitForResource(id resource) {
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o {
  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:1 baseVertex:0 baseInstance:0];
 }
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)u;[self retainUsedResource:r];}
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)u;(void)s;[self retainUsedResource:r];}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {[self retainUsedResource:r usage:u];}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)s;[self retainUsedResource:r usage:u];}
 - (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u {
- (void)u;for(NSUInteger i=0;i<c && r;i++)[self retainUsedResource:r[i]];
+ for(NSUInteger i=0;i<c && r;i++)[self retainUsedResource:r[i] usage:u];
 }
 - (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {
- (void)u;(void)s;for(NSUInteger i=0;i<c && r;i++)[self retainUsedResource:r[i]];
+ (void)s;for(NSUInteger i=0;i<c && r;i++)[self retainUsedResource:r[i] usage:u];
 }
 - (void)useHeap:(id<MTLHeap>)h {if(h)[self.commandBuffer.resourceOwners addObject:h];}
 - (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)s {(void)s;if(h)[self.commandBuffer.resourceOwners addObject:h];}
@@ -977,6 +997,7 @@ static void waitForResource(id resource) {
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ if([(NBTexture *)d surface])[self.commandBuffer.writtenSurfaces addObject:d];
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
 }
@@ -993,6 +1014,7 @@ static void waitForResource(id resource) {
             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
      destinationOrigin:(MTLOrigin)dO {
  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
+ if([(NBTexture *)d surface])[self.commandBuffer.writtenSurfaces addObject:d];
  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
 }
@@ -1033,6 +1055,7 @@ static void waitForResource(id resource) {
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
  if(![self textures:NB_OBJECTS(t) count:1])return;
+ if([(NBTexture *)t surface])[self.commandBuffer.writtenSurfaces addObject:t];
  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
 }
 - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
@@ -1046,7 +1069,7 @@ static void completed(void *context);
 static void scheduled(void *context);
 @implementation NBCommandBuffer
 - (instancetype)init {
- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
  if(self)createdUs=nowUs();
  return self;
 }
@@ -1134,7 +1157,7 @@ static void scheduled(void *context);
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
-  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
+  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];[_writtenSurfaces addObject:texture];}
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   return true;
@@ -1190,12 +1213,12 @@ static void scheduled(void *context);
  // deadlock checks. The queue's completionQueue routes completed handlers only.
  run();
 }
-// After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
+// After completion (or a refusal): invalidate the CPU's view of GPU-written imported surfaces, then completed handlers, once.
 - (void)finish {
- flushSurfaces(_surfaces);
+ if(!self.failedLocally)flushSurfaces(_writtenSurfaces);
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
- [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
+ [_surfaces removeAllObjects];[_writtenSurfaces removeAllObjects];[_resourceOwners removeAllObjects];
  @synchronized(gInFlight){[gInFlight removeObject:self];}
  NSArray *completedHandlers;
  @synchronized(self){
@@ -1398,17 +1421,59 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
  for(char &c:line)if(c=='\n')c=' ';
  journal(line);
 }
+struct BuiltLinkedFunctions {
+ std::vector<NmbFunction *> functions,privateFunctions,binaryFunctions;
+ std::vector<std::string> groupNames;
+ std::vector<std::vector<NmbFunction *>> groupLists;
+ std::vector<NmbLinkedGroup> groups;
+ bool populate(MTLLinkedFunctions *src,NmbLinkedFunctions &out,NSError **error) {
+  out={};
+  if(!src)return true;
+  auto convert=[&](NSArray<id<MTLFunction>> *in,std::vector<NmbFunction *> &dst)->bool {
+   if(!in.count)return true;
+   dst.reserve(in.count);
+   for(id f in in) {
+    if(![f isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign linked function");return false;}
+    dst.push_back([(NBFunction *)f handle]);
+   }
+   return true;
+  };
+  if(!convert(src.functions,functions) || !convert(src.privateFunctions,privateFunctions) || !convert(src.binaryFunctions,binaryFunctions))
+   return false;
+  out.functions=functions.empty()?nullptr:functions.data();out.function_count=(uint32_t)functions.size();
+  out.private_functions=privateFunctions.empty()?nullptr:privateFunctions.data();out.private_function_count=(uint32_t)privateFunctions.size();
+  out.binary_functions=binaryFunctions.empty()?nullptr:binaryFunctions.data();out.binary_function_count=(uint32_t)binaryFunctions.size();
+  NSDictionary<NSString *,NSArray<id<MTLFunction>> *> *g=src.groups;
+  if(g.count) {
+   groupNames.reserve(g.count);groupLists.reserve(g.count);groups.reserve(g.count);
+   for(NSString *name in g) {
+    if(!name){if(error)*error=nbError(@"null linked group name");return false;}
+    groupNames.emplace_back(name.UTF8String?:"");
+    groupLists.emplace_back();
+    if(!convert(g[name],groupLists.back()))return false;
+   }
+   for(size_t i=0;i<groupNames.size();++i)
+    groups.push_back({groupNames[i].c_str(),groupLists[i].empty()?nullptr:groupLists[i].data(),(uint32_t)groupLists[i].size()});
+   out.groups=groups.data();out.group_count=(uint32_t)groups.size();
+  }
+  return true;
+ }
+};
+struct BuiltRenderDescriptor {
+ NmbRenderPipelineDescriptor raw={};
+ BuiltLinkedFunctions vertexLinked,fragmentLinked;
+};
 // A render pipeline descriptor in the bridge's form; false, with the error, for a function of another device.
-static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDescriptor *p,NSError **error) {
- if(![(id)d.vertexFunction isKindOfClass:[NBFunction class]] || (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]])) {
+static bool renderDescriptor(MTLRenderPipelineDescriptor *d,BuiltRenderDescriptor *b,NSError **error) {
+ if(!d || ![(id)d.vertexFunction isKindOfClass:[NBFunction class]] || (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]])) {
   if(error)*error=nbError(@"foreign function");return false;
  }
- auto hasLinked=[](MTLLinkedFunctions *linked)->bool {
-  return linked && (linked.functions.count || linked.binaryFunctions.count || linked.privateFunctions.count || linked.groups.count);
- };
- if(hasLinked(d.vertexLinkedFunctions) || hasLinked(d.fragmentLinkedFunctions)) {
-  if(error)*error=nbError(@"render linked functions are not implemented");return false;
+ if(d.vertexPreloadedLibraries.count || d.fragmentPreloadedLibraries.count) {
+  if(error)*error=nbError(@"render dynamic libraries are not implemented");return false;
  }
+ NmbRenderPipelineDescriptor *p=&b->raw;
+ if(!b->vertexLinked.populate(d.vertexLinkedFunctions,p->vertex_linked,error) ||
+    !b->fragmentLinked.populate(d.fragmentLinkedFunctions,p->fragment_linked,error))return false;
  p->vertex=[(NBFunction *)d.vertexFunction handle];p->fragment=d.fragmentFunction?[(NBFunction *)d.fragmentFunction handle]:nullptr;
  for(unsigned i=0;i<8;i++) {
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];
@@ -1417,6 +1482,8 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
  }
  p->depth_format=d.depthAttachmentPixelFormat;p->stencil_format=d.stencilAttachmentPixelFormat;p->samples=d.rasterSampleCount;
  p->topology=d.inputPrimitiveTopology;p->rasterization=d.rasterizationEnabled;
+ p->max_vertex_call_stack_depth=d.maxVertexCallStackDepth;p->max_fragment_call_stack_depth=d.maxFragmentCallStackDepth;
+ p->adding_vertex_binary_functions=d.supportAddingVertexBinaryFunctions;p->adding_fragment_binary_functions=d.supportAddingFragmentBinaryFunctions;
  if(MTLVertexDescriptor *v=d.vertexDescriptor) {
   for(unsigned i=0;i<31;i++) {
    MTLVertexAttributeDescriptor *a=v.attributes[i];if(a.format==MTLVertexFormatInvalid)continue;
@@ -1543,8 +1610,12 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 - (void)endResidency {}
 @end
 
+struct BuiltComputeDescriptor {
+ NmbComputePipelineDescriptor raw={};
+ BuiltLinkedFunctions linked;
+};
 // Creation and archive population must use the same complete supported descriptor.
-static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipelineDescriptor *p,NSError **error) {
+static bool computeDescriptor(MTLComputePipelineDescriptor *d,BuiltComputeDescriptor *b,NSError **error) {
  if(!d || ![(id)d.computeFunction isKindOfClass:[NBFunction class]]){
   NBLOG(@"native-metal: compute descriptor refused: foreign compute function (%s)",d && d.computeFunction?object_getClassName(d.computeFunction):"nil");
   if(error)*error=nbError(@"foreign compute function");
@@ -1563,12 +1634,12 @@ static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipeline
   if(error)*error=nbError(@"compute stage inputs are not implemented");
   return false;
  }
- MTLLinkedFunctions *linked=d.linkedFunctions;
- if(linked.functions.count || linked.binaryFunctions.count || linked.privateFunctions.count || linked.groups.count ||
-    d.preloadedLibraries.count || d.insertLibraries.count) {
-  NBLOG(@"native-metal: compute descriptor refused: linked/dynamic libraries (%@)",[(NBFunction *)d.computeFunction name]);
-  if(error)*error=nbError(@"compute linked/dynamic libraries are not implemented");return false;
+ if(d.preloadedLibraries.count || d.insertLibraries.count) {
+  NBLOG(@"native-metal: compute descriptor refused: dynamic libraries (%@)",[(NBFunction *)d.computeFunction name]);
+  if(error)*error=nbError(@"compute dynamic libraries are not implemented");return false;
  }
+ NmbComputePipelineDescriptor *p=&b->raw;
+ if(!b->linked.populate(d.linkedFunctions,p->linked,error))return false;
  p->function=[(NBFunction *)d.computeFunction handle];p->max_threads=d.maxTotalThreadsPerThreadgroup;
  p->multiple_of_execution_width=d.threadGroupSizeIsMultipleOfThreadExecutionWidth;p->indirect=d.supportIndirectCommandBuffers;
  p->max_call_stack_depth=d.maxCallStackDepth;p->adding_binary_functions=d.supportAddingBinaryFunctions;
@@ -1584,14 +1655,14 @@ static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipeline
 - (void)dealloc {nmb_binary_archive_release(_handle);}
 - (NSUInteger)options {return 0;}
 - (BOOL)addRenderPipelineFunctionsWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
- auto *p=new NmbRenderPipelineDescriptor();
- const bool ok=renderDescriptor(d,p,error) && nmb_binary_archive_add_render(_handle,p);delete p;
+ auto *b=new BuiltRenderDescriptor();
+ const bool ok=renderDescriptor(d,b,error) && nmb_binary_archive_add_render(_handle,&b->raw);delete b;
  if(!ok)return failWith<BOOL>(error,@"archive render pipeline",NO);
  if(error)*error=nil;return YES;
 }
 - (BOOL)addComputePipelineFunctionsWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)error {
- NmbComputePipelineDescriptor p={};if(!computeDescriptor(d,&p,error))return NO;
- if(!nmb_binary_archive_add_compute_descriptor(_handle,&p))return failWith<BOOL>(error,@"archive compute pipeline",NO);
+ BuiltComputeDescriptor b;if(!computeDescriptor(d,&b,error))return NO;
+ if(!nmb_binary_archive_add_compute_descriptor(_handle,&b.raw))return failWith<BOOL>(error,@"archive compute pipeline",NO);
  if(error)*error=nil;return YES;
 }
 - (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {
@@ -1946,12 +2017,12 @@ static char sweetMemoryOwnerKey;
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
                                                        reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
- NmbComputePipelineDescriptor p={};if(!computeDescriptor(d,&p,error))return nil;
+ BuiltComputeDescriptor b;if(!computeDescriptor(d,&b,error))return nil;
  std::vector<NmbBinaryArchive *> archives;
  if(!pipelineArchives(d.binaryArchives,archives,error))return nil;
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();
- NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);gTimePipeline.add(pipelineBegan);
+ NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&b.raw,&creation);gTimePipeline.add(pipelineBegan);
  if(!handle){NBLOG(@"native-metal: compute pipeline (%@) refused: %@",[(NBFunction *)d.computeFunction name],lastError());return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);}
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
@@ -1989,14 +2060,16 @@ static char sweetMemoryOwnerKey;
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
                                                         reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
- auto *p=new NmbRenderPipelineDescriptor();
- if(!renderDescriptor(d,p,error)){delete p;return nil;}
+ auto *b=new BuiltRenderDescriptor();
+ if(!renderDescriptor(d,b,error)){delete b;return nil;}
  std::vector<NmbBinaryArchive *> archives;
- if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
+ if(!pipelineArchives(d.binaryArchives,archives,error)){delete b;return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
- const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
- NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
- journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
+ const uint64_t pipelineBegan=nowUs();
+ const bool logJournal=!gJournalPath.empty();
+ const NBCost costBegan=logJournal?NBCost::now():NBCost{};
+ NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,&b->raw,&creation);delete b;gTimePipeline.add(pipelineBegan);
+ if(logJournal)journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),NBCost::now().since(costBegan));
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
 }
@@ -2143,11 +2216,14 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
- if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+ const char *logPipelines=getenv("SWEET_MTL2_LOG_PIPELINES");
+ if(cache && logPipelines && !strcmp(logPipelines,"1")){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
- {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
-  for(char *line=waived,*next;*line;line=next){next=strchr(line,'\n');if(next)*next++=0;else next=line+strlen(line);journal(std::string("F ")+line);}}
+ if(!gJournalPath.empty()) {
+  char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
+  for(char *line=waived,*next;*line;line=next){next=strchr(line,'\n');if(next)*next++=0;else next=line+strlen(line);journal(std::string("F ")+line);}
+ }
  Class base=objc_getClass("_MTLDevice");
 #if !TARGET_OS_IPHONE
  // Host instrument: on NSObject every selector a client sends that this file lacks reaches the missing hook, instead of the host's

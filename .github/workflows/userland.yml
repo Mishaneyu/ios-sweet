@@ -3,7 +3,7 @@ name: userland
 on:
   workflow_dispatch:
   push:
-    branches: [main, master, upgrade_ios_version_target]
+    branches: [main, master, upgrade_ios_version_target, 'ci/*']
     paths:
       - "phone/**"
       - "tools/build-turnip-ios.sh"
