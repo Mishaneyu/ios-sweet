@@ -1,0 +1,69 @@
+From af20d2935cec8dae476e808b7283ef6d65a21819 Mon Sep 17 00:00:00 2001
+From: XNU 26 Rebase <rebase@local>
+Date: Tue, 27 Oct 2026 09:53:33 +0000
+Subject: [PATCH] ios26: map SM8150 MPSS carve-out write-combining in /dev/pmem
+
+---
+ bsd/dev/sweet_pmem.c | 32 +++++++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index 90fba52..e5faf4d 100644
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -100,6 +100,21 @@ static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
+  * from the small io_submap (a 2 MB one panicked "kmem_alloc failed"), so
+  * windows use ml_io_map_unmappable: kernel_map, freed by ml_io_unmap.
+  */
++/*
++ * SM8150 MPSS carve-out (0x8dc00000..0x97c00000, 160 MiB, 2 MiB aligned):
++ * lies inside /chosen dram-base..dram-size, so VM_WIMG_WCOMB maps it as
++ * Normal Non-Cacheable Write-Combining instead of strongly-ordered Device
++ * memory, dropping wland's 158 MiB MPSS load from ~96 s to < 0.1 s.
++ */
++#define PMEM_MPSS_PA    0x8dc00000ULL
++#define PMEM_MPSS_END   0x97c00000ULL
++
++static inline bool
++pm_is_wcomb(uint64_t pa)
++{
++	return pa >= PMEM_MPSS_PA && pa < PMEM_MPSS_END;
++}
++
+ static volatile uint32_t *
+ pm_io(uint64_t pa)
+ {
+@@ -113,7 +128,8 @@ pm_io(uint64_t pa)
+ 	if (pm_map[i].va) {
+ 		ml_io_unmap(pm_map[i].va, PMEM_WIN);
+ 	}
+-	pm_map[i].va = ml_io_map_unmappable((vm_offset_t)win, PMEM_WIN, VM_WIMG_IO);
++	unsigned int wimg = pm_is_wcomb(win) ? VM_WIMG_WCOMB : VM_WIMG_IO;
++	pm_map[i].va = ml_io_map_unmappable((vm_offset_t)win, PMEM_WIN, wimg);
+ 	pm_map[i].win = win;
+ 	return pm_map[i].va ? (volatile uint32_t *)(pm_map[i].va + (pa - win)) : NULL;
+ }
+@@ -143,6 +159,20 @@ pm_rw(struct uio *uio, bool write)
+ 			err = ENOMEM;
+ 			break;
+ 		}
++		if (pm_is_wcomb(pa)) {
++			if (write) {
++				err = uiomove((caddr_t)pm_bounce, (int)n, uio);
++				if (!err) {
++					bcopy(pm_bounce, (void *)(uintptr_t)r, n);
++					__asm__ volatile ("dsb sy" ::: "memory");
++				}
++			} else {
++				bcopy((const void *)(uintptr_t)r, pm_bounce, n);
++				__asm__ volatile ("dmb oshld" ::: "memory");
++				err = uiomove((caddr_t)pm_bounce, (int)n, uio);
++			}
++			continue;
++		}
+ 		if (write) {
+ 			err = uiomove((caddr_t)pm_bounce, (int)n, uio);
+ 			__asm__ volatile ("dmb oshst" ::: "memory");
+-- 
+2.43.0
+
