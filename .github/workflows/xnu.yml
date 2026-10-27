@@ -1,4 +1,5 @@
 name: xnu
+# polaris-gpu: RELEASE kernel on push
 
 on:
   workflow_dispatch:
