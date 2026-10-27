@@ -37,7 +37,10 @@ extern char **environ;
 #define SWEETSTORED_PORT        29170
 #define STAGE_ROOT              "/private/var/local/store-stage"
 #define LOCAL_IPA_DIR           "/private/var/local/ipa"
-#define REG_STAMP_PATH          "/private/var/local/.sweetstore-registered-v1"
+#define STAGED_SYSTEM_APPS_DIR  "/private/var/staged_system_apps"
+#define APP_PLACEHOLDERS_DIR    "/System/Library/AppPlaceholders"
+#define STAGED_PLACEHOLDERS_DIR "/private/var/local/staged-placeholders"
+#define REG_STAMP_PATH          "/private/var/local/.sweetstore-registered-v2"
 #define MARKER_FILE             ".sweetstore_installed"
 
 static pthread_mutex_t g_job_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -61,11 +64,11 @@ static void set_job(NSString *state, double progress, NSString *step, NSString *
 	pthread_mutex_unlock(&g_job_lock);
 }
 
-static int run_tool(const char *prog, char *const argv[])
+static int run_tool_env(const char *prog, char *const argv[], char *const envp[])
 {
 	pid_t pid = 0;
 	int status = 0;
-	int rc = posix_spawn(&pid, prog, NULL, NULL, argv, environ);
+	int rc = posix_spawn(&pid, prog, NULL, NULL, argv, envp ? envp : environ);
 	if (rc != 0) {
 		fprintf(stderr, "sweetstored: posix_spawn %s failed: %d\n", prog, rc);
 		return -1;
@@ -76,10 +79,38 @@ static int run_tool(const char *prog, char *const argv[])
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+static int run_tool(const char *prog, char *const argv[])
+{
+	return run_tool_env(prog, argv, environ);
+}
+
+static int run_lsreg_mobile_args(NSArray<NSString *> *args)
+{
+	char *mobile_env[] = {
+		(char *)"PATH=/private/var/local/bin:/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+		(char *)"HOME=/var/mobile",
+		(char *)"LSREG_UID=501",
+		NULL
+	};
+	NSUInteger cnt = args.count;
+	char **argv = (char **)calloc(cnt + 2, sizeof(char *));
+	if (!argv) return -1;
+	argv[0] = (char *)"/var/local/bin/lsreg";
+	for (NSUInteger i = 0; i < cnt; i++) {
+		argv[i + 1] = (char *)args[i].UTF8String;
+	}
+	argv[cnt + 1] = NULL;
+	int rc = run_tool_env("/var/local/bin/lsreg", argv, mobile_env);
+	free(argv);
+	return rc;
+}
+
 static int run_lsreg_rebuild(void)
 {
+	int rc_mob = run_lsreg_mobile_args(@[@"-r"]);
 	char *const argv[] = { (char *)"/var/local/bin/lsreg", (char *)"-r", NULL };
-	return run_tool("/var/local/bin/lsreg", argv);
+	int rc_root = run_tool("/var/local/bin/lsreg", argv);
+	return rc_mob == 0 ? 0 : rc_root;
 }
 
 static void chown_chmod_recursive(NSString *rootPath)
@@ -918,6 +949,7 @@ static void install_ipa_worker(NSString *ipaPath, BOOL deleteAfter, NSString *hi
 		if (deleteAfter) [fm removeItemAtPath:ipaPath error:nil];
 
 		set_job(@"installing", 0.92, @"Registering icon on Home Screen (lsreg)...", dispName, bundleId, @"");
+		(void)run_lsreg_mobile_args(@[destApp]);
 		(void)run_lsreg_rebuild();
 
 		set_job(@"done", 1.0, [NSString stringWithFormat:@"Installed %@ (%@)", dispName, version], dispName, bundleId, @"");
@@ -1157,22 +1189,75 @@ static void handle_client(int cfd)
 	}
 }
 
+static void promote_staged_system_apps(void)
+{
+	@autoreleasepool {
+		NSFileManager *fm = [NSFileManager defaultManager];
+		NSArray<NSString *> *staged = [fm contentsOfDirectoryAtPath:@STAGED_SYSTEM_APPS_DIR error:nil];
+		if (staged.count == 0) return;
+
+		mkdir(STAGED_PLACEHOLDERS_DIR, 0755);
+		int moved = 0;
+		for (NSString *item in staged) {
+			if (![item.pathExtension.lowercaseString isEqualToString:@"app"]) continue;
+			NSString *src = [@STAGED_SYSTEM_APPS_DIR stringByAppendingPathComponent:item];
+			NSString *dst = [@"/Applications" stringByAppendingPathComponent:item];
+			NSString *phSrc = [@APP_PLACEHOLDERS_DIR stringByAppendingPathComponent:item];
+			NSString *phDst = [@STAGED_PLACEHOLDERS_DIR stringByAppendingPathComponent:item];
+
+			if ([fm fileExistsAtPath:phSrc]) {
+				(void)rename(phSrc.fileSystemRepresentation, phDst.fileSystemRepresentation);
+			}
+			if (![fm fileExistsAtPath:dst]) {
+				if (rename(src.fileSystemRepresentation, dst.fileSystemRepresentation) == 0) {
+					chown(dst.fileSystemRepresentation, 0, 0);
+					chmod(dst.fileSystemRepresentation, 0755);
+					moved++;
+				}
+			}
+		}
+		if (moved > 0) {
+			fprintf(stderr, "sweetstored: promoted %d staged system apps into /Applications\n", moved);
+		}
+	}
+}
+
 static void ensure_first_boot_registration(void)
 {
 	@autoreleasepool {
+		NSFileManager *fm = [NSFileManager defaultManager];
+		NSArray<NSString *> *promoted = [fm contentsOfDirectoryAtPath:@STAGED_PLACEHOLDERS_DIR error:nil];
 		struct stat st;
-		if (stat("/Applications/SweetStore.app/SweetStore", &st) != 0) return;
-		NSString *want = [NSString stringWithFormat:@"%lld:%lld\n",
-		    (long long)st.st_size, (long long)st.st_mtimespec.tv_sec];
+		long long sw_sz = 0, sw_mt = 0;
+		if (stat("/Applications/SweetStore.app/SweetStore", &st) == 0) {
+			sw_sz = (long long)st.st_size;
+			sw_mt = (long long)st.st_mtimespec.tv_sec;
+		}
+		NSString *want = [NSString stringWithFormat:@"%lld:%lld:%lu\n",
+		    sw_sz, sw_mt, (unsigned long)promoted.count];
 		NSString *have = [NSString stringWithContentsOfFile:@REG_STAMP_PATH encoding:NSUTF8StringEncoding error:nil];
 		if ([have isEqualToString:want]) return;
 
-		/* Wait for lsd & SpringBoard to come up on boot, then rebuild LaunchServices once */
-		for (int attempt = 0; attempt < 4; attempt++) {
-			sleep(attempt == 0 ? 8 : 6);
-			int rc = run_lsreg_rebuild();
-			fprintf(stderr, "sweetstored: auto-register SweetStore.app attempt %d -> rc=%d\n", attempt + 1, rc);
-			if (rc == 0) {
+		NSMutableArray<NSString *> *toReg = [NSMutableArray array];
+		if (sw_sz > 0) {
+			[toReg addObject:@"/Applications/SweetStore.app"];
+		}
+		for (NSString *item in promoted) {
+			if (![item.pathExtension.lowercaseString isEqualToString:@"app"]) continue;
+			NSString *appPath = [@"/Applications" stringByAppendingPathComponent:item];
+			if ([fm fileExistsAtPath:appPath]) {
+				[toReg addObject:appPath];
+			}
+		}
+
+		/* Wait for lsd & SpringBoard to come up on boot, then register apps & rebuild LaunchServices */
+		for (int attempt = 0; attempt < 5; attempt++) {
+			sleep(attempt == 0 ? 6 : 6);
+			int rc_reg = toReg.count > 0 ? run_lsreg_mobile_args(toReg) : 0;
+			int rc_reb = run_lsreg_rebuild();
+			fprintf(stderr, "sweetstored: auto-register (%lu apps) attempt %d -> reg=%d rebuild=%d\n",
+			    (unsigned long)toReg.count, attempt + 1, rc_reg, rc_reb);
+			if (rc_reg == 0 || rc_reb == 0) {
 				[want writeToFile:@REG_STAMP_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
 				break;
 			}
@@ -1193,6 +1278,8 @@ int main(int argc, char **argv)
 		mkdir("/private/var/mobile/Downloads", 0777);
 		chown("/private/var/mobile/Downloads", 501, 501);
 		chmod("/private/var/mobile/Downloads", 0777);
+
+		promote_staged_system_apps();
 
 		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 			ensure_first_boot_registration();

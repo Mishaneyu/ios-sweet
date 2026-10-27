@@ -233,7 +233,8 @@ def main():
     ap.add_argument('--sweetmetal2', help='optional path to SweetMetal2.bundle to stage under /System/Library/Extensions')
     ap.add_argument('--userland-dir', help='optional extracted userland dir (Applications/, HAL/, bin/, lib/)')
     ap.add_argument('--dsc-stubs-dir', help='optional dir of de-PACd dyld_shared_cache_arm64e.* stub subcaches')
-    ap.add_argument('--mtl2-clients', help='optional /private/var/local/mtl2-clients content')
+    ap.add_argument('--mtl2-clients', default='* -chronod',
+                    help='/private/var/local/mtl2-clients content (default: "* -chronod")')
     ap.add_argument('--selftest-bin', help='optional compiled arm64 self-test Mach-O for guarded test boots')
     ap.add_argument('--selftest-script', help='optional bring-up self-test shell script for guarded test boots')
     ap.add_argument('--extra', action='append', default=[],
@@ -242,6 +243,8 @@ def main():
 
     tweaks = _load_tweaks_module()
 
+    build_ver, prod_ver = '23F84', '26.5.2'
+    jetsam_bytes, j_uid, j_gid, j_mode = None, 0, 0, 0o644
     if args.launchd_plist:
         with open(args.launchd_plist, 'rb') as f:
             raw_plist = f.read()
@@ -250,6 +253,25 @@ def main():
         hfs = HFSReadOnly(args.root_img)
         try:
             raw_plist, uid, gid, mode = hfs.read_file('/System/Library/xpc/launchd.plist')
+            for sv_rel in ('/System/Library/CoreServices/SystemVersion.plist',
+                           '/private/preboot/Cryptexes/OS/System/Library/CoreServices/SystemVersion.plist'):
+                try:
+                    raw_sv, _, _, _ = hfs.read_file(sv_rel)
+                    sv = plistlib.loads(raw_sv)
+                    build_ver = sv.get('ProductBuildVersion', build_ver)
+                    prod_ver = sv.get('ProductVersion', prod_ver)
+                    break
+                except FileNotFoundError:
+                    pass
+            try:
+                raw_j, j_uid, j_gid, j_mode = hfs.read_file(
+                    '/System/Library/LaunchDaemons/com.apple.jetsamproperties.D421.plist')
+                j_plist = plistlib.loads(raw_j)
+                j_raised = tweaks.patch_jetsam_limits(j_plist, min_mb=64)
+                jetsam_bytes = plistlib.dumps(j_plist, fmt=plistlib.FMT_BINARY)
+                print(f'jetsamproperties.D421.plist: raised {j_raised} limits to >= 64 MB')
+            except FileNotFoundError:
+                pass
         finally:
             hfs.close()
 
@@ -311,19 +333,55 @@ def main():
         raise RuntimeError(f'refusing to build overlay: required LaunchDaemons missing: {missing_keep}')
 
     cleaned_bytes = plistlib.dumps(plist, fmt=plistlib.FMT_BINARY)
+    major_ver = int(prod_ver.split('.')[0]) if prod_ver and prod_ver.split('.')[0].isdigit() else 26
+    setup_ver = 15 if major_ver >= 26 else 11
+    mig_bytes = plistlib.dumps({
+        'LastSystemVersion': build_ver,
+        'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': build_ver},
+    }, fmt=plistlib.FMT_BINARY)
+    sb_bytes = plistlib.dumps({
+        'BKNoWatchdogs': True,
+        'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},
+        'MCForceShowCloudConfigurationUI': False,
+    }, fmt=plistlib.FMT_BINARY)
     buddy_bytes = plistlib.dumps({
-        'LastSystemVersion': '23F84',
+        'ForceNoBuddy': True,
+        'LastSystemVersion': build_ver,
         'SetupDone': True,
         'SetupFinishedAllSteps': True,
-        'SetupVersion': 11,
+        'SetupVersion': setup_ver,
         'daemonizeNeedsToRun': False,
+    }, fmt=plistlib.FMT_BINARY)
+    buddy_nb_bytes = plistlib.dumps({
+        k: False for k in (
+            'ShouldRunDiagnosticsMiniBuddy',
+            'ShouldRunHSA2MiniBuddy',
+            'ShouldRunKeychainSyncMiniBuddy',
+            'ShouldRunMesaMiniBuddy',
+            'ShouldRunPaymentMiniBuddy',
+            'ShouldRunStandardMiniBuddy',
+            'SilentICDPUpgrade',
+        )
+    }, fmt=plistlib.FMT_BINARY)
+    mc_nb_bytes = plistlib.dumps({
+        'LockdownActivationIndicatesCloudConfigurationAvailable': False,
     }, fmt=plistlib.FMT_BINARY)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with tarfile.open(args.output, 'w', format=tarfile.USTAR_FORMAT) as tf:
         add_ustar_bytes(tf, 'System/Library/xpc/launchd.plist', cleaned_bytes, mode=mode, uid=uid, gid=gid)
-        add_ustar_bytes(tf, 'private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist',
-                        buddy_bytes, mode=0o600, uid=501, gid=501)
+        if jetsam_bytes is not None:
+            add_ustar_bytes(tf, 'System/Library/LaunchDaemons/com.apple.jetsamproperties.D421.plist',
+                            jetsam_bytes, mode=j_mode, uid=j_uid, gid=j_gid)
+        for pref_name, pref_data in (
+            ('com.apple.migration.plist', mig_bytes),
+            ('com.apple.springboard.plist', sb_bytes),
+            ('com.apple.purplebuddy.plist', buddy_bytes),
+            ('com.apple.purplebuddy.notbackedup.plist', buddy_nb_bytes),
+            ('com.apple.managedconfiguration.notbackedup.plist', mc_nb_bytes),
+        ):
+            add_ustar_bytes(tf, f'private/var/mobile/Library/Preferences/{pref_name}',
+                            pref_data, mode=0o600, uid=501, gid=501)
         # Ensure all MCM system & user container class base directories exist with right owners
         for cdir, cuid in (
             ('private/var/containers', 0),
@@ -339,11 +397,20 @@ def main():
             ('private/var/mobile/Containers/Data/Application', 501),
             ('private/var/mobile/Containers/Data/PluginKitPlugin', 501),
             ('private/var/mobile/Containers/Data/InternalDaemon', 501),
+            ('private/var/mobile/Containers/Data/XPCServices', 501),
             ('private/var/mobile/Containers/Data/Temp', 501),
             ('private/var/mobile/Containers/Shared', 501),
             ('private/var/mobile/Containers/Shared/AppGroup', 501),
         ):
             add_ustar_dir(tf, cdir, mode=0o755, uid=cuid, gid=cuid)
+
+        # Ensure pre-seeded installcoordinationd SystemGroup container is writable by mobile (501)
+        for sgdir in (
+            'private/var/containers/Shared/SystemGroup/systemgroup.com.apple.installcoordinationd',
+            'private/var/containers/Shared/SystemGroup/systemgroup.com.apple.installcoordinationd/Library',
+            'private/var/containers/Shared/SystemGroup/systemgroup.com.apple.installcoordinationd/Library/InstallCoordination',
+        ):
+            add_ustar_dir(tf, sgdir, mode=0o777, uid=501, gid=501)
 
         if args.dsc_stubs_dir:
             stub_files = sorted(fn for fn in os.listdir(args.dsc_stubs_dir)
@@ -408,6 +475,7 @@ def main():
             b'/usr/local/lib/libsweet_media.dylib mediaserverd\n'
             b'/usr/local/lib/libsweet_sysfix.dylib containermanagerd\n'
             b'/usr/local/lib/libsweet_sysfix.dylib containermanagerd_system\n'
+            b'/usr/local/lib/libsweet_sysfix.dylib backboardd\n'
             b'/usr/local/lib/libsweet_sysfix.dylib SpringBoard\n',
             mode=0o644,
         )

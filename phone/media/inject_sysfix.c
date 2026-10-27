@@ -31,12 +31,18 @@
  *           (Personal) identity from defaultUserIdentity,
  *           lock_userIdentityForPersonalPersona, and
  *           userIdentityForPersonalPersonaWithPOSIXUser:.
+ *   - backboardd (iOS 26+):
+ *       -[CBBacklightNode getBacklightCalibration:] fallback for 625-nit
+ *       AppleARMBacklight so _DisplayCreateWithCapabilitiesAndID does not call
+ *       __DisplaySliderToLogicalBrightnessInternal before copyMarketingTable
+ *       allocates the slider luminance table.
  *   - SpringBoard:
  *       +[XBApplicationSnapshotManifestImpl _outputFormatForSnapshot:] -> JPEG / PNG
  *       Avoids multi-second CPU ASTC (.atx) texture compression when apps go to
  *       background, preventing 10 s scene-update watchdog terminations.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <objc/message.h>
@@ -286,7 +292,82 @@ static IMP orig_root_posix_mode;
 static IMP orig_data_posix_mode;
 static IMP orig_schema_posix_mode;
 static IMP orig_subdir_posix_owner;
+static IMP orig_create_dir;
 static SEL sel_container_class;
+
+#ifndef DT_DIR
+#define DT_DIR 4
+#endif
+
+static void
+chmod_sys_dirs_recursive(const char *path, int depth)
+{
+	DIR *dir;
+	struct dirent *de;
+	char sub[1024];
+	int n;
+
+	if (path == NULL || path[0] != '/' || depth > 4) {
+		return;
+	}
+	(void)chmod(path, 0777);
+	if (depth == 4) {
+		return;
+	}
+	dir = opendir(path);
+	if (dir == NULL) {
+		return;
+	}
+	while ((de = readdir(dir)) != NULL) {
+		if (de->d_type != DT_DIR) {
+			continue;
+		}
+		if (strcmp(de->d_name, ".") == 0 ||
+		    strcmp(de->d_name, "..") == 0 ||
+		    strcmp(de->d_name, "DiagnosticReports") == 0 ||
+		    strcmp(de->d_name, "MemoryLimitViolations") == 0) {
+			continue;
+		}
+		n = snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
+		if (n > 0 && n < (int)sizeof(sub)) {
+			chmod_sys_dirs_recursive(sub, depth + 1);
+		}
+	}
+	(void)closedir(dir);
+}
+
+static void
+repair_existing_sys_containers(void)
+{
+	static const char *const roots[] = {
+		"/private/var/containers/Data/System",
+		"/private/var/containers/Shared/SystemGroup",
+	};
+	DIR *dir;
+	struct dirent *de;
+	char sub[1024];
+	size_t i;
+	int n;
+
+	for (i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+		dir = opendir(roots[i]);
+		if (dir == NULL) {
+			continue;
+		}
+		while ((de = readdir(dir)) != NULL) {
+			if (de->d_type != DT_DIR ||
+			    strcmp(de->d_name, ".") == 0 ||
+			    strcmp(de->d_name, "..") == 0) {
+				continue;
+			}
+			n = snprintf(sub, sizeof(sub), "%s/%s", roots[i], de->d_name);
+			if (n > 0 && n < (int)sizeof(sub)) {
+				chmod_sys_dirs_recursive(sub, 0);
+			}
+		}
+		(void)closedir(dir);
+	}
+}
 
 static BOOL
 cm26_register_protection(__unused id self, __unused SEL selector, __unused id *out_error)
@@ -318,7 +399,19 @@ cm26_set_top_level_sys_acl(__unused id self, __unused SEL selector,
 	const char *p = nsstr_cstr(url);
 
 	if (p != NULL && p[0] == '/') {
-		(void)chmod(p, 0777);
+		chmod_sys_dirs_recursive(p, 0);
+	}
+	return YES;
+}
+
+static BOOL
+cm26_std_sys_acl(__unused id self, __unused SEL selector,
+    id url, __unused id *out_error)
+{
+	const char *p = nsstr_cstr(url);
+
+	if (p != NULL && p[0] == '/') {
+		chmod_sys_dirs_recursive(p, 0);
 	}
 	return YES;
 }
@@ -332,9 +425,35 @@ cm26_url_acl_noop(__unused id self, __unused SEL selector,
 
 static BOOL
 cm26_standardize_acl_noop(__unused id self, __unused SEL selector,
-    __unused id url, __unused BOOL is_sys, __unused id *out_error)
+    id url, BOOL is_sys, __unused id *out_error)
 {
+	const char *p;
+
+	if (is_sys) {
+		p = nsstr_cstr(url);
+		if (p != NULL && p[0] == '/') {
+			chmod_sys_dirs_recursive(p, 0);
+		}
+	}
 	return YES;
+}
+
+static BOOL
+cm26_create_dir(id self, SEL selector, id url, BOOL with_inter, uint16_t mode,
+    id owner, int dp_class, void *fs_node, id *out_error)
+{
+	BOOL ok;
+	const char *p;
+
+	ok = ((BOOL (*)(id, SEL, id, BOOL, uint16_t, id, int, void *, id *))orig_create_dir)(
+	    self, selector, url, with_inter, mode, owner, dp_class, fs_node, out_error);
+	if (ok && (mode & 0777) == 0777) {
+		p = nsstr_cstr(url);
+		if (p != NULL && p[0] == '/') {
+			(void)chmod(p, 0777);
+		}
+	}
+	return ok;
 }
 
 static BOOL
@@ -491,7 +610,7 @@ cm_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 		m = class_getInstanceMethod(fm_cls,
 		    sel_registerName("standardizeACLsForSystemContainerAtURL:error:"));
 		if (m != NULL) {
-			(void)method_setImplementation(m, (IMP)cm26_url_acl_noop);
+			(void)method_setImplementation(m, (IMP)cm26_std_sys_acl);
 		}
 		m = class_getInstanceMethod(fm_cls,
 		    sel_registerName("standardizeACLsAtURL:isSystemContainer:error:"));
@@ -501,7 +620,7 @@ cm_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 		m = class_getInstanceMethod(fm_cls,
 		    sel_registerName("standardizeAllSystemContainerACLsAtURL:error:"));
 		if (m != NULL) {
-			(void)method_setImplementation(m, (IMP)cm26_url_acl_noop);
+			(void)method_setImplementation(m, (IMP)cm26_std_sys_acl);
 		}
 		m = class_getInstanceMethod(fm_cls,
 		    sel_registerName("stripACLFromURL:error:"));
@@ -513,6 +632,14 @@ cm_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 		if (m != NULL) {
 			(void)method_setImplementation(m, (IMP)cm26_fix_acl_on_fd);
 		}
+		m = class_getInstanceMethod(fm_cls,
+		    sel_registerName("createDirectoryAtURL:withIntermediateDirectories:mode:owner:dataProtectionClass:fsNode:error:"));
+		if (m != NULL) {
+			orig_create_dir = method_setImplementation(m, (IMP)cm26_create_dir);
+		}
+	}
+	if (geteuid() == 0) {
+		repair_existing_sys_containers();
 	}
 	cp_cls = objc_getClass("MCMContainerPath");
 	if (cp_cls != NULL) {
@@ -559,7 +686,7 @@ cm_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 	    getprogname());
 }
 
-/* ---- SpringBoard: +[XBApplicationSnapshotManifestImpl _outputFormatForSnapshot:] ---- */
+/* ---- SpringBoard: snapshot format & iOS 26+ CloudConfiguration bypass ---- */
 
 #define SNAPSHOT_FORMAT_PNG  0L
 #define SNAPSHOT_FORMAT_JPEG 3L
@@ -577,7 +704,14 @@ snapshot_output_format(__unused id self, __unused SEL selector, id snapshot)
 	return SNAPSHOT_FORMAT_PNG;
 }
 
-static bool sb_hooked;
+static BOOL
+sb26_return_no(__unused id self, __unused SEL selector)
+{
+	return NO;
+}
+
+static bool sb_xb_hooked;
+static bool sb_mc_hooked;
 
 static void
 sb_image_added(__unused const struct mach_header *header, __unused intptr_t slide)
@@ -585,14 +719,77 @@ sb_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 	Class cls;
 	Method method;
 
-	if (sb_hooked || (cls = objc_getClass("XBApplicationSnapshotManifestImpl")) == NULL) {
+	if (!sb_xb_hooked &&
+	    (cls = objc_getClass("XBApplicationSnapshotManifestImpl")) != NULL) {
+		sb_xb_hooked = true;
+		method = class_getClassMethod(cls,
+		    sel_registerName("_outputFormatForSnapshot:"));
+		if (method != NULL) {
+			method_setImplementation(method, (IMP)snapshot_output_format);
+			say("sweet: SpringBoard: +[XBApplicationSnapshotManifestImpl _outputFormatForSnapshot:] -> JPEG/PNG\n");
+		}
+	}
+	if (!sb_mc_hooked && darwin_major() >= 25 &&
+	    (cls = objc_getClass("MCProfileConnection")) != NULL) {
+		sb_mc_hooked = true;
+		method = class_getInstanceMethod(cls,
+		    sel_registerName("shouldShowSetupAssistant"));
+		if (method != NULL) {
+			method_setImplementation(method, (IMP)sb26_return_no);
+		}
+		method = class_getInstanceMethod(cls,
+		    sel_registerName("shouldShowCloudConfigurationUI"));
+		if (method != NULL) {
+			method_setImplementation(method, (IMP)sb26_return_no);
+		}
+		say("sweet: SpringBoard: -[MCProfileConnection shouldShowSetupAssistant/CloudConfigurationUI] -> NO\n");
+	}
+}
+
+/* ---- backboardd (iOS 26+): -[CBBacklightNode getBacklightCalibration:] ---- */
+
+static IMP orig_get_backlight_calib;
+static bool bb_hooked;
+
+static BOOL
+bb26_get_backlight_calib(id self, SEL selector, float *out)
+{
+	if (orig_get_backlight_calib != NULL &&
+	    ((BOOL (*)(id, SEL, float *))orig_get_backlight_calib)(self, selector, out)) {
+		return YES;
+	}
+	if (out == NULL) {
+		return NO;
+	}
+	/* Matches AppleARMBacklight (625 nits max, 155 nits mid, 2 nits min, 100 mA max) */
+	out[0] = 100.0f;	/* I_max */
+	out[1] = 25.0f;		/* I_mid */
+	out[2] = 100.0f;	/* Ihw_max */
+	out[3] = 625.0f;	/* Lmax_product */
+	out[4] = 155.0f;	/* Lmid_product */
+	out[5] = 2.0f;		/* Lmin_product */
+	out[6] = 625.0f;	/* Lmax_panel */
+	out[7] = 155.0f;	/* Lmid_panel */
+	out[8] = 2.0f;		/* Lmin_panel */
+	out[9] = 625.0f;	/* milliAmps2NitsScaleFactor */
+	return YES;
+}
+
+static void
+bb_image_added(__unused const struct mach_header *header, __unused intptr_t slide)
+{
+	Class cls;
+	Method method;
+
+	if (bb_hooked || (cls = objc_getClass("CBBacklightNode")) == NULL) {
 		return;
 	}
-	sb_hooked = true;
-	method = class_getClassMethod(cls, sel_registerName("_outputFormatForSnapshot:"));
+	bb_hooked = true;
+	method = class_getInstanceMethod(cls, sel_registerName("getBacklightCalibration:"));
 	if (method != NULL) {
-		method_setImplementation(method, (IMP)snapshot_output_format);
-		say("sweet: SpringBoard: +[XBApplicationSnapshotManifestImpl _outputFormatForSnapshot:] -> JPEG/PNG\n");
+		orig_get_backlight_calib = method_setImplementation(method,
+		    (IMP)bb26_get_backlight_calib);
+		say("sweet: backboardd: -[CBBacklightNode getBacklightCalibration:] -> 625-nit fallback\n");
 	}
 }
 
@@ -609,6 +806,11 @@ sweet_sysfix_init(void)
 	    strcmp(name, "containermanagerd_system") == 0) {
 		_dyld_register_func_for_add_image(cm_image_added);
 		cm_image_added(NULL, 0);
+	} else if (strcmp(name, "backboardd") == 0) {
+		if (darwin_major() >= 25) {
+			_dyld_register_func_for_add_image(bb_image_added);
+			bb_image_added(NULL, 0);
+		}
 	} else if (strcmp(name, "SpringBoard") == 0) {
 		_dyld_register_func_for_add_image(sb_image_added);
 		sb_image_added(NULL, 0);

@@ -574,6 +574,13 @@ static void notified(void *context,uint64_t value) {
 @interface NBQueue : NBObject
 @property(nonatomic) NmbQueue *handle;
 @property(atomic,strong) dispatch_queue_t completionQueue;   // SPI: where command buffers' handlers run (nil: the runtime's thread)
+@property(atomic) int backgroundTrackingPID;
+@property(atomic) BOOL skipRender;
+@property(atomic) BOOL executionEnabled;
+@property(atomic,getter=isProfilingEnabled) BOOL profilingEnabled;
+@property(atomic,getter=isStatEnabled) BOOL statEnabled;
+@property(atomic) uint64_t statOptions;
+@property(atomic) uint64_t statLocations;
 @end
 @interface NBCommandBuffer : NBObject {
 @public
@@ -1060,6 +1067,7 @@ static void completed(void *context) {
 }
 
 @implementation NBQueue
+- (instancetype)init {if((self=[super init]))_executionEnabled=YES;return self;}
 - (void)dealloc {nmb_queue_release(_handle);}
 - (id<MTLCommandBuffer>)commandBuffer {
  NmbCommandBuffer *handle=nmb_command_buffer_new(_handle);
@@ -1069,14 +1077,43 @@ static void completed(void *context) {
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences {return [self commandBuffer];}
 - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submission happens on the caller's thread here
 // setCompletionQueue: is the property's setter.
-// GPU priorities are not applied (one hardware queue): reported as not applied.
+// GPU priorities are not applied (one hardware queue): getters return Metal defaults; setters report not applied.
+- (NSUInteger)getGPUPriority {return 1; /* MTLGPUPriorityDefault */}
+- (NSUInteger)getBackgroundGPUPriority {return 2; /* MTLGPUPriorityLow */}
 - (BOOL)setGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
+- (BOOL)setGPUPriority:(NSUInteger)priority offset:(uint16_t)offset {(void)priority;(void)offset;return NO;}
 - (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
+- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority offset:(uint16_t)offset {(void)priority;(void)offset;return NO;}
+- (BOOL)_setGPUPriority:(NSUInteger)priority backgroundPriority:(NSUInteger)bg {(void)priority;(void)bg;return NO;}
+- (BOOL)supportsBackgroundAppRole {return YES;}
+- (NSUInteger)qosLevel {return 0;}
+- (dispatch_queue_t)commitQueue {return nil;}
+- (BOOL)commitSynchronously {return NO;}
+- (BOOL)commitsWithQoS {return NO;}
+- (BOOL)disableCrossQueueHazardTracking {return NO;}
+- (NSUInteger)maxCommandBufferCount {return 64;}
+- (BOOL)isOpenGLQueue {return NO;}
+- (void)insertDebugCaptureBoundary {}
+- (void)finish {
+ NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
+ for(NBCommandBuffer *cb in pending)if(cb.queue==self)[(id<MTLCommandBuffer>)cb waitUntilCompleted];
+}
+- (void)dispatchAvailableCompletionNotifications {}
+- (uint64_t)getStatOptions {return self.statOptions;}
+- (uint64_t)getStatLocations {return self.statLocations;}
+- (NSArray *)availableCounters {return @[];}
+- (int)requestCounters:(id)counters {(void)counters;return -1;}
+- (int)requestCounters:(id)counters withIndex:(unsigned)index {(void)counters;(void)index;return -1;}
+- (void)addPerfSampleHandler:(id)block {(void)block;}
 - (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d {(void)d;return [self commandBuffer];}
 - (void)addResidencySet:(id)residencySet {(void)residencySet;}
 - (void)addResidencySets:(const id __unsafe_unretained [])residencySets count:(NSUInteger)count {(void)residencySets;(void)count;}
 - (void)removeResidencySet:(id)residencySet {(void)residencySet;}
 - (void)removeResidencySets:(const id __unsafe_unretained [])residencySets count:(NSUInteger)count {(void)residencySets;(void)count;}
+- (void)addInternalResidencySet:(id)residencySet {(void)residencySet;}
+- (void)addInternalResidencySets:(const id __unsafe_unretained [])residencySets count:(NSUInteger)count {(void)residencySets;(void)count;}
+- (void)removeInternalResidencySet:(id)residencySet {(void)residencySet;}
+- (void)removeInternalResidencySets:(const id __unsafe_unretained [])residencySets count:(NSUInteger)count {(void)residencySets;(void)count;}
 @end
 
 // ---- the device ----

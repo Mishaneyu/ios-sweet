@@ -338,19 +338,32 @@ def build(seed=None, qemu=False, highmem=False, d22ap=False):
 
     # CoreBrightness / BacklightServices match AppleARMBacklight on IODeviceTree:/backlight
     # (IONameMatch = 'backlight', max 625 nits matching SweetFramebuffer.cpp AppleARMBacklight).
+    # CoreBrightness Display.m requires Q16.16 fixed-point user-accessible-max-nits /
+    # digital-dimming-min-nits and a 101-entry Q16.16 backlight-marketing-table (0..100%).
+    marketing_table = u32(*(
+        int(round((2.0 + 623.0 * ((i / 100.0) ** 2.2)) * 65536))
+        for i in range(101)
+    ))
     backlight = node('backlight', [
         ph(),
         ('compatible', cstr('backlight')),
         ('device_type', cstr('backlight')),
-        ('LminProduct', u32(131072)),
-        ('LmidProduct', u32(10158080)),
-        ('LmaxProduct', u32(44173121)),
+        ('backlight-id', u32(0xffffffff)),
+        ('backlight-update-policy', u32(4)),
+        ('display-backlight-calibration', u32(0)),
+        ('use-AAB-architecture', u32(1)),
+        ('use-Nits2DACTable', u32(1)),
+        ('LminProduct', u32(2 * 65536)),
+        ('LmidProduct', u32(155 * 65536)),
+        ('LmaxProduct', u32(625 * 65536)),
+        ('digital-dimming-min-nits', u32(2 * 65536)),
+        ('user-accessible-max-nits', u32(625 * 65536)),
+        ('backlight-marketing-table', marketing_table),
         ('DBVMin', u32(139)),
         ('DBVMax', u32(2047)),
         ('panel-gamma', u32(2200)),
-        ('max-nit-value', u32(750)),
-        ('aab-constraint-lmax', u32(675)),
-        ('user-accessible-max-nits', u32(625)),
+        ('max-nit-value', u32(625)),
+        ('aab-constraint-lmax', u32(625)),
     ])
 
     product = d22ap_product(ph) if d22ap else d421ap_product(ph)

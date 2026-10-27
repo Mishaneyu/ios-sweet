@@ -86,6 +86,7 @@ SKIP_LABELS = {
     'com.apple.audioaccessoryd',
     'com.apple.nfcd',
     'com.apple.seld',
+    'com.apple.softposreaderd',
     'com.apple.wifip2pd',
     'com.apple.biomed',
     'com.apple.biomesyncd',
@@ -118,6 +119,7 @@ SKIP_PLISTS = {
     'com.apple.audioaccessoryd.plist',
     'com.apple.nfcd.plist',
     'com.apple.seld.plist',
+    'com.apple.softposreaderd.plist',
     'com.apple.wifip2pd.plist',
     'com.apple.biomed.plist',
     'com.apple.biomesyncd.plist',
@@ -220,15 +222,51 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+JETSAM_LIMIT_KEYS = (
+    'ActiveHardMemoryLimit',
+    'InactiveHardMemoryLimit',
+    'ActiveSoftMemoryLimit',
+    'InactiveSoftMemoryLimit',
+)
+
+
+def patch_jetsam_limits(obj, min_mb=64):
+    """Raise tight 16K-page D421 daemon/XPC memory limits (< min_mb) for 8 GB RAM + 4K pages."""
+    raised = 0
+    if isinstance(obj, dict):
+        for k, v in list(obj.items()):
+            if k in JETSAM_LIMIT_KEYS and isinstance(v, int) and not isinstance(v, bool) and 0 < v < min_mb:
+                obj[k] = min_mb
+                raised += 1
+            elif isinstance(v, (dict, list)):
+                raised += patch_jetsam_limits(v, min_mb)
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                raised += patch_jetsam_limits(item, min_mb)
+    return raised
+
+
+def jetsam(root, min_mb=64):
+    for path in sorted(glob.glob(os.path.join(root, 'System/Library/LaunchDaemons/com.apple.jetsamproperties.*.plist'))):
+        st = os.stat(path)
+        data = load(path)
+        n = patch_jetsam_limits(data, min_mb=min_mb)
+        if n > 0:
+            save(path, data, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+            print(f'jetsam {os.path.basename(path)}: raised {n} limits to >= {min_mb} MB')
+
+
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = sys.argv[1]
     build, version = detect_system_version(root)
-    # SetupAssistant.framework _BYBuddyIOSCurrentVersion is 11 through iOS 26.5.2 (23F84)
-    setup_ver = 11
+    major = int(version.split('.')[0]) if version and version.split('.')[0].isdigit() else 16
+    setup_ver = 15 if major >= 26 else 11
     print(f'target root: iOS {version} ({build}), SetupVersion={setup_ver}')
     launchd(root)
+    jetsam(root)
     containers(root)
     activation(root, build, version)
     audio(root)
@@ -240,6 +278,7 @@ def main():
         'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},
         'MCForceShowCloudConfigurationUI': False})
     merge_pref(root, 'com.apple.purplebuddy', {
+        'ForceNoBuddy': True,
         'SetupDone': True, 'SetupFinishedAllSteps': True, 'SetupVersion': setup_ver,
         'LastSystemVersion': build,
         'daemonizeNeedsToRun': False})
