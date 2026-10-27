@@ -120,8 +120,6 @@ static void waitForResource(id resource);
 - (BOOL)isPurgeable {return NO;} \
 - (BOOL)isComplete {return YES;} \
 - (MTLResourceOptions)unfilteredResourceOptions {return [self resourceOptions];} \
-- (int)responsibleProcess {return _responsibleProcess;} \
-- (void)setResponsibleProcess:(int)p {_responsibleProcess=p;} \
 - (NSUInteger)allocationID {return (NSUInteger)(uintptr_t)self;} \
 - (NSUInteger)resourceID {return (NSUInteger)(uintptr_t)self;} \
 - (NSUInteger)resourceSize {return [self allocatedSize];} \
