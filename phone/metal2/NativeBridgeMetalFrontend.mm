@@ -1937,7 +1937,7 @@ static char sweetMemoryOwnerKey;
  if(completionHandler)dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{completionHandler(state,reflection,error);});
 }
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d completionHandler:(void (^)(id<MTLComputePipelineState>,NSError *))completionHandler {
- NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithDescriptor:d error:&error];
+ NSError *error=nil;id<MTLComputePipelineState> state=[self newComputePipelineStateWithDescriptor:d error:&error];
  if(completionHandler)dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{completionHandler(state,error);});
 }
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options completionHandler:(void (^)(id<MTLComputePipelineState>,MTLComputePipelineReflection *,NSError *))completionHandler {
