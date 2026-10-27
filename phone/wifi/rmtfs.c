@@ -34,9 +34,11 @@ static const struct { const char *path, *file; } parts[] = {
 static int fds[NPARTS] = { -1, -1, -1, -1 };
 static uint64_t buf_pa;
 
-int rmtfs_init(void)
+int rmtfs_prepare(void)
 {
 	for (unsigned i = 0; i < NPARTS; i++) {
+		if (fds[i] >= 0)
+			continue;
 		char p[128];
 		snprintf(p, sizeof(p), RMTFS_DIR "/%s", parts[i].file);
 		fds[i] = open(p, O_RDWR);
@@ -45,6 +47,8 @@ int rmtfs_init(void)
 			return -1;
 		}
 	}
+	if (buf_pa)
+		return 0;
 	/*
 	 * One buffer per phone boot, kept across modem restarts: a fresh 2 MB hyp_assign after
 	 * every restart (the old ones never handed back) ends with an SMC that never returns.
@@ -76,6 +80,13 @@ int rmtfs_init(void)
 			fclose(f);
 		}
 	}
+	return 0;
+}
+
+int rmtfs_init(void)
+{
+	if (rmtfs_prepare())
+		return -1;
 	if (qrtr_new_server(RMTFS_SERVICE, 1, 0, RMTFS_PORT))
 		return -1;
 	printf("rmtfs: serving at %u:%x, buffer %llx\n", QRTR_NODE_APPS, RMTFS_PORT, (unsigned long long)buf_pa);

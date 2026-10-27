@@ -20,6 +20,7 @@
 #define GLINK_CMD_RX_DONE_W_REUSE 14
 #define GLINK_CMD_SIGNALS	15
 
+int glink_prepare(void);
 int glink_init(void);
 /* Queue one command (8-byte header + data, padded to 8) and ring the modem. */
 int glink_send(uint16_t cmd, uint16_t p1, uint32_t p2, const void *data, size_t len);

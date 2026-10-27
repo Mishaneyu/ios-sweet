@@ -62,9 +62,21 @@ u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
 
 
-def synthetic_d421ap_product():
-    """Minimal fallback /product for D421AP when research/ipsw-26/d421ap.adt is absent (e.g. CI)."""
-    return [
+def _clean_adt_subtree(src_node, ph):
+    name_bytes = dict((k, v) for k, f, v in src_node.props).get('name', b'\0')
+    name = name_bytes.rstrip(b'\0').decode('latin1')
+    props = [ph()] + [
+        (k, v) for k, f, v in src_node.props
+        if not f and k not in ('name', 'AAPL,phandle')
+    ]
+    children = [_clean_adt_subtree(ch, ph) for ch in src_node.children]
+    return node(name, props, children)
+
+
+def synthetic_d421ap_product(ph):
+    """Minimal fallback /product subtree for D421AP when research/ipsw-26/d421ap.adt is absent (e.g. CI)."""
+    props = [
+        ph(),
         ('product-name', cstr('iPhone 11 Pro')),
         ('product-description', cstr('iPhone 11 Pro')),
         ('unique-model', cstr('D421AP')),
@@ -86,28 +98,35 @@ def synthetic_d421ap_product():
         ('has-exclaves', u32(0)),
         ('exclaves-enabled', u32(0)),
     ]
+    children = [
+        node('camera', [ph(), ('flash', u32(1))]),
+        node('haptics', [ph(), ('closed-loop', u32(1))]),
+        node('audio', [ph()]),
+    ]
+    return [node('product', props, children)]
 
 
-def adt_product(path, d22ap=False):
-    """/product properties of the real D421AP/D22AP tree, without the syscfg
-    placeholders iBoot would fill in (flag bit set) and the node bookkeeping."""
+def adt_product(ph, path, d22ap=False):
+    """/product subtree of the real D421AP/D22AP tree (including camera, haptics,
+    audio, facetime, maps), without the syscfg placeholders iBoot would fill in
+    (flag bit set) and with fresh AAPL,phandles."""
     if not os.path.exists(path):
         print(f'warning: {path} missing, {"no /product node" if d22ap else "using synthetic D421AP /product"}',
               file=sys.stderr)
-        return None if d22ap else synthetic_d421ap_product()
+        return [] if d22ap else synthetic_d421ap_product(ph)
     root, _ = adt.parse(open(path, 'rb').read())
     for c in root.children:
         if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
-            return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+            return [_clean_adt_subtree(c, ph)]
     raise SystemExit(f'{path}: no /product node')
 
 
-def d22ap_product(path=D22AP_ADT):
-    return adt_product(path, d22ap=True)
+def d22ap_product(ph, path=D22AP_ADT):
+    return adt_product(ph, path, d22ap=True)
 
 
-def d421ap_product(path=D421AP_ADT):
-    return adt_product(path, d22ap=False)
+def d421ap_product(ph, path=D421AP_ADT):
+    return adt_product(ph, path, d22ap=False)
 
 
 PANIC_LOG_PA = 0x1fd000000
@@ -317,8 +336,24 @@ def build(seed=None, qemu=False, highmem=False, d22ap=False):
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
-    product_props = d22ap_product() if d22ap else d421ap_product()
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    # CoreBrightness / BacklightServices match AppleARMBacklight on IODeviceTree:/backlight
+    # (IONameMatch = 'backlight', max 625 nits matching SweetFramebuffer.cpp AppleARMBacklight).
+    backlight = node('backlight', [
+        ph(),
+        ('compatible', cstr('backlight')),
+        ('device_type', cstr('backlight')),
+        ('LminProduct', u32(131072)),
+        ('LmidProduct', u32(10158080)),
+        ('LmaxProduct', u32(44173121)),
+        ('DBVMin', u32(139)),
+        ('DBVMax', u32(2047)),
+        ('panel-gamma', u32(2200)),
+        ('max-nit-value', u32(750)),
+        ('aab-constraint-lmax', u32(675)),
+        ('user-accessible-max-nits', u32(625)),
+    ])
+
+    product = d22ap_product(ph) if d22ap else d421ap_product(ph)
 
     target_type, target_sub, model = ('D22', 'D22AP', 'iPhone10,3') if d22ap else ('D421', 'D421AP', 'iPhone12,3')
 
@@ -334,7 +369,7 @@ def build(seed=None, qemu=False, highmem=False, d22ap=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, backlight] + product + ([] if qemu else [ufs, pram]))
 
 
 if __name__ == '__main__':

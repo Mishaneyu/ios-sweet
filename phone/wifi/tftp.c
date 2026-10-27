@@ -34,9 +34,14 @@ static struct xfer {
 } xf[TFTP_XFERS];
 int tftp_verbose = 0;
 
-int tftp_init(void)
+void tftp_prepare(void)
 {
 	mkdir(RW_DIR, 0755);
+}
+
+int tftp_init(void)
+{
+	tftp_prepare();
 	if (qrtr_new_server(TFTP_SERVICE, 1, 0, TFTP_PORT))
 		return -1;
 	printf("tftp: serving at %u:%x\n", QRTR_NODE_APPS, TFTP_PORT);

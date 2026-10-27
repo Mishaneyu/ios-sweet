@@ -81,7 +81,11 @@ SKIP_LABELS = {
     'com.apple.webinspectord',
     'com.apple.PerfPowerServices',
     'com.apple.PerfPowerServicesExtended',
+    'com.apple.PerfPowerTelemetryClientRegistrationService',
     'com.apple.perfpowermetricd',
+    'com.apple.audioaccessoryd',
+    'com.apple.nfcd',
+    'com.apple.seld',
     'com.apple.wifip2pd',
     'com.apple.biomed',
     'com.apple.biomesyncd',
@@ -92,6 +96,9 @@ SKIP_LABELS = {
     'com.apple.nanoprefsyncd',
     'com.apple.nanoprefsyncd.2',
     'com.apple.nanobackupd',
+    'com.apple.cameracaptured',
+    'com.apple.familycircled',
+    'com.apple.factory.NFQRCoded',
 }
 
 SKIP_PLISTS = {
@@ -106,7 +113,11 @@ SKIP_PLISTS = {
     'com.apple.webinspectord.plist',
     'com.apple.PerfPowerServices.plist',
     'com.apple.PerfPowerServicesExtended.plist',
+    'com.apple.PerfPowerTelemetryClientRegistrationService.plist',
     'com.apple.perfpowermetricd.plist',
+    'com.apple.audioaccessoryd.plist',
+    'com.apple.nfcd.plist',
+    'com.apple.seld.plist',
     'com.apple.wifip2pd.plist',
     'com.apple.biomed.plist',
     'com.apple.biomesyncd.plist',
@@ -116,6 +127,9 @@ SKIP_PLISTS = {
     'com.apple.nanoregistrylaunchd.plist',
     'com.apple.nanoprefsyncd.plist',
     'com.apple.nanobackupd.plist',
+    'com.apple.cameracaptured.plist',
+    'com.apple.familycircled.plist',
+    'com.apple.factory.NFQRCoded.plist',
 }
 
 SKIP_PREFIXES = (
@@ -211,8 +225,8 @@ def main():
         sys.exit(__doc__)
     root = sys.argv[1]
     build, version = detect_system_version(root)
-    major = int(version.split('.')[0]) if version.split('.')[0].isdigit() else 16
-    setup_ver = 26 if major >= 26 else 11
+    # SetupAssistant.framework _BYBuddyIOSCurrentVersion is 11 through iOS 26.5.2 (23F84)
+    setup_ver = 11
     print(f'target root: iOS {version} ({build}), SetupVersion={setup_ver}')
     launchd(root)
     containers(root)

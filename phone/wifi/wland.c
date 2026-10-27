@@ -26,10 +26,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include "pmem.h"
 #include "smem.h"
+#include "glink.h"
 #include "link.h"
 #include "rmtfs.h"
 #include "pdmapper.h"
@@ -706,7 +708,14 @@ static int up(unsigned secs)
 {
 	if (smmu_wlan_identity())
 		printf("up: no WLAN SMMU stream: the radio will not start\n");
-	if (wlan_power() || smp2p_create() || boot_modem())
+	if (wlan_power() || smp2p_create())
+		return 1;
+	/* Pre-allocate GLINK rings, rmtfs 2 MB buffer + EFS fds, and TFTP dir BEFORE
+	 * PAS-booting MPSS so the modem never waits on HFS+/SMC after GLINK comes up. */
+	if (glink_prepare() || rmtfs_prepare())
+		return 1;
+	tftp_prepare();
+	if (boot_modem())
 		return 1;
 	return net(secs) ? 1 : 0;
 }
@@ -766,6 +775,10 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: wland smem | smp2p | vote RES LVL | levels RES | boot\n");
 		return 2;
 	}
+	/* Escape launchd Darwin-BG CPU/IO throttling so MPSS GLINK/rmtfs/TFTP never starve */
+	(void)setpriority(PRIO_DARWIN_PROCESS, 0, 0);
+	(void)setpriority(PRIO_PROCESS, 0, -10);
+	(void)setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_IMPORTANT);
 	setvbuf(stdout, NULL, _IONBF, 0);	/* a stalled bus access must not swallow the output */
 	pm_init();
 	if (smem_init())

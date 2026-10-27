@@ -19,20 +19,25 @@ static uint32_t tx_len, rx_len;
 #define RX_TAIL	(desc + 8)
 #define RX_HEAD	(desc + 12)
 
-int glink_init(void)
+int glink_prepare(void)
 {
-	uint32_t sz;
 	if (smem_alloc(SMEM_HOST_MODEM, DESC_ITEM, 32, &desc) ||
 	    smem_alloc(SMEM_HOST_MODEM, FIFO_TX_ITEM, 16384, &tx_fifo) ||
 	    smem_get(SMEM_HOST_MODEM, FIFO_TX_ITEM, &tx_fifo, &tx_len)) {
 		fprintf(stderr, "glink: smem items\n");
 		return -1;
 	}
+	return 0;
+}
+
+int glink_init(void)
+{
+	if ((!desc || !tx_len) && glink_prepare())
+		return -1;
 	if (smem_get(SMEM_HOST_MODEM, FIFO_RX_ITEM, &rx_fifo, &rx_len)) {
 		fprintf(stderr, "glink: the modem has no rx fifo (item 480)\n");
 		return -1;
 	}
-	(void)sz;
 	/* as Linux qcom_glink_smem_register: our ends of both pipes start over */
 	wr32(RX_TAIL, 0);
 	wr32(TX_HEAD, 0);
@@ -44,15 +49,15 @@ int glink_init(void)
 
 static uint32_t tx_write(uint32_t head, const uint8_t *data, size_t n)
 {
-	/* the FIFO is device memory here: whole words only (n is padded by the caller) */
-	for (size_t i = 0; i < n; i += 4) {
-		uint32_t w;
-		memcpy(&w, data + i, 4);
-		wr32(tx_fifo + head, w);
-		head += 4;
-		if (head >= tx_len)
-			head -= tx_len;
-	}
+	/* the FIFO is device memory here: whole words only (n and head are multiples of 8) */
+	size_t first = n <= tx_len - head ? n : tx_len - head;
+	if (first)
+		pm_wr(tx_fifo + head, data, first);
+	if (n > first)
+		pm_wr(tx_fifo, data + first, n - first);
+	head += (uint32_t)n;
+	if (head >= tx_len)
+		head -= tx_len;
 	return head;
 }
 
@@ -86,15 +91,29 @@ size_t glink_rx_avail(void)
 
 void glink_rx_peek(void *buf, size_t off, size_t len)
 {
+	if (!len)
+		return;
 	uint32_t t = rd32(RX_TAIL) + (uint32_t)off;
 	if (t >= rx_len)
 		t -= rx_len;
 	uint8_t *b = buf;
-	for (size_t i = 0; i < len; i++) {
-		uint32_t w = rd32(rx_fifo + (t & ~3u));
-		b[i] = (uint8_t)(w >> (8 * (t & 3)));
-		if (++t >= rx_len)
-			t = 0;
+	size_t done = 0;
+	while (done < len) {
+		if ((t & 3u) || (len - done) < 4) {
+			uint32_t w = rd32(rx_fifo + (t & ~3u));
+			b[done++] = (uint8_t)(w >> (8 * (t & 3u)));
+			if (++t >= rx_len)
+				t = 0;
+		} else {
+			size_t rem = len - done;
+			size_t contig = rx_len - t;
+			size_t chunk = (rem < contig ? rem : contig) & ~(size_t)3;
+			pm_rd(rx_fifo + t, b + done, chunk);
+			done += chunk;
+			t += (uint32_t)chunk;
+			if (t >= rx_len)
+				t -= rx_len;
+		}
 	}
 }
 

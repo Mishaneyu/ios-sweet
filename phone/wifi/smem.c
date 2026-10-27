@@ -167,8 +167,11 @@ int smem_alloc(unsigned host, unsigned item, uint32_t size, uint64_t *pa)
 	wr32(e + 4, asize);
 	wr32(e + 8, (asize - size) | (0u << 16));	/* padding_data, padding_hdr */
 	wr32(e + 12, 0);
-	for (uint32_t o = 0; o < asize; o += 4)
-		wr32(e + 16 + o, 0);
+	static const uint8_t z[4096];
+	for (uint32_t o = 0; o < asize; o += sizeof(z)) {
+		uint32_t n = asize - o < sizeof(z) ? asize - o : (uint32_t)sizeof(z);
+		pm_wr(e + 16 + o, z, n);
+	}
 	__asm__ volatile("dsb sy" ::: "memory");
 	wr32(p->pa + 12, free_unc + 16 + asize);
 	hwunlock();
