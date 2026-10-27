@@ -233,8 +233,9 @@ def main():
     ap.add_argument('--sweetmetal2', help='optional path to SweetMetal2.bundle to stage under /System/Library/Extensions')
     ap.add_argument('--userland-dir', help='optional extracted userland dir (Applications/, HAL/, bin/, lib/)')
     ap.add_argument('--dsc-stubs-dir', help='optional dir of de-PACd dyld_shared_cache_arm64e.* stub subcaches')
-    ap.add_argument('--mtl2-clients', default='* -chronod',
-                    help='/private/var/local/mtl2-clients content (default: "* -chronod")')
+    ap.add_argument('--mtl2-clients',
+                    default='*\n-chronod\n-cameracaptured\n-iconservicesagent\n-WidgetRenderer_Default',
+                    help='/private/var/local/mtl2-clients content')
     ap.add_argument('--selftest-bin', help='optional compiled arm64 self-test Mach-O for guarded test boots')
     ap.add_argument('--selftest-script', help='optional bring-up self-test shell script for guarded test boots')
     ap.add_argument('--extra', action='append', default=[],
