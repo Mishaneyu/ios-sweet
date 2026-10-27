@@ -1189,15 +1189,15 @@ static void handle_client(int cfd)
 	}
 }
 
-static void promote_staged_system_apps(void)
+static int promote_staged_system_apps(void)
 {
+	int moved = 0;
 	@autoreleasepool {
 		NSFileManager *fm = [NSFileManager defaultManager];
 		NSArray<NSString *> *staged = [fm contentsOfDirectoryAtPath:@STAGED_SYSTEM_APPS_DIR error:nil];
-		if (staged.count == 0) return;
+		if (staged.count == 0) return 0;
 
 		mkdir(STAGED_PLACEHOLDERS_DIR, 0755);
-		int moved = 0;
 		for (NSString *item in staged) {
 			if (![item.pathExtension.lowercaseString isEqualToString:@"app"]) continue;
 			NSString *src = [@STAGED_SYSTEM_APPS_DIR stringByAppendingPathComponent:item];
@@ -1220,23 +1220,24 @@ static void promote_staged_system_apps(void)
 			fprintf(stderr, "sweetstored: promoted %d staged system apps into /Applications\n", moved);
 		}
 	}
+	return moved;
 }
 
-static void ensure_first_boot_registration(void)
+static void ensure_first_boot_registration(int moved)
 {
 	@autoreleasepool {
 		NSFileManager *fm = [NSFileManager defaultManager];
 		NSArray<NSString *> *promoted = [fm contentsOfDirectoryAtPath:@STAGED_PLACEHOLDERS_DIR error:nil];
 		struct stat st;
-		long long sw_sz = 0, sw_mt = 0;
+		long long sw_sz = 0;
 		if (stat("/Applications/SweetStore.app/SweetStore", &st) == 0) {
 			sw_sz = (long long)st.st_size;
-			sw_mt = (long long)st.st_mtimespec.tv_sec;
 		}
-		NSString *want = [NSString stringWithFormat:@"%lld:%lld:%lu\n",
-		    sw_sz, sw_mt, (unsigned long)promoted.count];
+		/* Omit mtime: boot overlay extraction refreshes SweetStore mtime on every boot */
+		NSString *want = [NSString stringWithFormat:@"v2:%lld:%lu\n",
+		    sw_sz, (unsigned long)promoted.count];
 		NSString *have = [NSString stringWithContentsOfFile:@REG_STAMP_PATH encoding:NSUTF8StringEncoding error:nil];
-		if ([have isEqualToString:want]) return;
+		if (moved == 0 && [have isEqualToString:want]) return;
 
 		NSMutableArray<NSString *> *toReg = [NSMutableArray array];
 		if (sw_sz > 0) {
@@ -1250,14 +1251,14 @@ static void ensure_first_boot_registration(void)
 			}
 		}
 
-		/* Wait for lsd & SpringBoard to come up on boot, then register apps & rebuild LaunchServices */
+		/* Let SpringBoard reach Lock Screen first; only rebuild full LSDB when placeholders were newly displaced */
 		for (int attempt = 0; attempt < 5; attempt++) {
-			sleep(attempt == 0 ? 6 : 6);
+			sleep(attempt == 0 ? 15 : 6);
 			int rc_reg = toReg.count > 0 ? run_lsreg_mobile_args(toReg) : 0;
-			int rc_reb = run_lsreg_rebuild();
-			fprintf(stderr, "sweetstored: auto-register (%lu apps) attempt %d -> reg=%d rebuild=%d\n",
-			    (unsigned long)toReg.count, attempt + 1, rc_reg, rc_reb);
-			if (rc_reg == 0 || rc_reb == 0) {
+			int rc_reb = moved > 0 ? run_lsreg_rebuild() : 0;
+			fprintf(stderr, "sweetstored: auto-register (%lu apps, moved=%d) attempt %d -> reg=%d rebuild=%d\n",
+			    (unsigned long)toReg.count, moved, attempt + 1, rc_reg, rc_reb);
+			if (rc_reg == 0 && rc_reb == 0) {
 				[want writeToFile:@REG_STAMP_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
 				break;
 			}
@@ -1279,10 +1280,10 @@ int main(int argc, char **argv)
 		chown("/private/var/mobile/Downloads", 501, 501);
 		chmod("/private/var/mobile/Downloads", 0777);
 
-		promote_staged_system_apps();
+		int moved = promote_staged_system_apps();
 
 		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-			ensure_first_boot_registration();
+			ensure_first_boot_registration(moved);
 		});
 
 		int srv = socket(AF_INET, SOCK_STREAM, 0);

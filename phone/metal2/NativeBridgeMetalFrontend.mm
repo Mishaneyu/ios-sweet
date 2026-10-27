@@ -723,6 +723,7 @@ static void waitForResource(id resource) {
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+ if(sampler)[_commandBuffer.resourceOwners addObject:sampler];
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
@@ -730,8 +731,14 @@ static void waitForResource(id resource) {
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
  if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
+ [_commandBuffer.resourceOwners addObject:fence];
  NmbFence *handle=[(NBFence *)fence handle];
  [self check:update?nmb_encoder_update_fence(_handle,handle,stages):nmb_encoder_wait_fence(_handle,handle,stages) what:update?"updateFence":"waitForFence"];
+}
+- (void)retainUsedResource:(id)r {
+ if(!r)return;
+ [_commandBuffer.resourceOwners addObject:r];
+ if([r isKindOfClass:[NBTexture class]] && [(NBTexture *)r surface])[_commandBuffer.surfaces addObject:r];
 }
 - (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
 - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
@@ -746,6 +753,7 @@ static void waitForResource(id resource) {
 - (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
  if(![(id)state isKindOfClass:[NBComputePipeline class]]){[self.commandBuffer refuse:@"foreign compute pipeline"];return;}
+ [self.commandBuffer.resourceOwners addObject:state];
  [self check:nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle]) what:"setComputePipelineState"];
 }
 - (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:0];}
@@ -778,10 +786,14 @@ static void waitForResource(id resource) {
 }
 - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
 - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)r;(void)u;}
-- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u {(void)r;(void)c;(void)u;}
-- (void)useHeap:(id<MTLHeap>)h {(void)h;}
-- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c {(void)h;(void)c;}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)u;[self retainUsedResource:r];}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u {
+ (void)u;for(NSUInteger i=0;i<c && r;i++)[self retainUsedResource:r[i]];
+}
+- (void)useHeap:(id<MTLHeap>)h {if(h)[self.commandBuffer.resourceOwners addObject:h];}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c {
+ for(NSUInteger i=0;i<c && h;i++)if(h[i])[self.commandBuffer.resourceOwners addObject:h[i]];
+}
 - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
 - (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c {(void)r;(void)c;}
 - (void)setStageInRegion:(MTLRegion)r {(void)r;}
@@ -793,6 +805,7 @@ static void waitForResource(id resource) {
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+ [self.commandBuffer.resourceOwners addObject:state];
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
@@ -837,6 +850,7 @@ static void waitForResource(id resource) {
 }
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
+ if(state)[self.commandBuffer.resourceOwners addObject:state];
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
 }
 - (void)setViewport:(MTLViewport)v {
@@ -910,14 +924,22 @@ static void waitForResource(id resource) {
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o {
  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:1 baseVertex:0 baseInstance:0];
 }
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)r;(void)u;}
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)u;(void)s;}
-- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u {(void)r;(void)c;(void)u;}
-- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)c;(void)u;(void)s;}
-- (void)useHeap:(id<MTLHeap>)h {(void)h;}
-- (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)s {(void)h;(void)s;}
-- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c {(void)h;(void)c;}
-- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c stages:(MTLRenderStages)s {(void)h;(void)c;(void)s;}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)u;[self retainUsedResource:r];}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)u;(void)s;[self retainUsedResource:r];}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u {
+ (void)u;for(NSUInteger i=0;i<c && r;i++)[self retainUsedResource:r[i]];
+}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {
+ (void)u;(void)s;for(NSUInteger i=0;i<c && r;i++)[self retainUsedResource:r[i]];
+}
+- (void)useHeap:(id<MTLHeap>)h {if(h)[self.commandBuffer.resourceOwners addObject:h];}
+- (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)s {(void)s;if(h)[self.commandBuffer.resourceOwners addObject:h];}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c {
+ for(NSUInteger i=0;i<c && h;i++)if(h[i])[self.commandBuffer.resourceOwners addObject:h[i]];
+}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)c stages:(MTLRenderStages)s {
+ (void)s;for(NSUInteger i=0;i<c && h;i++)if(h[i])[self.commandBuffer.resourceOwners addObject:h[i]];
+}
 - (void)memoryBarrierWithScope:(MTLBarrierScope)s afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {(void)s;(void)after;(void)before;}
 - (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {(void)r;(void)c;(void)after;(void)before;}
 - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
@@ -1138,6 +1160,7 @@ static void scheduled(void *context);
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
  if(self.committed){[self refuse:@"event encoded after commit"];return;}
+ [_resourceOwners addObject:event];
  NmbEvent *handle=[(NBEvent *)event handle];
  if(!(signal?nmb_command_buffer_signal_event(_handle,handle,value):nmb_command_buffer_wait_event(_handle,handle,value)))
   [self refuse:[NSString stringWithFormat:@"%s: %@",signal?"encodeSignalEvent":"encodeWaitForEvent",lastError()]];
@@ -1379,6 +1402,12 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
 static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDescriptor *p,NSError **error) {
  if(![(id)d.vertexFunction isKindOfClass:[NBFunction class]] || (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]])) {
   if(error)*error=nbError(@"foreign function");return false;
+ }
+ auto hasLinked=[](MTLLinkedFunctions *linked)->bool {
+  return linked && (linked.functions.count || linked.binaryFunctions.count || linked.privateFunctions.count || linked.groups.count);
+ };
+ if(hasLinked(d.vertexLinkedFunctions) || hasLinked(d.fragmentLinkedFunctions)) {
+  if(error)*error=nbError(@"render linked functions are not implemented");return false;
  }
  p->vertex=[(NBFunction *)d.vertexFunction handle];p->fragment=d.fragmentFunction?[(NBFunction *)d.fragmentFunction handle]:nullptr;
  for(unsigned i=0;i<8;i++) {
