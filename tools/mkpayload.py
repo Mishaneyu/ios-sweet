@@ -145,7 +145,21 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
+GPU_FW = ('a630_gmu.bin', 'a630_sqe.fw', 'a630_zap.mdt', 'a630_zap.b02')
+
+
+def add_gpufw_to_adt(adt_blob, fw_dir):
+    """Return the ADT with /chosen/gpufw,<file> = the Adreno 630 firmware (bsd/dev/sweet_gpu.c)."""
+    root, _ = adt.parse(adt_blob)
+    chosen = next(c for c in root.children if c.name == 'chosen')
+    chosen.props = [p for p in chosen.props if not p[0].startswith('gpufw,')]
+    for name in GPU_FW:
+        with open(os.path.join(fw_dir, name), 'rb') as f:
+            chosen.props.append(('gpufw,' + name, 0, f.read()))
+    return adt.serialize(root)
+
+
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=(), gpufw_dir=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -159,6 +173,8 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
     adt_blob = open(adt_path, 'rb').read()
+    if gpufw_dir:
+        adt_blob = add_gpufw_to_adt(adt_blob, gpufw_dir)
     # The ADT decides where the kernel's RAM is (mkadt.py --highmem).
     PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
@@ -215,6 +231,8 @@ if __name__ == '__main__':
                     help='add a file under /chosen/memory-map NAME')
     ap.add_argument('--max-payload-size', type=lambda n: int(n, 0),
                     help='fail if payload bytes exceed the bootloader ramdisk-to-DTB gap')
+    ap.add_argument('--gpufw', help='Adreno 630 firmware directory (a630_gmu.bin, a630_sqe.fw, a630_zap.mdt, '
+                    'a630_zap.b02 from the phone\'s /vendor/firmware), put in the ADT as /chosen/gpufw,*')
     ap.add_argument('--check-polaris-cpus', action='store_true',
                     help='require Polaris/SDM845 eight-node ADT and one contiguous cpus=1..8 prefix')
     a = ap.parse_args()
@@ -231,7 +249,7 @@ if __name__ == '__main__':
         if '=' not in item:
             ap.error('--blob must be NAME=FILE')
         blobs.append(item.split('=', 1))
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, blobs)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, blobs, a.gpufw)
     if a.max_payload_size is not None and (a.max_payload_size <= 0 or
                                            len(blob) > a.max_payload_size):
         ap.error(f'payload {len(blob)} bytes exceeds --max-payload-size '
