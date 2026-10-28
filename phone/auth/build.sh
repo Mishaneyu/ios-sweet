@@ -18,7 +18,7 @@ codesign -f -s - --entitlements sweetauthd-ents.plist out/sweetauthd
 
 # 2. Native UIKit + WebKit "microG Settings" app for iCloud & Apple ID
 "$CC" -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
-	-framework UIKit -framework QuartzCore -framework WebKit -framework Foundation \
+	-framework UIKit -framework QuartzCore -framework CoreGraphics -framework WebKit -framework Foundation \
 	-o out/SweetAuth.app/SweetAuth SweetAuth.m
 strip -x out/SweetAuth.app/SweetAuth
 cp Info.plist out/SweetAuth.app/Info.plist

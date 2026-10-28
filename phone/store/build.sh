@@ -25,7 +25,7 @@ strip -x out/SweetStore.app/SweetStore
 
 # 2b. Standalone UIKit + WKWebView app stub packaged by sweetstored (/create-webapp)
 "$CC" -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
-	-framework UIKit -framework QuartzCore -framework WebKit -framework Foundation \
+	-framework UIKit -framework QuartzCore -framework CoreGraphics -framework WebKit -framework Foundation \
 	-o out/SweetStore.app/SweetWebAppStub SweetWebApp.m
 strip -x out/SweetStore.app/SweetWebAppStub
 codesign -f -s - out/SweetStore.app/SweetWebAppStub

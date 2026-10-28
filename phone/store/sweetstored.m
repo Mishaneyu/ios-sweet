@@ -9,7 +9,7 @@
  *      and embeds clean 4 KB SHA-256 CodeDirectory + merged XML entitlements with
  *      CodeDirectory.ident == CFBundleIdentifier.
  *   4. Provisions isolated /private/var/mobile/Containers/Data/Application/<bundleId> and
- *      Shared/AppGroup/* directories owned by mobile:mobile (501:501).
+ *      Shared/AppGroup/<group> directories owned by mobile:mobile (501:501).
  *   5. Packages 1-tap standalone native UIKit + WKWebView .app bundles (SweetWebAppStub)
  *      with real App Store icons converted to PNG via ImageIO + CoreGraphics.
  *   6. Manages per-app SweetMetal2 GPU / CPU mode (/var/local/mtl2-clients) and an optional
