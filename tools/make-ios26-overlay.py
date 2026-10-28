@@ -607,6 +607,14 @@ def main():
     renamed, removed = tweaks.clean_launchd_plist(plist)
 
     jobs = plist['LaunchDaemons']
+    # Ensure backboardd never selects a 10-bit b3a8 / compressed swapchain on Boot #1
+    # before SweetMetal2.bundle loads (+2.6 s after IOMFB open).
+    bb_key = '/System/Library/LaunchDaemons/com.apple.backboardd.plist'
+    if bb_key in jobs and isinstance(jobs[bb_key], dict):
+        bb_env = dict(jobs[bb_key].get('EnvironmentVariables') or {})
+        bb_env['CA_DISABLE_FRAMEBUFFER_COMPRESSION'] = '1'
+        jobs[bb_key]['EnvironmentVariables'] = bb_env
+
     # Dropbear v2024.86 is built without syslog (-E is invalid; stderr is default).
     db_key = '/System/Library/LaunchDaemons/org.iosonpixel.dropbear.plist'
     if db_key in jobs:
@@ -810,6 +818,14 @@ def main():
         'SilenceUnknownCallersEnabled': False,
         'SilenceUnknownFaceTimeCallersEnabled': False,
     }, fmt=plistlib.FMT_BINARY)
+    bb_prefs = {
+        'CAEnableDeepFramebuffer': False,
+        'CAEnableFramebufferCompression': False,
+        'CAEnableIOSurfaceCompression': False,
+    }
+    bb_prefs_bytes = plistlib.dumps(bb_prefs, fmt=plistlib.FMT_BINARY)
+    mobile_global_prefs.update(bb_prefs)
+    sys_global_prefs.update(bb_prefs)
     # Disable iOS 26 AI Call Screening ("Receptionist" / LiveVoicemail) before launchd builds
     # com.apple.featureflags.shm so callservicesd synchronously creates CSDProviderCall and launches
     # InCallService for all incoming calls instead of holding unknown callers on stripped ANE/SiriTTS daemons.
@@ -848,6 +864,7 @@ def main():
         for pref_name, pref_data in (
             ('com.apple.migration.plist', mig_bytes),
             ('com.apple.springboard.plist', sb_bytes),
+            ('com.apple.backboardd.plist', bb_prefs_bytes),
             ('com.apple.purplebuddy.plist', buddy_bytes),
             ('com.apple.purplebuddy.notbackedup.plist', buddy_nb_bytes),
             ('com.apple.managedconfiguration.notbackedup.plist', mc_nb_bytes),
@@ -855,6 +872,13 @@ def main():
         ):
             add_ustar_bytes(tf, f'private/var/mobile/Library/Preferences/{pref_name}',
                             pref_data, mode=0o600, uid=MOBILE_UID, gid=MOBILE_UID)
+        add_ustar_dir(tf, 'private/var/root', mode=0o750, uid=0, gid=0)
+        add_ustar_dir(tf, 'private/var/root/Library', mode=0o750, uid=0, gid=0)
+        add_ustar_dir(tf, 'private/var/root/Library/Preferences', mode=0o750, uid=0, gid=0)
+        add_ustar_bytes(tf, 'private/var/root/Library/Preferences/com.apple.backboardd.plist',
+                        bb_prefs_bytes, mode=0o600, uid=0, gid=0)
+        add_ustar_bytes(tf, 'private/var/preferences/com.apple.backboardd.plist',
+                        bb_prefs_bytes, mode=0o644, uid=0, gid=0)
 
         if tz_name:
             add_ustar_dir(tf, 'private/var/db/timezone', mode=0o755, uid=0, gid=0)
@@ -897,16 +921,17 @@ def main():
                 'AutomaticTimeZoneEnabled': False,
                 'TimeZone': tz_name,
             })
-            add_ustar_bytes(tf, 'private/var/mobile/Library/Preferences/.GlobalPreferences.plist',
-                            plistlib.dumps(mobile_global_prefs, fmt=plistlib.FMT_BINARY),
-                            mode=0o644, uid=MOBILE_UID, gid=MOBILE_UID)
             sys_global_prefs.update({
                 'AutomaticTimeZoneEnabled': False,
                 'TimeZone': tz_name,
             })
-            add_ustar_bytes(tf, 'private/var/preferences/.GlobalPreferences.plist',
-                            plistlib.dumps(sys_global_prefs, fmt=plistlib.FMT_BINARY),
-                            mode=0o644, uid=0, gid=0)
+
+        add_ustar_bytes(tf, 'private/var/mobile/Library/Preferences/.GlobalPreferences.plist',
+                        plistlib.dumps(mobile_global_prefs, fmt=plistlib.FMT_BINARY),
+                        mode=0o644, uid=MOBILE_UID, gid=MOBILE_UID)
+        add_ustar_bytes(tf, 'private/var/preferences/.GlobalPreferences.plist',
+                        plistlib.dumps(sys_global_prefs, fmt=plistlib.FMT_BINARY),
+                        mode=0o644, uid=0, gid=0)
 
         if wp_assets is not None:
             _, _, _, _, full_png, thumb_png, full_cpb, thumb_cpb, wp_bundle_plist = wp_assets

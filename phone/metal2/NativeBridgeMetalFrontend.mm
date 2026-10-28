@@ -245,11 +245,16 @@ static uint64_t gTexturePoolBytes;
 static std::atomic<uint64_t> gTexturePoolHits,gTexturePoolMisses;
 static void texturePoolLimits(uint64_t *capBytes,size_t *capCount) {
  const char *prog=getprogname();
- if(prog && !strcmp(prog,"backboardd")){*capBytes=192ull<<20;*capCount=24;}
- else{*capBytes=48ull<<20;*capCount=12;}
+ if(prog && !strcmp(prog,"backboardd")){*capBytes=192ull<<20;*capCount=32;}
+ else if(prog && !strcmp(prog,"SpringBoard")){*capBytes=64ull<<20;*capCount=24;}
+ else{*capBytes=0;*capCount=0;}
 }
 static bool canPoolTextureDesc(const NmbTextureDescriptor &req) {
- return (req.usage&(MTLTextureUsageRenderTarget|MTLTextureUsageShaderWrite))!=0;
+ const char *prog=getprogname();
+ if(!prog || (strcmp(prog,"backboardd")!=0 && strcmp(prog,"SpringBoard")!=0))return false;
+ if(req.type!=MTLTextureType2D || req.depth!=1 || req.levels!=1 || req.samples!=1 || req.array_length!=1)return false;
+ if(req.width<64 || req.height<64)return false;
+ return (req.usage&MTLTextureUsageRenderTarget)!=0 && (req.usage&MTLTextureUsageShaderWrite)==0;
 }
 static NmbTexture *takePooledTexture(const NmbTextureDescriptor &req) {
  if(!canPoolTextureDesc(req))return nullptr;

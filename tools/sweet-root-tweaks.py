@@ -188,6 +188,11 @@ def clean_launchd_plist(plist):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
+    bb_job = jobs.get('/System/Library/LaunchDaemons/com.apple.backboardd.plist')
+    if isinstance(bb_job, dict):
+        bb_env = dict(bb_job.get('EnvironmentVariables') or {})
+        bb_env['CA_DISABLE_FRAMEBUFFER_COMPRESSION'] = '1'
+        bb_job['EnvironmentVariables'] = bb_env
     removed = [
         k for k, j in jobs.items()
         if j.get('Label') in SKIP_LABELS
@@ -332,6 +337,10 @@ def main():
                            'SilentICDPUpgrade')})
     merge_pref(root, 'com.apple.managedconfiguration.notbackedup', {
         'LockdownActivationIndicatesCloudConfigurationAvailable': False})
+    merge_pref(root, 'com.apple.backboardd', {
+        'CAEnableDeepFramebuffer': False,
+        'CAEnableFramebufferCompression': False,
+        'CAEnableIOSurfaceCompression': False})
 
 
 if __name__ == '__main__':

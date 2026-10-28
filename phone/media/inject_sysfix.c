@@ -1388,6 +1388,19 @@ sweet_sysfix_init(void)
 		_dyld_register_func_for_add_image(cm_image_added);
 		cm_image_added(NULL, 0);
 	} else if (strcmp(name, "backboardd") == 0) {
+		/*
+		 * Disable 10-bit deep framebuffer (b3a8) and Apple framebuffer
+		 * compression BEFORE backboardd's main() opens IOMFB / QuartzCore
+		 * (2.6 s before SweetMetal2.bundle loads on Boot #1), ensuring a
+		 * plain 8-bit BGRA swapchain and full 60 Hz gpu_direct compositing.
+		 */
+		(void)setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+		CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"),
+		    kCFBooleanFalse, kCFPreferencesCurrentApplication);
+		CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"),
+		    kCFBooleanFalse, kCFPreferencesCurrentApplication);
+		CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"),
+		    kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		if (darwin_major() >= 25) {
 			_dyld_register_func_for_add_image(bb_image_added);
 			bb_image_added(NULL, 0);

@@ -175,15 +175,23 @@ static NSString *query_activation_state(void)
 	return @"Unknown";
 }
 
-static BOOL run_keychain_roundtrip_512b(int *out_status)
+static BOOL run_keychain_roundtrip_512b(int *out_status, NSString **out_step, NSInteger *out_got_len)
 {
 	NSMutableData *payload = [NSMutableData dataWithLength:512];
 	uint8_t *p = (uint8_t *)payload.mutableBytes;
 	for (size_t i = 0; i < 512; i++) {
 		p[i] = (uint8_t)((i * 131 + 0x5A) & 0xFF);
 	}
+	NSDictionary *legacyCleanup = @{
+		(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+		(__bridge id)kSecAttrService: @"org.iosonpixel.sweetauth.selftest",
+		(__bridge id)kSecAttrAccount: @"roundtrip512",
+	};
+	(void)SecItemDelete((__bridge CFDictionaryRef)legacyCleanup);
+
 	NSDictionary *baseQuery = @{
 		(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+		(__bridge id)kSecAttrAccessGroup: @"org.iosonpixel.sweetauthd",
 		(__bridge id)kSecAttrService: @"org.iosonpixel.sweetauth.selftest",
 		(__bridge id)kSecAttrAccount: @"roundtrip512",
 	};
@@ -191,16 +199,23 @@ static BOOL run_keychain_roundtrip_512b(int *out_status)
 
 	NSMutableDictionary *addAttrs = [baseQuery mutableCopy];
 	addAttrs[(__bridge id)kSecValueData] = payload;
-	addAttrs[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAlwaysThisDeviceOnly;
+	addAttrs[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
 
 	OSStatus st = SecItemAdd((__bridge CFDictionaryRef)addAttrs, NULL);
 	if (st != errSecSuccess) {
+		usleep(150000);
+		(void)SecItemDelete((__bridge CFDictionaryRef)baseQuery);
+		st = SecItemAdd((__bridge CFDictionaryRef)addAttrs, NULL);
+	}
+	if (st != errSecSuccess) {
 		if (out_status) *out_status = (int)st;
+		if (out_step) *out_step = @"add";
+		if (out_got_len) *out_got_len = -1;
 		return NO;
 	}
 
 	NSMutableDictionary *copyQuery = [baseQuery mutableCopy];
-	copyQuery[(__bridge id)kSecReturnData] = @YES;
+	copyQuery[(__bridge id)kSecReturnData] = (__bridge id)kCFBooleanTrue;
 	copyQuery[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
 
 	CFTypeRef result = NULL;
@@ -210,10 +225,24 @@ static BOOL run_keychain_roundtrip_512b(int *out_status)
 	if (out_status) *out_status = (int)st;
 	if (st != errSecSuccess || !result) {
 		if (result) CFRelease(result);
+		if (out_step) *out_step = (st != errSecSuccess) ? @"copy" : @"null_result";
+		if (out_got_len) *out_got_len = -1;
 		return NO;
 	}
-	NSData *got = (__bridge_transfer NSData *)result;
-	return [got isEqualToData:payload];
+	id obj = (__bridge_transfer id)result;
+	NSData *got = nil;
+	if ([obj isKindOfClass:[NSData class]]) {
+		got = (NSData *)obj;
+	} else if ([obj isKindOfClass:[NSDictionary class]]) {
+		id vd = ((NSDictionary *)obj)[(__bridge id)kSecValueData];
+		if ([vd isKindOfClass:[NSData class]]) {
+			got = (NSData *)vd;
+		}
+	}
+	if (out_got_len) *out_got_len = got ? (NSInteger)got.length : -2;
+	BOOL eq = (got != nil) && [got isEqualToData:payload];
+	if (out_step) *out_step = eq ? @"ok" : (got ? @"mismatch" : NSStringFromClass([obj class]));
+	return eq;
 }
 
 static NSInteger probe_https_status(NSString *urlStr)
@@ -250,7 +279,9 @@ static NSDictionary *run_selfcheck(void)
 	BOOL actOK = ([actState rangeOfString:@"Activated" options:NSCaseInsensitiveSearch].location != NSNotFound);
 
 	int kcStatus = -1;
-	BOOL kcOK = run_keychain_roundtrip_512b(&kcStatus);
+	NSString *kcStep = @"unrun";
+	NSInteger kcGotLen = -1;
+	BOOL kcOK = run_keychain_roundtrip_512b(&kcStatus, &kcStep, &kcGotLen);
 
 	NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
 	BOOL clockOK = (now >= 1700000000.0);
@@ -309,6 +340,8 @@ static NSDictionary *run_selfcheck(void)
 		@"activation_ok": @(actOK),
 		@"keychain_512b_ok": @(kcOK),
 		@"keychain_status": @(kcStatus),
+		@"keychain_step": kcStep ?: @"?",
+		@"keychain_got_len": @(kcGotLen),
 		@"clock_epoch": @((long long)now),
 		@"clock_ok": @(clockOK),
 		@"gsa_http": @(gsaCode),

@@ -1,9 +1,30 @@
 # Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-28, 07:25 IST** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-28, 23:45 IST** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
+
+### WAVE 6 (`wave6m`, kernel `0149`): VOICE CALLS + STEREO ADSP AUDIO + SWEETAUTH/SWEETSTORE 2.0 + BOOT-1 `BGRA` `gpu_direct`, `wlan_pd` PD-MAPPER FIX & KEYCHAIN ACCESS-GROUP FIX STAGED OFFLINE (2026-10-28)
+- **Kernel**: Untouched GitHub Actions CI artifact `work/boot/kernel-26-0149` (`xnu-12377.121.6`, kernel `0149`, `21,420,160` B).
+- **Boot-Args (`shim/out/shim-rmx1931-wave6-prod.img` / `shim-rmx1931-wave6-test.img`)**:
+  `debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsrw=1 rootrw=1 cs_integrity_skip=1 fips_mode=0x44 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=2 sweetfb_direct=1 sweetfb_hz=60 sweetiolog=- sweetgpu=1 sweetmtl=2 sweetgpufreq=6 sweetusb=2 sweetusbframes=0 flamecpufreq=3 rmxtouchdelay=2 sweetrtcoff=<epoch-rtc> ufslogsecs=15 flamereboot=0` (`flamereboot=180` + `ufslogsecs=5` on `test`).
+- **Hardware Observations Verified in `wave6l` (`kernel 0149`)**:
+  - **Stability, CPU/GPU DVFS & Thermals**: `crashes_total: 0`, `sandbox_denied_total: 0`, `gpu.recoveries: 0`, battery `32.2 °C`; Kryo 485 OSM DVFS active (`sleep=[576, 710, 825]`, `idle=[1382, 1708, 1804]`, `active=[1785, 2419, 2841] MHz`), Adreno 640 @ `675 MHz`.
+  - **Cellular, Incoming/Outgoing Voice & Stereo ADSP Audio (`0147`, `cellulard`, `adspd`, `HakiosAudio`, `libsweet_sysfix.dylib`)**: `qrtr_connected: true`, `imei_present: true`, `sim_present: true`, `reg_state: "registered"`, `rat: "lte"`, `voice_svc_ready: true`, `ims_voice_support: true`; `CallScreeningEnabled` / `ReceptionistEnabled` disabled in `TelephonyUtilities.plist` feature flags and `ringerState -> 1` unmuted in `backboardd` + `SpringBoard`; LPASS ADSP `streaming` with `underruns: 0` across stereo `MAX98937` amplifiers + `Q6Voice` (`CVD v2.3`) 2-way call audio.
+  - **Three `wave6l` Regressions Caught by Diagnostics**:
+    1. **Boot #1 `b3a8` (`0x62336138`) swapchain fallback**: On Boot #1 of a freshly flashed rootfs, `backboardd` opened `IOMFB` (`AppleCLCD` `D421AP`) `2.6 s` before `SweetMetal2.bundle` loaded and wrote `CAEnableDeepFramebuffer=false`, causing `QuartzCore` to allocate a 10-bit `b3a8` swapchain (`cpu_fallback`, `8` startup submits).
+    2. **MPSS `msm/modem/wlan_pd` failed to spawn when LTE NV + `avs/audio` were active**: Disassembling MPSS `eloader-wlan_process` (`modem.b13@0xc0d51368`) proved it aborts before TFTP-loading `wlanmdsp.mbn` if `pd-mapper` QMI `0x40` `GET_DOMAIN_LIST("kernel/elf_loader")` fails IDL decode. Traced to `uint8_t list[512];` in `phone/wifi/pdmapper.c:63` being uninitialized on the stack (`list[0]++` incremented dirty stack bytes instead of `0`).
+    3. **`sweetauthd` `/v1/selfcheck` `keychain_512b_ok: false` (`keychain_status: 0`)**: `phone/auth/sweetauthd-ents.plist` and `SweetAuth-ents.plist` placed wildcard `<string>*</string>` at index `0` of `keychain-access-groups` (which `securityd` uses as the default `agrp` when `kSecAttrAccessGroup` is omitted) and used deprecated `kSecAttrAccessibleAlwaysThisDeviceOnly`.
+- **Fixes Applied & Staged Offline in `wave6m` (Pending Hardware Boot After User Finishes Android 17)**:
+  1. **`phone/wifi/pdmapper.c`**: Zero-initialized `uint8_t list[512] = { 0 };`, added bounds guard, and emitted optional TLV `0x12` only when `list[0] > 0`.
+  2. **`phone/media/inject_sysfix.c`, `tools/make-ios26-overlay.py`, `tools/sweet-root-tweaks.py`**: Exported `CA_DISABLE_FRAMEBUFFER_COMPRESSION=1` + `CAEnableDeepFramebuffer=false` / `CAEnableFramebufferCompression=false` / `CAEnableIOSurfaceCompression=false` in `libsweet_sysfix.dylib` constructor (before `backboardd` `main()`), in `com.apple.backboardd`'s `launchd.plist` `EnvironmentVariables`, and in pre-staged `mobile`/`root`/`.GlobalPreferences` plists so Boot #1 immediately selects 8-bit `BGRA` `gpu_direct` 60 Hz compositing.
+  3. **`phone/metal2/NativeBridgeMetalFrontend.mm`**: Scoped `canPoolTextureDesc` / `texturePoolLimits` strictly to transient 2D render-target textures (`>= 64x64`, `levels=1`, `samples=1`, `RenderTarget && !ShaderWrite`) in `backboardd` (`192 MiB / 32`) and `SpringBoard` (`64 MiB / 24`), preserving zero-init guarantees on glyph/icon atlases and compute `ShaderWrite` textures while keeping Liquid Glass backdrop blur pyramids zero-alloc.
+  4. **`phone/auth/sweetauthd-ents.plist`, `phone/auth/SweetAuth-ents.plist`, `phone/auth/sweetauthd.m`**: Moved `org.iosonpixel.sweetauthd` / `org.iosonpixel.sweetauth` to index `0` of `keychain-access-groups` (`*` last) and updated `run_keychain_roundtrip_512b` to use explicit `kSecAttrAccessGroup` + `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.
+- **Still Open (Verify on Hardware When Switching Back from Android 17)**:
+  - Check `/dev/block/sda16` (`userdata`) HFSX magic (`HX` at `+1024`) in TWRP before booting iOS (re-stream `/home/paink/ios26-root-rmx1931.img` first if Android 17 reformatted `userdata`).
+  - Boot `shim/out/shim-rmx1931-wave6-test.img` (`fastboot boot`) and verify simultaneous `en0` Wi-Fi + LTE voice/ringer + `present_mode: "gpu_direct"` (`BGRA` `0x42475241` on Boot #1, 60 Hz smooth scroll) + `sweetauthd` `keychain_512b_ok: true`.
+
 
 ### WAVE 5 COMPLETE: 20:9 FULL-SCREEN, LIQUID GLASS ICONS, SMUOS METAL2 TURBO, COOL DYNAMIC DVFS (`34.4 °C`), ACTIVE WI-FI SCANNING & LIVE CELLULAR SIM ON RMX1931 (kernel `0146`, 2026-10-28)
 - **Kernel**: Untouched GitHub Actions CI artifact from `xnu.yml` run `40612021256` (`8b0d624`, kernel `0146`), saved at `work/boot/kernel-26-0146` (`21,419,608` B, SHA-256 `955e25a0fd57674f14f0f3b1138d38b3f02c8026231d4ab0f0ee94f85093f938`).

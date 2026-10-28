@@ -60,7 +60,7 @@ void pdmapper_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			memcpy(name, p, l < 79 ? l : 79);
 		qmi_get_u32(&m, 0x10, &offset);
 		/* domain_list[]: u8 count, then { u8 len + name, u32 instance, u8 valid, u32 data } */
-		uint8_t list[512];
+		uint8_t list[512] = { 0 };
 		size_t o = 1;
 		uint16_t total = 0;
 		for (unsigned i = 0; i < sizeof(db) / sizeof(db[0]); i++) {
@@ -69,6 +69,8 @@ void pdmapper_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			if (total++ < offset)
 				continue;
 			uint8_t nl = (uint8_t)strlen(db[i].domain);
+			if (o + 1 + nl + 9 > sizeof(list))
+				break;
 			list[o++] = nl;
 			memcpy(list + o, db[i].domain, nl);
 			o += nl;
@@ -86,7 +88,8 @@ void pdmapper_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		qmi_tlv(&q, 0x10, &total, 2);
 		uint16_t rev = 1;
 		qmi_tlv(&q, 0x11, &rev, 2);
-		qmi_tlv(&q, 0x12, list, (uint16_t)o);
+		if (list[0] > 0)
+			qmi_tlv(&q, 0x12, list, (uint16_t)o);
 	}
 	qrtr_send(QRTR_TYPE_DATA, PDMAPPER_PORT, h->src_node, h->src_port, q.b, (uint32_t)qmi_finish(&q));
 }

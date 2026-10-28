@@ -22,8 +22,8 @@
 	<true/>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>*</string>
 		<string>org.iosonpixel.sweetauth</string>
+		<string>*</string>
 	</array>
 </dict>
 </plist>
