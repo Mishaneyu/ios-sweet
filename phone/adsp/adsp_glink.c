@@ -91,8 +91,10 @@ static void pdmapper_load_jsn_db(void);
 int
 adsp_glink_prepare(void)
 {
-	uint64_t dpa = 0, tpa = 0;
-	uint32_t tlen = 0;
+	static const uint8_t z4k[4096];
+	static const uint8_t z32[32];
+	uint64_t dpa = 0, tpa = 0, rpa = 0;
+	uint32_t tlen = 0, rlen = 0;
 
 	if (smem_alloc_item(SMEM_HOST_ADSP, SMEM_GLINK_DESC_ITEM, 32, &dpa) != 0 ||
 	    smem_alloc_item(SMEM_HOST_ADSP, SMEM_GLINK_TX_ITEM, 16384, &tpa) != 0 ||
@@ -100,6 +102,24 @@ adsp_glink_prepare(void)
 		adsp_log("glink: failed to allocate SMEM items 478/479 in ADSP partition");
 		return -1;
 	}
+	/*
+	 * Zero GLINK descriptor (TX_TAIL/TX_HEAD/RX_TAIL/RX_HEAD) and FIFOs
+	 * BEFORE PAS_AUTH_AND_RESET while ADSP is held in reset so warm reboots
+	 * from TWRP/Linux never leave non-zero ring indices in SMEM.
+	 */
+	(void)pm_wr(dpa, z32, sizeof(z32));
+	for (uint32_t o = 0; o < tlen; o += sizeof(z4k)) {
+		uint32_t n = tlen - o < sizeof(z4k) ? tlen - o : (uint32_t)sizeof(z4k);
+		(void)pm_wr(tpa + o, z4k, n);
+	}
+	if (smem_get_item(SMEM_HOST_ADSP, SMEM_GLINK_RX_ITEM, &rpa, &rlen) == 0 && rlen > 0) {
+		for (uint32_t o = 0; o < rlen; o += sizeof(z4k)) {
+			uint32_t n = rlen - o < sizeof(z4k) ? rlen - o : (uint32_t)sizeof(z4k);
+			(void)pm_wr(rpa + o, z4k, n);
+		}
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+
 	desc_pa = dpa;
 	tx_fifo_pa = tpa;
 	tx_fifo_len = tlen;
@@ -137,12 +157,13 @@ glink_ring_init(void)
 		chans[c].rxoff = 0;
 	}
 
-	wr32(DESC_RX_TAIL, 0);
-	wr32(DESC_TX_HEAD, 0);
-	adsp_log("glink: rings ready desc=0x%llx tx=0x%llx(%u) rx=0x%llx(%u)",
+	/* Note: DESC_TX_HEAD and DESC_RX_TAIL were zeroed in adsp_glink_prepare() before reset */
+	adsp_log("glink: rings ready desc=0x%llx tx=0x%llx(%u) rx=0x%llx(%u) idx tx=%u/%u rx=%u/%u",
 	    (unsigned long long)desc_pa,
 	    (unsigned long long)tx_fifo_pa, tx_fifo_len,
-	    (unsigned long long)rx_fifo_pa, rx_fifo_len);
+	    (unsigned long long)rx_fifo_pa, rx_fifo_len,
+	    rd32(DESC_TX_TAIL), rd32(DESC_TX_HEAD),
+	    rd32(DESC_RX_TAIL), rd32(DESC_RX_HEAD));
 	return 0;
 }
 
@@ -325,6 +346,7 @@ glink_rx_one(void)
 
 	switch (cmd) {
 	case GLINK_CMD_VERSION:
+		adsp_log("glink: < VERSION %u features=0x%x", p1, p2);
 		(void)glink_tx_cmd(GLINK_CMD_VERSION_ACK, 1, p2 & GLINK_FEAT_INTENT_REUSE, NULL, 0);
 		if (!version_acked) {
 			(void)glink_tx_cmd(GLINK_CMD_VERSION, 1, GLINK_FEAT_INTENT_REUSE, NULL, 0);
@@ -332,6 +354,7 @@ glink_rx_one(void)
 		break;
 
 	case GLINK_CMD_VERSION_ACK:
+		adsp_log("glink: < VERSION_ACK %u features=0x%x", p1, p2);
 		version_acked = true;
 		break;
 
@@ -636,6 +659,7 @@ adsp_glink_bringup(unsigned timeout_ms)
 	uint64_t start, end;
 	bool opened_ipcrtr_proactive = false;
 	bool opened_apr_proactive = false;
+	bool rekick_500 = false, rekick_2000 = false;
 
 	if (glink_ring_init() != 0) {
 		return -1;
@@ -645,12 +669,27 @@ adsp_glink_bringup(unsigned timeout_ms)
 	start = now_ms();
 	end = start + timeout_ms;
 	while (now_ms() < end && !g_stop_requested) {
+		uint64_t elapsed;
+
 		(void)adsp_glink_poll(10);
-		if (version_acked && !opened_ipcrtr_proactive && now_ms() - start > 150ULL) {
+		elapsed = now_ms() - start;
+		if (!version_acked && !rekick_500 && elapsed > 500ULL) {
+			rekick_500 = true;
+			if (rd32(DESC_TX_HEAD) == 0) {
+				(void)glink_tx_cmd(GLINK_CMD_VERSION, 1, GLINK_FEAT_INTENT_REUSE, NULL, 0);
+			} else {
+				apcs_kick(IPC_BIT_ADSP_GLINK);
+			}
+		}
+		if (!version_acked && !rekick_2000 && elapsed > 2000ULL) {
+			rekick_2000 = true;
+			apcs_kick(IPC_BIT_ADSP_GLINK);
+		}
+		if (version_acked && !opened_ipcrtr_proactive && elapsed > 150ULL) {
 			opened_ipcrtr_proactive = true;
 			chan_send_open(&chans[CH_IDX_IPCRTR]);
 		}
-		if (g_status.glink_ipcrtr_up && !opened_apr_proactive && now_ms() - start > 600ULL) {
+		if (g_status.glink_ipcrtr_up && !opened_apr_proactive && elapsed > 600ULL) {
 			opened_apr_proactive = true;
 			chan_send_open(&chans[CH_IDX_APR]);
 		}
@@ -661,10 +700,12 @@ adsp_glink_bringup(unsigned timeout_ms)
 		}
 	}
 
-	adsp_log("glink: bringup status after %u ms: ver=%d IPCRTR=%d apr_audio_svc=%d",
+	adsp_log("glink: bringup status after %u ms: ver=%d IPCRTR=%d apr_audio_svc=%d idx tx=%u/%u rx=%u/%u",
 	    timeout_ms, version_acked ? 1 : 0,
 	    g_status.glink_ipcrtr_up ? 1 : 0,
-	    g_status.glink_apr_up ? 1 : 0);
+	    g_status.glink_apr_up ? 1 : 0,
+	    rd32(DESC_TX_TAIL), rd32(DESC_TX_HEAD),
+	    rd32(DESC_RX_TAIL), rd32(DESC_RX_HEAD));
 	return g_status.glink_apr_up ? 0 : -1;
 }
 

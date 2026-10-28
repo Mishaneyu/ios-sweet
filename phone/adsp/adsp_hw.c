@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -592,7 +593,6 @@ static uint64_t smp2p_out_pa;
 static uint64_t smp2p_in_pa;
 static uint64_t slave_kernel_pa;
 static uint32_t last_adsp_smp2p = 0xffffffffu;
-static bool master_ready_sent;
 
 static void
 smp2p_wr_name(uint64_t pa, const char *name)
@@ -626,9 +626,40 @@ smp2p_adsp_create(void)
 		wr32(pa + 0, 0x504d5324u);
 		__asm__ volatile("dsb sy" ::: "memory");
 		wr32(pa + 4, 1u | (1u << 8));              /* v1 + SSR_ACK */
+	} else {
+		/*
+		 * Warm reboot: "$SMP" already exists in SMEM. Ensure "master-kernel"
+		 * bit 0 ("qcom,force-stop" per live.dtb) is cleared to 0 BEFORE
+		 * PAS_AUTH_AND_RESET so ADSP never halts in STOP_ACK on boot.
+		 */
+		uint32_t hdr12 = rd32(pa + 12);
+		uint32_t total = hdr12 & 0xffffu;
+		uint32_t valid = hdr12 >> 16;
+		bool found = false;
+
+		for (uint32_t i = 0; i < valid && i < 16; i++) {
+			uint64_t e = pa + 20ULL + 20ULL * i;
+			char nm[17];
+			for (int k = 0; k < 16; k++) {
+				nm[k] = (char)(rd32(e + (uint64_t)(k & ~3)) >> (8 * (k & 3)));
+			}
+			nm[16] = '\0';
+			if (strcmp(nm, "master-kernel") == 0) {
+				wr32(e + 16ULL, 0u);
+				found = true;
+				break;
+			}
+		}
+		if (!found && valid < total && valid < 16) {
+			uint64_t e = pa + 20ULL + 20ULL * valid;
+			smp2p_wr_name(e, "master-kernel");
+			wr32(e + 16ULL, 0u);
+			__asm__ volatile("dsb sy" ::: "memory");
+			wr32(pa + 12, total | ((valid + 1u) << 16));
+		}
+		__asm__ volatile("dsb sy" ::: "memory");
 	}
 	smp2p_out_pa = pa;
-	master_ready_sent = false;
 	apcs_kick(IPC_BIT_ADSP_SMP2P);
 	return 0;
 }
@@ -697,11 +728,6 @@ smp2p_adsp_service(void)
 		}
 		if ((v & 2u) && !(v & 1u)) {
 			g_status.smp2p_ready = true;
-			if (!master_ready_sent && smp2p_out_pa != 0) {
-				master_ready_sent = true;
-				wr32(smp2p_out_pa + 36, rd32(smp2p_out_pa + 36) | 1u);
-				apcs_kick(IPC_BIT_ADSP_SMP2P);
-			}
 		}
 		if ((v & 4u) && !(v & 1u)) {
 			g_status.smp2p_handover = true;
@@ -801,13 +827,41 @@ adsp_pas_boot(void)
 		return -1;
 	}
 
-	/* Warm-restart handling: if ADSP is already running, shut it down cleanly first */
-	if (smp2p_find_in_entry("slave-kernel", &ve) == 0) {
-		uint32_t prev = rd32(ve);
-		if (prev & 2u) {
-			adsp_log("pas: ADSP already running (slave-kernel=0x%x), performing clean restart", prev);
-			(void)adsp_pas_shutdown();
-			delay_ms(200);
+	/*
+	 * Warm-restart handling: SMEM DRAM survives warm resets from TWRP/ABL
+	 * even though the SoC reset already powered down LPASS. Only call
+	 * PAS_SHUTDOWN(1) if adspd already booted ADSP in THIS XNU boot
+	 * (matching kern.boottime in /var/local/adspd.boot), avoiding a
+	 * spurious PAS_SHUTDOWN while MPSS is running.
+	 */
+	{
+		struct timeval bt = { 0 };
+		size_t btsz = sizeof(bt);
+		char cur_stamp[32] = "", prev_stamp[32] = "";
+		FILE *sf;
+
+		(void)sysctlbyname("kern.boottime", &bt, &btsz, NULL, 0);
+		snprintf(cur_stamp, sizeof(cur_stamp), "%ld\n", (long)bt.tv_sec);
+		sf = fopen("/var/local/adspd.boot", "r");
+		if (sf != NULL) {
+			if (fgets(prev_stamp, sizeof(prev_stamp), sf) == NULL) {
+				prev_stamp[0] = '\0';
+			}
+			fclose(sf);
+		}
+		if (bt.tv_sec != 0 && strcmp(cur_stamp, prev_stamp) == 0 &&
+		    smp2p_find_in_entry("slave-kernel", &ve) == 0) {
+			uint32_t prev = rd32(ve);
+			if (prev & 2u) {
+				adsp_log("pas: ADSP already booted in this XNU session (slave-kernel=0x%x), restarting", prev);
+				(void)adsp_pas_shutdown();
+				delay_ms(200);
+			}
+		}
+		sf = fopen("/var/local/adspd.boot", "w");
+		if (sf != NULL) {
+			fputs(cur_stamp, sf);
+			fclose(sf);
 		}
 	}
 

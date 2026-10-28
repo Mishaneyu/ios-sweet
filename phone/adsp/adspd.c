@@ -486,7 +486,14 @@ run_daemon(bool is_auto, bool tone_only, unsigned tone_ms)
 	if (adsp_pas_boot() != 0) {
 		snprintf(g_status.state, sizeof(g_status.state), "error");
 		adsp_status_write();
-		return 1;
+		if (!is_auto) {
+			return 1;
+		}
+		(void)setpriority(PRIO_PROCESS, 0, 0);
+		while (!g_stop_requested) {
+			delay_ms(2000);
+		}
+		return 0;
 	}
 
 	snprintf(g_status.state, sizeof(g_status.state), "glink_bringup");
@@ -495,7 +502,14 @@ run_daemon(bool is_auto, bool tone_only, unsigned tone_ms)
 		snprintf(g_status.last_error, sizeof(g_status.last_error), "GLINK apr_audio_svc timeout");
 		snprintf(g_status.state, sizeof(g_status.state), "error");
 		adsp_status_write();
-		return 1;
+		if (!is_auto) {
+			return 1;
+		}
+		(void)setpriority(PRIO_PROCESS, 0, 0);
+		while (!g_stop_requested) {
+			(void)adsp_glink_poll(250);
+		}
+		return 0;
 	}
 
 	snprintf(g_status.state, sizeof(g_status.state), "q6_bringup");
@@ -503,8 +517,16 @@ run_daemon(bool is_auto, bool tone_only, unsigned tone_ms)
 	if (adsp_q6_bringup_playback() != 0) {
 		snprintf(g_status.state, sizeof(g_status.state), "error");
 		adsp_status_write();
-		return 1;
+		if (!is_auto) {
+			return 1;
+		}
+		(void)setpriority(PRIO_PROCESS, 0, 0);
+		while (!g_stop_requested) {
+			(void)adsp_glink_poll(250);
+		}
+		return 0;
 	}
+	(void)setpriority(PRIO_PROCESS, 0, -2);
 
 	if (tone_only) {
 		adsp_log("playing standalone %u ms stereo test tone...", tone_ms);
@@ -555,10 +577,27 @@ main(int argc, char **argv)
 	if (strcmp(cmd, "tone") == 0) {
 		unsigned ms = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 1000u;
 		bool streaming = false;
+		int dpid;
 		if (ms < 100u) ms = 100u;
 		if (ms > 15000u) ms = 15000u;
-		if (find_running_adspd_pid(&streaming) > 1 && streaming) {
-			return inject_tone_via_shm(ms) == 0 ? 0 : 1;
+		dpid = find_running_adspd_pid(&streaming);
+		if (dpid > 1) {
+			for (int w = 0; w < 40 && !streaming; w++) {
+				delay_ms(200);
+				dpid = find_running_adspd_pid(&streaming);
+				if (dpid <= 1) {
+					break;
+				}
+			}
+			if (streaming) {
+				return inject_tone_via_shm(ms) == 0 ? 0 : 1;
+			}
+			if (dpid > 1) {
+				fprintf(stderr,
+				    "adspd tone: daemon (pid %d) is running but stream is not ready\n",
+				    dpid);
+				return 1;
+			}
 		}
 		return run_daemon(false, true, ms);
 	}

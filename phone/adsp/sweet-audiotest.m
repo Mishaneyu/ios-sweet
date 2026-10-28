@@ -200,7 +200,7 @@ main(int argc, const char *argv[])
 			    (int)st);
 			AudioQueueDispose(aq, true);
 			AudioServicesPlaySystemSound(1007);
-			CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.75, false);
+			usleep(900000);
 		} else {
 			NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] +
 			    ((double)duration_ms / 1000.0) + 1.0;

@@ -1174,19 +1174,23 @@ static void poll_dms_imei_present(struct qmi_ctx *ctx, struct cellular_state *st
 	if (qmi_request(ctx, QMI_SVC_DMS, QMI_DMS_GET_DEVICE_SERIAL_NUMBERS,
 			NULL, 0, srsp, sizeof(srsp), &srsp_len, 1000) == 0 &&
 	    qmi_check_result(srsp, srsp_len, NULL) == 0) {
-		uint16_t ilen = 0;
-		const uint8_t *iv = qmi_tlv_find(srsp, srsp_len, 0x11, &ilen);
+		static const uint8_t serial_tlvs[] = { 0x11, 0x12, 0x10 };
 		bool has_nonzero = false;
-		if (iv && ilen >= 14) {
-			for (uint16_t i = 0; i < ilen; i++) {
-				if (iv[i] >= '1' && iv[i] <= '9') {
-					has_nonzero = true;
-					break;
+		for (size_t t = 0; t < sizeof(serial_tlvs) && !has_nonzero; t++) {
+			uint16_t ilen = 0;
+			const uint8_t *iv = qmi_tlv_find(srsp, srsp_len, serial_tlvs[t], &ilen);
+			if (iv && ilen >= 8) {
+				for (uint16_t i = 0; i < ilen; i++) {
+					if (iv[i] >= '1' && iv[i] <= '9') {
+						has_nonzero = true;
+						break;
+					}
 				}
 			}
 		}
 		st->imei_present = has_nonzero;
-		ctx->imei_checked = true;
+		/* Keep re-checking across DMS shutting_down/NV-restore until online & valid */
+		ctx->imei_checked = has_nonzero;
 	}
 	wipe_sensitive(srsp, sizeof(srsp));
 }
@@ -1244,7 +1248,7 @@ static void configure_nas_selection_and_reg(struct qmi_ctx *ctx, struct cellular
 	}
 
 	if (ctx->nas_pref_configured && !ctx->nas_auto_reg_attempted &&
-	    st->imei_present && st->reg_state_raw == 3) {
+	    (st->reg_state_raw == 3 || st->reg_state_raw == 0)) {
 		ctx->nas_auto_reg_attempted = true;
 		uint8_t req[16], rsp[128];
 		size_t req_len = 0, rsp_len = 0;
