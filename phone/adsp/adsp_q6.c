@@ -22,7 +22,7 @@
 
 /* ---- APR v2 framing & service IDs (techpack/audio/include/ipc/apr.h) ---- */
 #define APR_HDR_SIZE                            20u
-#define APR_HDR_FIELD_CMD                       0x0050u /* SEQ_CMD(0), len=5 dwords, v0 */
+#define APR_HDR_FIELD_CMD                       0x0250u /* SEQ_CMD(2), len=5 dwords, v0 */
 #define APR_DOMAIN_ADSP                         4u
 #define APR_DOMAIN_APPS                         5u
 
@@ -149,6 +149,7 @@ static uint64_t last_nonsilent_ms;
 static uint64_t last_voice_poll_ms;
 static bool     afe_tx_running;
 static uint16_t voice_tx_port = AFE_PORT_ID_QUATERNARY_MI2S_TX;
+static uint16_t voice_src_port;
 
 /* Built-in test tone state */
 static uint64_t tone_frames_left;
@@ -188,11 +189,17 @@ apr_call_ex(uint8_t svc, uint16_t src_port, uint16_t dst_port, uint32_t opcode,
     const void *payload, uint16_t payload_size, uint32_t expect_rsp_op,
     uint16_t *out_from_port, uint32_t out_words[4], unsigned timeout_ms)
 {
-	uint32_t tok = next_cmd_token++;
+	uint32_t seq = next_cmd_token++;
+	uint32_t tok;
 	uint64_t deadline;
 
-	if (next_cmd_token >= 0x70000000u) {
+	if (next_cmd_token >= 0x7000u) {
 		next_cmd_token = 1u;
+	}
+	if (svc == APR_SVC_ASM) {
+		tok = ((seq & 0x7fffu) << 16) | (src_port & 0xff00u);
+	} else {
+		tok = seq;
 	}
 	memset(&sync_wait, 0, sizeof(sync_wait));
 	sync_wait.waiting = true;
@@ -264,10 +271,20 @@ adsp_apr_rx(const uint8_t *data, uint32_t len)
 	body_bytes = len - hdr_bytes;
 
 	/* Async DMA write completion from Q6ASM */
-	if (h.opcode == ASM_DATA_EVENT_WRITE_DONE_V2 && (h.token & WRITE_TOKEN_FLAG)) {
+	if (h.opcode == ASM_DATA_EVENT_WRITE_DONE_V2) {
 		uint32_t idx = h.token & ~WRITE_TOKEN_FLAG;
 		if (idx < ADSP_DMA_PERIODS) {
 			period_ready[idx] = 1;
+		}
+		if (body_bytes >= 16) {
+			uint32_t wr_status = 0;
+			memcpy(&wr_status, body + 12, 4);
+			if (wr_status != 0) {
+				static uint32_t wr_err_logs;
+				if (wr_err_logs++ < 8u) {
+					adsp_log("q6asm: WRITE_DONE idx=%u status=0x%x", idx, wr_status);
+				}
+			}
 		}
 		return;
 	}
@@ -285,6 +302,23 @@ adsp_apr_rx(const uint8_t *data, uint32_t len)
 			sync_wait.basic_status = sync_wait.words[1];
 		}
 		sync_wait.done = true;
+		return;
+	}
+
+	{
+		static uint32_t unmatched_logs;
+		if (unmatched_logs < 32u) {
+			uint32_t w0 = 0, w1 = 0;
+			if (body_bytes >= 4) {
+				memcpy(&w0, body, 4);
+			}
+			if (body_bytes >= 8) {
+				memcpy(&w1, body + 4, 4);
+			}
+			unmatched_logs++;
+			adsp_log("apr rx: unmatched svc=%u op=0x%x tok=0x%x port=0x%x->0x%x len=%u w0=0x%x w1=0x%x",
+			    h.src_svc, h.opcode, h.token, h.src_port, h.dest_port, len, w0, w1);
+		}
 	}
 }
 
@@ -382,6 +416,11 @@ q6afe_set_quad_mi2s_clk(uint32_t freq_hz)
 static int
 q6afe_start_i2s_port(uint16_t port_id, uint16_t sd_line_mode, uint16_t mono_stereo)
 {
+	/*
+	 * Stock q6afe (afe_port_start -> q6common_pack_pp_params -> afe_port_apr_send_pkt)
+	 * sends sizeof(union afe_port_config) == 128 (0x80) bytes for param_size
+	 * (payload_size = 12 + 128 = 140 = 0x8c, total APR packet = 176 = 0xb0 B).
+	 */
 	struct {
 		uint16_t port_id;
 		uint16_t payload_size;
@@ -400,12 +439,13 @@ q6afe_start_i2s_port(uint16_t port_id, uint16_t sd_line_mode, uint16_t mono_ster
 		uint32_t sample_rate;
 		uint16_t data_format;
 		uint16_t reserved;
+		uint8_t  union_pad[108];
 	} __attribute__((packed)) cfg = {
 		.port_id               = port_id,
-		.payload_size          = 12u + 20u,
+		.payload_size          = 12u + 128u,
 		.module_id             = AFE_MODULE_AUDIO_DEV_INTERFACE,
 		.param_id              = AFE_PARAM_ID_I2S_CONFIG,
-		.param_size            = 20u,
+		.param_size            = 128u,
 		.i2s_cfg_minor_version = 1u,
 		.bit_width             = 16u,
 		.channel_mode          = sd_line_mode,
@@ -423,7 +463,12 @@ q6afe_start_i2s_port(uint16_t port_id, uint16_t sd_line_mode, uint16_t mono_ster
 	(void)apr_call(APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, &start, sizeof(start), 0, NULL);
 
 	if (apr_call(APR_SVC_AFE, 0, AFE_PORT_CMD_SET_PARAM_V2, &cfg, sizeof(cfg), 0, NULL) != 0) {
-		return -1;
+		cfg.payload_size = 12u + 20u;
+		cfg.param_size = 20u;
+		if (apr_call(APR_SVC_AFE, 0, AFE_PORT_CMD_SET_PARAM_V2,
+		    &cfg, (uint16_t)(sizeof(cfg) - sizeof(cfg.union_pad)), 0, NULL) != 0) {
+			return -1;
+		}
 	}
 	if (apr_call(APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, &start, sizeof(start), 0, NULL) != 0) {
 		return -1;
@@ -808,7 +853,7 @@ detect_voice_call_wanted(bool *out_speakerphone)
 }
 
 static void
-cvp_send_v2_v3_media_info(uint16_t cvp_h, uint16_t tx_port, uint16_t rx_port)
+cvp_send_v2_v3_media_info(uint16_t src_port, uint16_t cvp_h, uint16_t tx_port, uint16_t rx_port)
 {
 	/* CVP v2 channel info (RX & TX) + v3 endpoint media format + topology commit */
 	struct {
@@ -832,10 +877,10 @@ cvp_send_v2_v3_media_info(uint16_t cvp_h, uint16_t tx_port, uint16_t rx_port)
 		.bits_per_sample = 16u,
 		.ch_map          = { 1, 0, 0, 0, 0, 0, 0, 0 },
 	};
-	(void)apr_call_ex(APR_SVC_ADSP_CVP, 1, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V2,
+	(void)apr_call_ex(APR_SVC_ADSP_CVP, src_port, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V2,
 	    &ch_info, sizeof(ch_info), 0, NULL, NULL, 500);
 	ch_info.param_id = VSS_PARAM_VOCPROC_TX_CHANNEL_INFO;
-	(void)apr_call_ex(APR_SVC_ADSP_CVP, 1, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V2,
+	(void)apr_call_ex(APR_SVC_ADSP_CVP, src_port, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V2,
 	    &ch_info, sizeof(ch_info), 0, NULL, NULL, 500);
 
 	struct {
@@ -866,23 +911,32 @@ cvp_send_v2_v3_media_info(uint16_t cvp_h, uint16_t tx_port, uint16_t rx_port)
 		.sample_rate     = HAKIOS_AUDIO_RATE,
 		.ch_map          = { 1, 2, 0, 0, 0, 0, 0, 0 },
 	};
-	(void)apr_call_ex(APR_SVC_ADSP_CVP, 1, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V3,
+	(void)apr_call_ex(APR_SVC_ADSP_CVP, src_port, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V3,
 	    &ep_fmt, sizeof(ep_fmt), 0, NULL, NULL, 500);
 	ep_fmt.param_id = VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO;
 	ep_fmt.port_id = tx_port;
 	ep_fmt.num_channels = 1u;
 	ep_fmt.ch_map[1] = 0;
-	(void)apr_call_ex(APR_SVC_ADSP_CVP, 1, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V3,
+	(void)apr_call_ex(APR_SVC_ADSP_CVP, src_port, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V3,
 	    &ep_fmt, sizeof(ep_fmt), 0, NULL, NULL, 500);
 
-	(void)apr_call_ex(APR_SVC_ADSP_CVP, 1, cvp_h, VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT,
+	(void)apr_call_ex(APR_SVC_ADSP_CVP, src_port, cvp_h, VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT,
 	    NULL, 0, 0, NULL, NULL, 500);
 }
 
 static int
 q6_voice_start(bool speakerphone)
 {
-	char session_name[20] = "default modem voice";
+	static const struct {
+		uint16_t    src_port;
+		const char *name;
+	} voice_sessions[] = {
+		{ 0u, "default modem voice" },
+		{ 2u, "default volte voice" },
+		{ 3u, "10DC1000" },
+	};
+	char session_name[20];
+	uint16_t s_port = 0u;
 	struct {
 		uint32_t enable;
 	} __attribute__((packed)) dual = { .enable = 1u };
@@ -922,17 +976,30 @@ q6_voice_start(bool speakerphone)
 		voice_tx_port = AFE_PORT_ID_PSEUDOPORT_01;
 	}
 
-	if (apr_call_ex(APR_SVC_ADSP_MVM, 1, 0, VSS_IMVM_CMD_CREATE_PASSIVE_CTL_SESSION,
-	    session_name, sizeof(session_name), 0, &mvm_h, NULL, 1500) != 0 || mvm_h == 0) {
+	memset(session_name, 0, sizeof(session_name));
+	for (size_t i = 0; i < sizeof(voice_sessions) / sizeof(voice_sessions[0]); i++) {
+		memset(session_name, 0, sizeof(session_name));
+		strncpy(session_name, voice_sessions[i].name, sizeof(session_name) - 1);
+		s_port = voice_sessions[i].src_port;
+		mvm_h = 0;
+		if (apr_call_ex(APR_SVC_ADSP_MVM, s_port, 0, VSS_IMVM_CMD_CREATE_PASSIVE_CTL_SESSION,
+		    session_name, sizeof(session_name), 0, &mvm_h, NULL, 1500) == 0 && mvm_h != 0) {
+			voice_src_port = s_port;
+			adsp_log("q6voice: MVM session '%s' opened (src_port=%u mvm=0x%x)",
+			    session_name, s_port, mvm_h);
+			break;
+		}
+	}
+	if (mvm_h == 0) {
 		adsp_log("q6voice: MVM CREATE_PASSIVE_CONTROL_SESSION failed");
 		goto fail;
 	}
-	if (apr_call_ex(APR_SVC_ADSP_CVS, 1, 0, VSS_ISTREAM_CMD_CREATE_PASSIVE_CTL_SESS,
+	if (apr_call_ex(APR_SVC_ADSP_CVS, s_port, 0, VSS_ISTREAM_CMD_CREATE_PASSIVE_CTL_SESS,
 	    session_name, sizeof(session_name), 0, &cvs_h, NULL, 1500) != 0 || cvs_h == 0) {
 		adsp_log("q6voice: CVS CREATE_PASSIVE_CONTROL_SESSION failed");
 		goto fail;
 	}
-	(void)apr_call_ex(APR_SVC_ADSP_MVM, 1, mvm_h, VSS_IMVM_CMD_SET_POLICY_DUAL_CONTROL,
+	(void)apr_call_ex(APR_SVC_ADSP_MVM, s_port, mvm_h, VSS_IMVM_CMD_SET_POLICY_DUAL_CONTROL,
 	    &dual, sizeof(dual), 0, NULL, NULL, 1000);
 
 	memset(&cvp_create, 0, sizeof(cvp_create));
@@ -946,16 +1013,16 @@ q6_voice_start(bool speakerphone)
 	cvp_create.ec_ref_port_id = 0xffffu;
 	memcpy(cvp_create.name, session_name, sizeof(session_name));
 
-	if (apr_call_ex(APR_SVC_ADSP_CVP, 1, 0, VSS_IVOCPROC_CMD_CREATE_FULL_CTL_V3,
+	if (apr_call_ex(APR_SVC_ADSP_CVP, s_port, 0, VSS_IVOCPROC_CMD_CREATE_FULL_CTL_V3,
 	    &cvp_create, sizeof(cvp_create), 0, &cvp_h, NULL, 1500) == 0 && cvp_h != 0) {
-		cvp_send_v2_v3_media_info(cvp_h, voice_tx_port, AFE_PORT_ID_QUATERNARY_MI2S_RX);
-	} else if (apr_call_ex(APR_SVC_ADSP_CVP, 1, 0, VSS_IVOCPROC_CMD_CREATE_FULL_CTL_V2,
+		cvp_send_v2_v3_media_info(s_port, cvp_h, voice_tx_port, AFE_PORT_ID_QUATERNARY_MI2S_RX);
+	} else if (apr_call_ex(APR_SVC_ADSP_CVP, s_port, 0, VSS_IVOCPROC_CMD_CREATE_FULL_CTL_V2,
 	    &cvp_create, sizeof(cvp_create), 0, &cvp_h, NULL, 1500) != 0 || cvp_h == 0) {
 		adsp_log("q6voice: CVP CREATE_FULL_CONTROL_SESSION failed");
 		goto fail;
 	}
 
-	if (apr_call_ex(APR_SVC_ADSP_CVP, 1, cvp_h, VSS_IVOCPROC_CMD_ENABLE,
+	if (apr_call_ex(APR_SVC_ADSP_CVP, s_port, cvp_h, VSS_IVOCPROC_CMD_ENABLE,
 	    NULL, 0, 0, NULL, NULL, 1500) != 0) {
 		adsp_log("q6voice: CVP ENABLE failed");
 		goto fail;
@@ -963,20 +1030,20 @@ q6_voice_start(bool speakerphone)
 
 	memset(&attach, 0, sizeof(attach));
 	attach.handle = cvp_h;
-	if (apr_call_ex(APR_SVC_ADSP_MVM, 1, mvm_h, VSS_IMVM_CMD_ATTACH_VOCPROC,
+	if (apr_call_ex(APR_SVC_ADSP_MVM, s_port, mvm_h, VSS_IMVM_CMD_ATTACH_VOCPROC,
 	    &attach, 2u, 0, NULL, NULL, 1500) != 0) {
 		adsp_log("q6voice: MVM ATTACH_VOCPROC failed");
 		goto fail;
 	}
 
 	/* Unmute RX (1) and TX (0) on CVS */
-	(void)apr_call_ex(APR_SVC_ADSP_CVS, 1, cvs_h, VSS_IVOLUME_CMD_MUTE_V2,
+	(void)apr_call_ex(APR_SVC_ADSP_CVS, s_port, cvs_h, VSS_IVOLUME_CMD_MUTE_V2,
 	    &unmute, 6u, 0, NULL, NULL, 800);
 	unmute.direction = 0u;
-	(void)apr_call_ex(APR_SVC_ADSP_CVS, 1, cvs_h, VSS_IVOLUME_CMD_MUTE_V2,
+	(void)apr_call_ex(APR_SVC_ADSP_CVS, s_port, cvs_h, VSS_IVOLUME_CMD_MUTE_V2,
 	    &unmute, 6u, 0, NULL, NULL, 800);
 
-	if (apr_call_ex(APR_SVC_ADSP_MVM, 1, mvm_h, VSS_IMVM_CMD_START_VOICE,
+	if (apr_call_ex(APR_SVC_ADSP_MVM, s_port, mvm_h, VSS_IMVM_CMD_START_VOICE,
 	    NULL, 0, 0, NULL, NULL, 1500) != 0) {
 		adsp_log("q6voice: MVM START_VOICE failed");
 		goto fail;
@@ -995,13 +1062,13 @@ q6_voice_start(bool speakerphone)
 
 fail:
 	if (cvp_h != 0) {
-		(void)apr_call_ex(APR_SVC_ADSP_CVP, 1, cvp_h, APR_CMD_DESTROY_SESSION, NULL, 0, 0, NULL, NULL, 500);
+		(void)apr_call_ex(APR_SVC_ADSP_CVP, s_port, cvp_h, APR_CMD_DESTROY_SESSION, NULL, 0, 0, NULL, NULL, 500);
 	}
 	if (cvs_h != 0) {
-		(void)apr_call_ex(APR_SVC_ADSP_CVS, 1, cvs_h, APR_CMD_DESTROY_SESSION, NULL, 0, 0, NULL, NULL, 500);
+		(void)apr_call_ex(APR_SVC_ADSP_CVS, s_port, cvs_h, APR_CMD_DESTROY_SESSION, NULL, 0, 0, NULL, NULL, 500);
 	}
 	if (mvm_h != 0) {
-		(void)apr_call_ex(APR_SVC_ADSP_MVM, 1, mvm_h, APR_CMD_DESTROY_SESSION, NULL, 0, 0, NULL, NULL, 500);
+		(void)apr_call_ex(APR_SVC_ADSP_MVM, s_port, mvm_h, APR_CMD_DESTROY_SESSION, NULL, 0, 0, NULL, NULL, 500);
 	}
 	if (afe_tx_running) {
 		q6afe_stop_port(AFE_PORT_ID_QUATERNARY_MI2S_TX);
@@ -1024,25 +1091,25 @@ q6_voice_stop(void)
 	adsp_log("q6voice: stopping cellular voice session");
 
 	if (g_status.mvm_handle != 0) {
-		(void)apr_call_ex(APR_SVC_ADSP_MVM, 1, g_status.mvm_handle,
+		(void)apr_call_ex(APR_SVC_ADSP_MVM, voice_src_port, g_status.mvm_handle,
 		    VSS_IMVM_CMD_STOP_VOICE, NULL, 0, 0, NULL, NULL, 1000);
 		if (g_status.cvp_handle != 0) {
-			(void)apr_call_ex(APR_SVC_ADSP_MVM, 1, g_status.mvm_handle,
+			(void)apr_call_ex(APR_SVC_ADSP_MVM, voice_src_port, g_status.mvm_handle,
 			    VSS_IMVM_CMD_DETACH_VOCPROC, &detach, sizeof(detach), 0, NULL, NULL, 1000);
 		}
 	}
 	if (g_status.cvp_handle != 0) {
-		(void)apr_call_ex(APR_SVC_ADSP_CVP, 1, g_status.cvp_handle,
+		(void)apr_call_ex(APR_SVC_ADSP_CVP, voice_src_port, g_status.cvp_handle,
 		    VSS_IVOCPROC_CMD_DISABLE, NULL, 0, 0, NULL, NULL, 800);
-		(void)apr_call_ex(APR_SVC_ADSP_CVP, 1, g_status.cvp_handle,
+		(void)apr_call_ex(APR_SVC_ADSP_CVP, voice_src_port, g_status.cvp_handle,
 		    APR_CMD_DESTROY_SESSION, NULL, 0, 0, NULL, NULL, 800);
 	}
 	if (g_status.cvs_handle != 0) {
-		(void)apr_call_ex(APR_SVC_ADSP_CVS, 1, g_status.cvs_handle,
+		(void)apr_call_ex(APR_SVC_ADSP_CVS, voice_src_port, g_status.cvs_handle,
 		    APR_CMD_DESTROY_SESSION, NULL, 0, 0, NULL, NULL, 800);
 	}
 	if (g_status.mvm_handle != 0) {
-		(void)apr_call_ex(APR_SVC_ADSP_MVM, 1, g_status.mvm_handle,
+		(void)apr_call_ex(APR_SVC_ADSP_MVM, voice_src_port, g_status.mvm_handle,
 		    APR_CMD_DESTROY_SESSION, NULL, 0, 0, NULL, NULL, 800);
 	}
 	if (afe_tx_running) {
@@ -1070,33 +1137,22 @@ int
 adsp_q6_bringup_playback(void)
 {
 	/*
-	 * Configure apps_smmu (SID 0x1b21 mask 0x0f -> covers 0x1b21 audio DMA &
-	 * 0x1b23 adsprpc-smd!), hyp_assign the 4 MiB-aligned remote heap, and spawn
-	 * the "audiopd" static PD over FastRPC BEFORE issuing Q6AFE/Q6ADM/Q6ASM APR
-	 * commands so audio_pd registers all Elite/AVS APR services first.
+	 * Configure apps_smmu (SID 0x1b21 mask 0x0f -> audio DMA in 0xC0000000 via
+	 * IOVA 0x1:C0000000). RMX1931's adsp.mdt runs all Elite/AVS audio services
+	 * monolithically inside Root PD (pd=0); do NOT spawn "audiopd" over FastRPC!
 	 */
 	if (adsp_smmu_setup() != 0) {
 		snprintf(g_status.last_error, sizeof(g_status.last_error), "apps_smmu 0x1b21 setup failed");
 		return -1;
 	}
-	(void)adsp_hyp_assign_fastrpc_heap();
-	if (adsp_fastrpc_spawn_audiopd() != 0) {
-		adsp_log("fastrpc: warning: audiopd static PD spawn did not ACK, continuing");
-	}
-	/* Pump reverse-RPC (apps_remotectl / apps_std ACDB load) briefly while audiopd initializes */
-	(void)adsp_glink_poll(250);
 
 	if (q6core_wait_ready(15000) != 0) {
 		snprintf(g_status.last_error, sizeof(g_status.last_error), "Q6Core AVCS not ready");
 		return -1;
 	}
+	g_status.audiopd_spawned = true;
 	tlmm_setup_quat_mi2s();
 
-	/*
-	 * Right after CREATE_STATIC("audiopd") returns, audio_pd finishes loading
-	 * adsp_avs_config.acdb via apps_std reverse-RPC and registering Q6AFE (svc=4).
-	 * Retry Q6AFE clock setup for up to ~4s while pumping GLINK/reverse-RPC.
-	 */
 	{
 		int clk_rc = -1;
 		for (int attempt = 0; attempt < 8 && !g_stop_requested; attempt++) {
@@ -1116,15 +1172,16 @@ adsp_q6_bringup_playback(void)
 	}
 	g_status.afe_quat_rx_up = true;
 
-	/* Initialize MAX98927L@0x39 & MAX98927R@0x3a while I2S BCLK/WS are live */
+	/* Initialize MAX98937L@0x39 & MAX98937R@0x3a while I2S BCLK/WS are live */
 	if (max98927_init_stereo() != 0) {
-		adsp_log("max98927: warning: neither 0x39 nor 0x3a responded to probe");
+		adsp_log("max98937: warning: neither 0x39 nor 0x3a responded to probe");
 	}
 
 	if (q6_open_media_stream() != 0) {
 		snprintf(g_status.last_error, sizeof(g_status.last_error), "Q6ADM/Q6ASM stream open failed");
 		return -1;
 	}
+	adsp_smmu_check_fault("post-stream-open");
 	last_nonsilent_ms = 0;
 	return 0;
 }

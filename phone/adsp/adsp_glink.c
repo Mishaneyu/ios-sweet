@@ -673,7 +673,6 @@ adsp_glink_bringup(unsigned timeout_ms)
 	uint64_t start, end;
 	bool opened_ipcrtr_proactive = false;
 	bool opened_apr_proactive = false;
-	bool opened_fastrpc_proactive = false;
 	bool rekick_500 = false, rekick_2000 = false;
 
 	if (glink_ring_init() != 0) {
@@ -704,19 +703,13 @@ adsp_glink_bringup(unsigned timeout_ms)
 			opened_ipcrtr_proactive = true;
 			chan_send_open(&chans[CH_IDX_IPCRTR]);
 		}
-		if (version_acked && !opened_fastrpc_proactive && elapsed > 250ULL) {
-			opened_fastrpc_proactive = true;
-			chan_send_open(&chans[CH_IDX_FASTRPC]);
-		}
 		if (g_status.glink_ipcrtr_up && !opened_apr_proactive && elapsed > 600ULL) {
 			opened_apr_proactive = true;
 			chan_send_open(&chans[CH_IDX_APR]);
 		}
-		if (g_status.glink_ipcrtr_up && g_status.glink_apr_up &&
-		    (g_status.glink_fastrpc_up || elapsed > 3500ULL)) {
-			adsp_log("glink: IPCRTR (rcid=%u), apr_audio_svc (rcid=%u), fastrpc (rcid=%u up=%d) UP",
-			    chans[CH_IDX_IPCRTR].rcid, chans[CH_IDX_APR].rcid,
-			    chans[CH_IDX_FASTRPC].rcid, g_status.glink_fastrpc_up ? 1 : 0);
+		if (g_status.glink_ipcrtr_up && g_status.glink_apr_up) {
+			adsp_log("glink: IPCRTR (rcid=%u) and apr_audio_svc (rcid=%u) UP",
+			    chans[CH_IDX_IPCRTR].rcid, chans[CH_IDX_APR].rcid);
 			return 0;
 		}
 	}
