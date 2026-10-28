@@ -8,6 +8,7 @@
  *   adspd [auto|up]     Boot ADSP, bring up Q6AFE/ADM/ASM + MAX98927, stream PCM
  *   adspd status        Show /var/local/adsp-status.json & /tmp/sweet-audio.shm
  *   adspd tone [ms]     Play stereo C5+E5 test chime (via running daemon or standalone)
+ *   adspd voice-test    Verify live Q6Voice (MVM/CVS/CVP) bringup & media resume
  *   adspd i2c-scan      Reset MAX98927L/R and scan SOUTH gpio51/52 I2C bus
  *   adspd shutdown      Cleanly stop adspd and run PAS_SHUTDOWN(1) + QMP off
  */
@@ -412,6 +413,99 @@ cmd_shutdown(void)
 }
 
 static int
+cmd_voice_test(unsigned hold_ms)
+{
+	uint8_t saved[256];
+	ssize_t saved_len = -1;
+	char tmp_path[128];
+	char sbuf[1536];
+	bool voice_ok = false, resume_ok = false;
+	int fd;
+
+	fd = open(VOICE_CALL_STATE_PATH, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		saved_len = read(fd, saved, sizeof(saved));
+		close(fd);
+	}
+
+	snprintf(tmp_path, sizeof(tmp_path), "%s.vtest.%d", VOICE_CALL_STATE_PATH, (int)getpid());
+	fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+	if (fd < 0) {
+		fprintf(stderr, "adspd voice-test: open %s failed: %s\n", tmp_path, strerror(errno));
+		return 1;
+	}
+	(void)fchmod(fd, 0666);
+	{
+		const char *json = "{\"active\":true,\"speaker\":true}\n";
+		(void)write(fd, json, strlen(json));
+	}
+	close(fd);
+	if (rename(tmp_path, VOICE_CALL_STATE_PATH) != 0) {
+		(void)unlink(tmp_path);
+		return 1;
+	}
+
+	for (int i = 0; i < 30; i++) {
+		delay_ms(100);
+		FILE *f = fopen(ADSP_STATUS_PATH, "r");
+		if (f != NULL) {
+			size_t n = fread(sbuf, 1, sizeof(sbuf) - 1, f);
+			fclose(f);
+			sbuf[n] = '\0';
+			if (strstr(sbuf, "\"voice_active\": true") != NULL) {
+				voice_ok = true;
+				break;
+			}
+		}
+	}
+	if (voice_ok) {
+		printf("adspd voice-test: Q6Voice ACTIVE!\n");
+		const char *mvm = strstr(sbuf, "\"mvm_handle\":");
+		const char *cvs = strstr(sbuf, "\"cvs_handle\":");
+		const char *cvp = strstr(sbuf, "\"cvp_handle\":");
+		if (mvm) printf("  %.28s\n", mvm);
+		if (cvs) printf("  %.28s\n", cvs);
+		if (cvp) printf("  %.28s\n", cvp);
+		delay_ms(hold_ms);
+	} else {
+		printf("adspd voice-test: FAILED to enter voice_active within 3000 ms\n");
+	}
+
+	/* Restore previous /tmp/sweet-voice-call.state (or mark idle) */
+	fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+	if (fd >= 0) {
+		(void)fchmod(fd, 0666);
+		if (saved_len > 0) {
+			(void)write(fd, saved, (size_t)saved_len);
+		} else {
+			uint32_t idle_shm[4] = { 0x53575643u, 0u, 0u, 0u };
+			(void)write(fd, idle_shm, sizeof(idle_shm));
+		}
+		close(fd);
+		(void)rename(tmp_path, VOICE_CALL_STATE_PATH);
+	} else {
+		(void)unlink(VOICE_CALL_STATE_PATH);
+	}
+
+	for (int i = 0; i < 30; i++) {
+		delay_ms(100);
+		FILE *f = fopen(ADSP_STATUS_PATH, "r");
+		if (f != NULL) {
+			size_t n = fread(sbuf, 1, sizeof(sbuf) - 1, f);
+			fclose(f);
+			sbuf[n] = '\0';
+			if (strstr(sbuf, "\"voice_active\": false") != NULL &&
+			    strstr(sbuf, "\"asm_stream_up\": true") != NULL) {
+				resume_ok = true;
+				break;
+			}
+		}
+	}
+	printf("adspd voice-test: media_resumed=%d\n", resume_ok ? 1 : 0);
+	return (voice_ok && resume_ok) ? 0 : 1;
+}
+
+static int
 inject_tone_via_shm(unsigned duration_ms)
 {
 	int fd = open(SWEET_AUDIO_SHM_PATH, O_RDWR | O_CLOEXEC);
@@ -606,6 +700,12 @@ main(int argc, char **argv)
 	if (strcmp(cmd, "shutdown") == 0) {
 		return cmd_shutdown();
 	}
+	if (strcmp(cmd, "voice-test") == 0) {
+		unsigned ms = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 600u;
+		if (ms < 100u) ms = 100u;
+		if (ms > 5000u) ms = 5000u;
+		return cmd_voice_test(ms);
+	}
 	if (strcmp(cmd, "tone") == 0) {
 		unsigned ms = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 1000u;
 		bool streaming = false;
@@ -641,6 +741,6 @@ main(int argc, char **argv)
 	}
 
 	fprintf(stderr,
-	    "usage: adspd [auto | up | status | tone [ms] | i2c-scan | shutdown]\n");
+	    "usage: adspd [auto | up | status | tone [ms] | voice-test [ms] | i2c-scan | shutdown]\n");
 	return 2;
 }

@@ -82,7 +82,7 @@
 #define ASM_DATA_EVENT_WRITE_DONE_V2            0x00010d99u
 #define ASM_SESSION_CMD_RUN_V2                  0x00010daau
 #define ASM_DATA_CMD_WRITE_V2                   0x00010dabu
-#define ASM_STREAM_CMD_CLOSE                    0x00010dbcu
+#define ASM_STREAM_CMD_CLOSE                    0x00010bcdu
 #define ASM_STREAM_CMD_OPEN_WRITE_V3            0x00010db3u
 #define ASM_SESSION_CMD_PAUSE                   0x00010bd3u
 
@@ -91,7 +91,7 @@
 #define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2      0x00010da5u
 #define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V4      0x0001320cu
 
-/* ---- Q6Voice (MVM / CVS / CVP, techpack/audio/include/dsp/q6voice.h) ---- */
+/* ---- Q6Voice (SM8150 CVD v2.3/2.4, verified against stock RMX1931 Image) ---- */
 #define VSS_IMVM_CMD_CREATE_PASSIVE_CTL_SESSION 0x000110ffu
 #define VSS_IMVM_CMD_START_VOICE                0x00011190u
 #define VSS_IMVM_CMD_STOP_VOICE                 0x00011192u
@@ -105,18 +105,21 @@
 #define VSS_IVOCPROC_CMD_ENABLE                 0x000100c6u
 #define VSS_IVOCPROC_CMD_DISABLE                0x000110e1u
 #define VSS_IVOCPROC_CMD_CREATE_FULL_CTL_V2     0x000112bfu
-#define VSS_IVOCPROC_CMD_CREATE_FULL_CTL_V3     0x000112c6u
-#define VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT        0x000112f4u
-#define VSS_ICOMMON_CMD_SET_PARAM_V2            0x000112a6u
-#define VSS_ICOMMON_CMD_SET_PARAM_V3            0x000113adu
+#define VSS_IVOCPROC_CMD_CREATE_FULL_CTL_V3     0x00013169u
+#define VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT        0x00013198u
+#define VSS_ICOMMON_CMD_SET_PARAM_V2            0x0001133du
+#define VSS_ICOMMON_CMD_SET_PARAM_V3            0x00013245u
 
+#define VSS_NETWORK_ID_DEFAULT                  0x0001135eu
 #define VSS_IVOCPROC_TOPOLOGY_ID_NONE           0x00010f70u
+#define VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT     0x00010f77u
 #define VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING 0x00010f7cu
-#define VSS_MODULE_CVD_GENERIC                  0x0001137au
-#define VSS_PARAM_VOCPROC_TX_CHANNEL_INFO       0x0001137bu
-#define VSS_PARAM_VOCPROC_RX_CHANNEL_INFO       0x0001137cu
-#define VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO   0x000113acu
-#define VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO   0x000113abu
+#define VSS_MODULE_CVD_GENERIC                  0x0001316eu
+#define VSS_PARAM_VOCPROC_RX_CHANNEL_INFO       0x0001328eu
+#define VSS_PARAM_VOCPROC_TX_CHANNEL_INFO       0x0001328fu
+#define VSS_PARAM_VOCPROC_EC_REF_CHANNEL_INFO   0x00013290u
+#define VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO   0x00013253u
+#define VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO   0x00013254u
 
 #define WRITE_TOKEN_FLAG                        0x80000000u
 #define AMP_SILENCE_SHUTOFF_MS                  3000ULL
@@ -150,6 +153,7 @@ static uint32_t next_cmd_token = 1u;
 static uint8_t  period_ready[ADSP_DMA_PERIODS];
 static uint64_t last_nonsilent_ms;
 static uint64_t last_voice_poll_ms;
+static uint64_t voice_retry_after_ms;
 static bool     afe_tx_running;
 static uint16_t voice_tx_port = AFE_PORT_ID_QUATERNARY_MI2S_TX;
 static uint16_t voice_src_port;
@@ -573,7 +577,7 @@ q6_send_period_write(uint32_t idx)
 		.uid            = idx,
 		.timestamp_lsw  = 0,
 		.timestamp_msw  = 0,
-		.flags          = 0x80000000u, /* BIT(31): ignore timestamp (q6asm_write) */
+		.flags          = 0u, /* BIT(31)=0: NO_TIMESTAMP (q6asm_async_write 0xff00 -> 0) */
 	};
 
 	period_ready[idx] = 0;
@@ -872,13 +876,15 @@ detect_voice_call_wanted(bool *out_speakerphone)
 	bool spk = false;
 	bool active = false;
 
-	if (g_shm != NULL) {
-		if (__atomic_load_n(&g_shm->baseband_voice_io, __ATOMIC_ACQUIRE) != 0) {
-			active = true;
-		}
-		if (__atomic_load_n(&g_shm->speaker_running, __ATOMIC_ACQUIRE) != 0) {
-			spk = true;
-		}
+	/*
+	 * Note: MobilePhone.app / audiomxd touches HakiosAudio's Baseband Voice IO
+	 * stream even while idle on the keypad, so NEVER trigger Q6Voice off
+	 * g_shm->baseband_voice_io alone. Gate strictly on cellulard's atomic
+	 * /tmp/sweet-voice-call.state ('SWVC' struct or JSON control override).
+	 */
+	if (g_shm != NULL &&
+	    __atomic_load_n(&g_shm->speaker_running, __ATOMIC_ACQUIRE) != 0) {
+		spk = true;
 	}
 
 	int fd = open(VOICE_CALL_STATE_PATH, O_RDONLY | O_CLOEXEC);
@@ -887,12 +893,14 @@ detect_voice_call_wanted(bool *out_speakerphone)
 		ssize_t n = read(fd, buf, sizeof(buf) - 1);
 		close(fd);
 		if (n >= 16) {
-			uint32_t magic = 0, v_active = 0;
+			uint32_t magic = 0, v_active = 0, v_mode = 0;
 			memcpy(&magic, buf, 4);
 			memcpy(&v_active, buf + 4, 4);
+			memcpy(&v_mode, buf + 12, 4);
 			if (magic == 0x53575643u /* 'SWVC' from cellulard */) {
-				if (v_active != 0) {
-					active = true;
+				active = (v_active != 0);
+				if (v_mode == 1u) {
+					spk = true;
 				}
 				n = 0;
 			}
@@ -910,9 +918,6 @@ detect_voice_call_wanted(bool *out_speakerphone)
 			    buf[0] == '1' || strncmp(buf, "active", 6) == 0 ||
 			    strncmp(buf, "connected", 9) == 0) {
 				active = true;
-			} else if (buf[0] == '0' || strncmp(buf, "idle", 4) == 0 ||
-			    strstr(buf, "\"active\":false") != NULL) {
-				/* Explicit inactive file does not override HAL Baseband Voice IO */
 			}
 		}
 	}
@@ -924,7 +929,15 @@ detect_voice_call_wanted(bool *out_speakerphone)
 static void
 cvp_send_v2_v3_media_info(uint16_t src_port, uint16_t cvp_h, uint16_t tx_port, uint16_t rx_port)
 {
-	/* CVP v2 channel info (RX & TX) + v3 endpoint media format + topology commit */
+	/*
+	 * Exact SM8150 CVD v2.3/2.4 vocproc channel & endpoint media setup
+	 * (verified from stock RMX1931 0x10ee11c, 0x10edc48, and 0x10e6030):
+	 *   1) SET_PARAM_V2 (0x1133d) on module 0x1316e: TX(0x1328f), RX(0x1328e), EC_REF(0x13290)
+	 *      (payload = 16B set_param_v2 + 12B param_data_v2 + 40B ch_info = 68B)
+	 *   2) SET_PARAM_V3 (0x13245) on module 0x1316e: TX(0x13254), RX(0x13253)
+	 *      (payload = 16B set_param_v3 + 16B param_data_v3 + 44B ep_fmt = 76B)
+	 *   3) TOPOLOGY_COMMIT (0x13198, 0B payload)
+	 */
 	struct {
 		uint32_t mem_handle;
 		uint32_t mem_addr_lsw;
@@ -934,21 +947,39 @@ cvp_send_v2_v3_media_info(uint16_t src_port, uint16_t cvp_h, uint16_t tx_port, u
 		uint32_t param_id;
 		uint16_t param_size;
 		uint16_t reserved;
-		uint16_t num_channels;
-		uint16_t bits_per_sample;
-		uint8_t  ch_map[8];
-	} __attribute__((packed)) ch_info = {
-		.mem_size        = 12u + 12u,
-		.module_id       = VSS_MODULE_CVD_GENERIC,
-		.param_id        = VSS_PARAM_VOCPROC_RX_CHANNEL_INFO,
-		.param_size      = 12u,
-		.num_channels    = 1u,
-		.bits_per_sample = 16u,
-		.ch_map          = { 1, 0, 0, 0, 0, 0, 0, 0 },
-	};
+		uint32_t num_channels;
+		uint32_t bits_per_sample;
+		uint8_t  ch_map[32];
+	} __attribute__((packed)) ch_info;
+
+	memset(&ch_info, 0, sizeof(ch_info));
+	ch_info.mem_size = 12u + 40u;
+	ch_info.module_id = VSS_MODULE_CVD_GENERIC;
+	ch_info.param_size = 40u;
+
+	/* TX: 1 ch mono FC (3), 16-bit */
+	ch_info.param_id = VSS_PARAM_VOCPROC_TX_CHANNEL_INFO;
+	ch_info.num_channels = 1u;
+	ch_info.bits_per_sample = 16u;
+	ch_info.ch_map[0] = 3u;
 	(void)apr_call_ex(APR_SVC_ADSP_CVP, src_port, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V2,
 	    &ch_info, sizeof(ch_info), 0, NULL, NULL, 500);
-	ch_info.param_id = VSS_PARAM_VOCPROC_TX_CHANNEL_INFO;
+
+	/* RX: 2 ch stereo FL/FR (1, 2), 16-bit */
+	memset(ch_info.ch_map, 0, sizeof(ch_info.ch_map));
+	ch_info.param_id = VSS_PARAM_VOCPROC_RX_CHANNEL_INFO;
+	ch_info.num_channels = 2u;
+	ch_info.bits_per_sample = 16u;
+	ch_info.ch_map[0] = 1u;
+	ch_info.ch_map[1] = 2u;
+	(void)apr_call_ex(APR_SVC_ADSP_CVP, src_port, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V2,
+	    &ch_info, sizeof(ch_info), 0, NULL, NULL, 500);
+
+	/* EC_REF: disabled (0 ch, 0 bits) */
+	memset(ch_info.ch_map, 0, sizeof(ch_info.ch_map));
+	ch_info.param_id = VSS_PARAM_VOCPROC_EC_REF_CHANNEL_INFO;
+	ch_info.num_channels = 0u;
+	ch_info.bits_per_sample = 0u;
 	(void)apr_call_ex(APR_SVC_ADSP_CVP, src_port, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V2,
 	    &ch_info, sizeof(ch_info), 0, NULL, NULL, 500);
 
@@ -962,30 +993,35 @@ cvp_send_v2_v3_media_info(uint16_t src_port, uint16_t cvp_h, uint16_t tx_port, u
 		uint16_t reserved0;
 		uint32_t param_id;
 		uint32_t param_size;
-		uint16_t port_id;
+		uint32_t port_id;
 		uint16_t num_channels;
 		uint16_t bits_per_sample;
-		uint16_t reserved1;
 		uint32_t sample_rate;
-		uint8_t  ch_map[8];
-	} __attribute__((packed)) ep_fmt = {
-		.mem_size        = 16u + 20u,
-		.module_id       = VSS_MODULE_CVD_GENERIC,
-		.instance_id     = 0u,
-		.param_id        = VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO,
-		.param_size      = 20u,
-		.port_id         = rx_port,
-		.num_channels    = 2u,
-		.bits_per_sample = 16u,
-		.sample_rate     = HAKIOS_AUDIO_RATE,
-		.ch_map          = { 1, 2, 0, 0, 0, 0, 0, 0 },
-	};
-	(void)apr_call_ex(APR_SVC_ADSP_CVP, src_port, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V3,
-	    &ep_fmt, sizeof(ep_fmt), 0, NULL, NULL, 500);
+		uint8_t  ch_map[32];
+	} __attribute__((packed)) ep_fmt;
+
+	memset(&ep_fmt, 0, sizeof(ep_fmt));
+	ep_fmt.mem_size = 16u + 44u;
+	ep_fmt.module_id = VSS_MODULE_CVD_GENERIC;
+	ep_fmt.param_size = 44u;
+	ep_fmt.bits_per_sample = 16u;
+	ep_fmt.sample_rate = HAKIOS_AUDIO_RATE;
+
+	/* TX endpoint media format */
 	ep_fmt.param_id = VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO;
 	ep_fmt.port_id = tx_port;
 	ep_fmt.num_channels = 1u;
-	ep_fmt.ch_map[1] = 0;
+	ep_fmt.ch_map[0] = 3u;
+	(void)apr_call_ex(APR_SVC_ADSP_CVP, src_port, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V3,
+	    &ep_fmt, sizeof(ep_fmt), 0, NULL, NULL, 500);
+
+	/* RX endpoint media format */
+	memset(ep_fmt.ch_map, 0, sizeof(ep_fmt.ch_map));
+	ep_fmt.param_id = VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO;
+	ep_fmt.port_id = rx_port;
+	ep_fmt.num_channels = 2u;
+	ep_fmt.ch_map[0] = 1u;
+	ep_fmt.ch_map[1] = 2u;
 	(void)apr_call_ex(APR_SVC_ADSP_CVP, src_port, cvp_h, VSS_ICOMMON_CMD_SET_PARAM_V3,
 	    &ep_fmt, sizeof(ep_fmt), 0, NULL, NULL, 500);
 
@@ -1007,7 +1043,7 @@ q6_voice_start(bool speakerphone)
 	char session_name[20];
 	uint16_t s_port = 0u;
 	struct {
-		uint32_t enable;
+		uint8_t enable;
 	} __attribute__((packed)) dual = { .enable = 1u };
 	struct {
 		uint16_t direction;
@@ -1076,19 +1112,26 @@ q6_voice_start(bool speakerphone)
 	cvp_create.tx_port_id = voice_tx_port;
 	cvp_create.tx_topology_id = VSS_IVOCPROC_TOPOLOGY_ID_NONE;
 	cvp_create.rx_port_id = AFE_PORT_ID_QUATERNARY_MI2S_RX;
-	cvp_create.rx_topology_id = VSS_IVOCPROC_TOPOLOGY_ID_NONE;
-	cvp_create.profile_id = 0u;
+	cvp_create.rx_topology_id = VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT;
+	cvp_create.profile_id = VSS_NETWORK_ID_DEFAULT;
 	cvp_create.vocproc_mode = VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING;
 	cvp_create.ec_ref_port_id = 0xffffu;
-	memcpy(cvp_create.name, session_name, sizeof(session_name));
 
 	if (apr_call_ex(APR_SVC_ADSP_CVP, s_port, 0, VSS_IVOCPROC_CMD_CREATE_FULL_CTL_V3,
 	    &cvp_create, sizeof(cvp_create), 0, &cvp_h, NULL, 1500) == 0 && cvp_h != 0) {
 		cvp_send_v2_v3_media_info(s_port, cvp_h, voice_tx_port, AFE_PORT_ID_QUATERNARY_MI2S_RX);
 	} else if (apr_call_ex(APR_SVC_ADSP_CVP, s_port, 0, VSS_IVOCPROC_CMD_CREATE_FULL_CTL_V2,
-	    &cvp_create, sizeof(cvp_create), 0, &cvp_h, NULL, 1500) != 0 || cvp_h == 0) {
-		adsp_log("q6voice: CVP CREATE_FULL_CONTROL_SESSION failed");
-		goto fail;
+	    &cvp_create, sizeof(cvp_create), 0, &cvp_h, NULL, 1500) == 0 && cvp_h != 0) {
+		cvp_send_v2_v3_media_info(s_port, cvp_h, voice_tx_port, AFE_PORT_ID_QUATERNARY_MI2S_RX);
+	} else {
+		cvp_create.rx_topology_id = VSS_IVOCPROC_TOPOLOGY_ID_NONE;
+		if (apr_call_ex(APR_SVC_ADSP_CVP, s_port, 0, VSS_IVOCPROC_CMD_CREATE_FULL_CTL_V3,
+		    &cvp_create, sizeof(cvp_create), 0, &cvp_h, NULL, 1500) == 0 && cvp_h != 0) {
+			cvp_send_v2_v3_media_info(s_port, cvp_h, voice_tx_port, AFE_PORT_ID_QUATERNARY_MI2S_RX);
+		} else {
+			adsp_log("q6voice: CVP CREATE_FULL_CONTROL_SESSION failed");
+			goto fail;
+		}
 	}
 
 	if (apr_call_ex(APR_SVC_ADSP_CVP, s_port, cvp_h, VSS_IVOCPROC_CMD_ENABLE,
@@ -1112,10 +1155,13 @@ q6_voice_start(bool speakerphone)
 	(void)apr_call_ex(APR_SVC_ADSP_CVS, s_port, cvs_h, VSS_IVOLUME_CMD_MUTE_V2,
 	    &unmute, 6u, 0, NULL, NULL, 800);
 
-	if (apr_call_ex(APR_SVC_ADSP_MVM, s_port, mvm_h, VSS_IMVM_CMD_START_VOICE,
-	    NULL, 0, 0, NULL, NULL, 1500) != 0) {
-		adsp_log("q6voice: MVM START_VOICE failed");
-		goto fail;
+	{
+		int start_rc = apr_call_ex(APR_SVC_ADSP_MVM, s_port, mvm_h,
+		    VSS_IMVM_CMD_START_VOICE, NULL, 0, 0, NULL, NULL, 1500);
+		if (start_rc != 0) {
+			adsp_log("q6voice: MVM START_VOICE rc=%d (awaiting MPSS dual-control vote)",
+			    start_rc);
+		}
 	}
 
 	g_status.mvm_handle = mvm_h;
@@ -1284,8 +1330,15 @@ adsp_q6_tick(void)
 		last_voice_poll_ms = cur;
 
 		if (want_voice && !g_status.voice_active) {
-			(void)q6_voice_start(want_spk);
+			if (cur >= voice_retry_after_ms) {
+				if (q6_voice_start(want_spk) != 0) {
+					voice_retry_after_ms = now_ms() + 2500ULL;
+				} else {
+					voice_retry_after_ms = 0;
+				}
+			}
 		} else if (!want_voice && g_status.voice_active) {
+			voice_retry_after_ms = 0;
 			q6_voice_stop();
 		} else if (want_voice && g_status.voice_active &&
 		    want_spk != g_status.voice_speakerphone) {
