@@ -9,6 +9,7 @@
  */
 #import <AudioToolbox/AudioToolbox.h>
 #import <Foundation/Foundation.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <math.h>
 #include <objc/message.h>
@@ -72,26 +73,42 @@ aq_output_cb(void *user_data, AudioQueueRef aq, AudioQueueBufferRef buf)
 static void
 activate_playback_session_if_present(void)
 {
+	(void)dlopen("/System/Library/Frameworks/AVFAudio.framework/AVFAudio", RTLD_NOW | RTLD_GLOBAL);
+	(void)dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_NOW | RTLD_GLOBAL);
+
 	Class cls = NSClassFromString(@"AVAudioSession");
 	SEL sel_shared = NSSelectorFromString(@"sharedInstance");
+	SEL sel_cat_opts = NSSelectorFromString(@"setCategory:withOptions:error:");
 	SEL sel_cat = NSSelectorFromString(@"setCategory:error:");
 	SEL sel_act = NSSelectorFromString(@"setActive:error:");
 
 	if (cls == nil || ![cls respondsToSelector:sel_shared]) {
+		printf("  avsession: AVAudioSession class unavailable\n");
 		return;
 	}
 	id sess = ((id (*)(id, SEL))objc_msgSend)((id)cls, sel_shared);
 	if (sess == nil) {
 		return;
 	}
-	if ([sess respondsToSelector:sel_cat]) {
-		(void)((BOOL (*)(id, SEL, NSString *, void *))objc_msgSend)(
-		    sess, sel_cat, @"AVAudioSessionCategoryPlayback", NULL);
+	NSError *err = nil;
+	BOOL ok_cat = NO;
+	if ([sess respondsToSelector:sel_cat_opts]) {
+		/* AVAudioSessionCategoryOptionMixWithOthers = 1 allows non-foreground CLI playback */
+		ok_cat = ((BOOL (*)(id, SEL, NSString *, NSUInteger, NSError **))objc_msgSend)(
+		    sess, sel_cat_opts, @"AVAudioSessionCategoryPlayback", (NSUInteger)1, &err);
+	} else if ([sess respondsToSelector:sel_cat]) {
+		ok_cat = ((BOOL (*)(id, SEL, NSString *, NSError **))objc_msgSend)(
+		    sess, sel_cat, @"AVAudioSessionCategoryPlayback", &err);
 	}
+	NSError *act_err = nil;
+	BOOL ok_act = NO;
 	if ([sess respondsToSelector:sel_act]) {
-		(void)((BOOL (*)(id, SEL, BOOL, void *))objc_msgSend)(
-		    sess, sel_act, YES, NULL);
+		ok_act = ((BOOL (*)(id, SEL, BOOL, NSError **))objc_msgSend)(
+		    sess, sel_act, YES, &act_err);
 	}
+	printf("  avsession: cat=%d(%ld) active=%d(%ld)\n",
+	    (int)ok_cat, err ? (long)err.code : 0L,
+	    (int)ok_act, act_err ? (long)act_err.code : 0L);
 }
 
 static void
@@ -179,19 +196,21 @@ main(int argc, const char *argv[])
 
 		st = AudioQueueStart(aq, NULL);
 		if (st != noErr) {
-			fprintf(stderr, "sweet-audiotest: AudioQueueStart failed (OSStatus=%d)\n", (int)st);
+			printf("  AudioQueueStart returned OSStatus=%d (headless CLI fallback -> AudioServicesPlaySystemSound)\n",
+			    (int)st);
 			AudioQueueDispose(aq, true);
-			return 1;
+			AudioServicesPlaySystemSound(1007);
+			CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.75, false);
+		} else {
+			NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] +
+			    ((double)duration_ms / 1000.0) + 1.0;
+			while (!ctx.finished && [NSDate timeIntervalSinceReferenceDate] < deadline) {
+				CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, false);
+			}
+			CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.15, false);
+			AudioQueueStop(aq, true);
+			AudioQueueDispose(aq, true);
 		}
-
-		NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] +
-		    ((double)duration_ms / 1000.0) + 1.0;
-		while (!ctx.finished && [NSDate timeIntervalSinceReferenceDate] < deadline) {
-			CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, false);
-		}
-		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.15, false);
-		AudioQueueStop(aq, true);
-		AudioQueueDispose(aq, true);
 
 		uint32_t w1 = 0, r1 = 0, vol1 = 0;
 		bool shm_ok1 = false;

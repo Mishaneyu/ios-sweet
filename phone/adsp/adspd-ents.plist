@@ -8,5 +8,13 @@
 	<true/>
 	<key>com.apple.private.security.no-sandbox</key>
 	<true/>
+	<key>com.apple.mediaserverd.WildcardClient</key>
+	<true/>
+	<key>com.apple.SystemSound.anko</key>
+	<true/>
+	<key>com.apple.avfoundation.allow-system-sound-as-behavior</key>
+	<true/>
+	<key>inter-app-audio</key>
+	<true/>
 </dict>
 </plist>

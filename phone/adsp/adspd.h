@@ -40,8 +40,8 @@
 #define ADSP_PCM_PERIOD_BYTES       (ADSP_PCM_PERIOD_FRAMES * HAKIOS_AUDIO_FRAME) /* 3840 B */
 #define ADSP_DSP_IOVA_HIGH          0x00000001u
 
-/* SMEM & APCS IPC doorbells (live.dtb verified) */
-#define SMEM_BASE_PA                0x80900000ULL
+/* SMEM & APCS IPC doorbells (live.dtb verified: qcom,smem@86000000) */
+#define SMEM_BASE_PA                0x86000000ULL
 #define SMEM_SIZE_BYTES             0x00200000ULL
 #define SMEM_HOST_APPS              0u
 #define SMEM_HOST_ADSP              2u

@@ -1878,6 +1878,21 @@ static void invoke_ct_reply_block(id replyBlock, BOOL setterOnly,
 		invoke_ct_reply_block(replyBlock, NO, build_system_capabilities_dict(), YES, 1, nil);
 		return YES;
 	}
+	if ([sname isEqualToString:@"copyCellInfo:completion:"]) {
+		Class ccls = NSClassFromString(@"CTCellInfo");
+		id ci = ccls ? [[ccls alloc] init] : nil;
+		invoke_ct_reply_block(replyBlock, NO, ci, NO, 0, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"smartDataMode:completion:"]) {
+		invoke_ct_reply_block(replyBlock, NO, @(NO), NO, 0, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"getEnglishCarrierNameFor:completion:"]) {
+		NSString *op = st.operator_name[0] ? [NSString stringWithUTF8String:st.operator_name] : @"";
+		invoke_ct_reply_block(replyBlock, NO, op, YES, 0, nil);
+		return YES;
+	}
 	if ([sname isEqualToString:@"copyCarrierBundleValue:keyHierarchy:bundleType:completion:"] ||
 	    [sname isEqualToString:@"copyCarrierBundleValueWithDefault:keyHierarchy:bundleType:completion:"]) {
 		__unsafe_unretained id keyHier = nil;

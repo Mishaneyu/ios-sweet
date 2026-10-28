@@ -20,6 +20,9 @@ static const struct { const char *service, *domain; uint32_t instance; } db[] = 
 	{ "kernel/elf_loader", "msm/modem/wlan_pd", 180 },
 	{ "tms/servreg", "msm/modem/wlan_pd", 180 },
 	{ "wlan/fw", "msm/modem/wlan_pd", 180 },
+	{ "avs/audio", "msm/adsp/audio_pd", 74 },
+	{ "tms/servreg", "msm/adsp/audio_pd", 74 },
+	{ "tms/servreg", "msm/adsp/root_pd", 74 },
 };
 
 int pdmapper_init(void)

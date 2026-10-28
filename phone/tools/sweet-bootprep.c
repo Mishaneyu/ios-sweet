@@ -105,7 +105,7 @@ purge_legacy_rmtfs_buffer(const char *buf_file)
 	unsigned fver = 0;
 	int n = fscanf(f, "%lld %llx %u", &fb, &fpa, &fver);
 	fclose(f);
-	if (n != 3 || fver < 3u) {
+	if (n != 3 || fver < 4u) {
 		unlink(buf_file);
 	}
 }
@@ -173,7 +173,7 @@ main(int argc, char **argv, char **envp)
 	unpack_gz_if_needed("/private/var/local/fw/rmtfs/oppodycnvbk.img.gz",
 	    "/private/var/local/fw/rmtfs/oppodycnvbk.img", 10485760);
 
-	const char *efs_stamp = "/private/var/local/fw/rmtfs/.wave6-efs-restored-v1";
+	const char *efs_stamp = "/private/var/local/fw/rmtfs/.wave6-efs-restored-v2";
 	const char *rmtfs_buf = "/private/var/local/fw/rmtfs/.buffer";
 	struct stat st;
 	if (stat(efs_stamp, &st) != 0) {

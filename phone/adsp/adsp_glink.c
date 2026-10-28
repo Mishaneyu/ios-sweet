@@ -939,7 +939,7 @@ pdmapper_load_jsn_db(void)
 		closedir(dir);
 	}
 
-	/* Built-in SM8150 ADSP fallback entries (instance 74) if .jsn files are absent */
+	/* Built-in SM8150 ADSP + MPSS fallback entries if .jsn files are absent */
 	pd_add_entry("avs/audio",         "msm/adsp/audio_pd",  74, 0, 0);
 	pd_add_entry("kernel/elf_loader", "msm/adsp/audio_pd",  74, 0, 0);
 	pd_add_entry("tms/servreg",       "msm/adsp/audio_pd",  74, 0, 0);
@@ -947,6 +947,12 @@ pdmapper_load_jsn_db(void)
 	pd_add_entry("tms/servreg",       "msm/adsp/sensor_pd", 74, 0, 0);
 	pd_add_entry("tms/servreg",       "msm/adsp/root_pd",   74, 0, 0);
 	pd_add_entry("tms/pdr_enabled",   "msm/adsp/root_pd",   74, 0, 0);
+	pd_add_entry("tms/servreg",       "msm/modem/root_pd",  180, 0, 0);
+	pd_add_entry("tms/pdr_enabled",   "msm/modem/root_pd",  180, 0, 0);
+	pd_add_entry("gps/gps_service",   "msm/modem/root_pd",  180, 0, 0);
+	pd_add_entry("kernel/elf_loader", "msm/modem/wlan_pd",  180, 0, 0);
+	pd_add_entry("tms/servreg",       "msm/modem/wlan_pd",  180, 0, 0);
+	pd_add_entry("wlan/fw",           "msm/modem/wlan_pd",  180, 0, 0);
 	adsp_log("pd-mapper: loaded %u domain service entries", npd_db);
 }
 
@@ -1170,9 +1176,24 @@ tftp_open_ro(const char *req_path)
 	const char *ro_prefix = "/readonly/firmware/image/";
 	const char *base;
 	char local[256];
+	int fd;
 
 	if (strncmp(req_path, ro_prefix, strlen(ro_prefix)) == 0) {
 		const char *rest = req_path + strlen(ro_prefix);
+		if (rest[0] != '\0' && strstr(rest, "..") == NULL) {
+			snprintf(local, sizeof(local), "%s/%s", ADSP_FW_DIR, rest);
+			fd = open(local, O_RDONLY | O_CLOEXEC);
+			if (fd >= 0) {
+				return fd;
+			}
+			for (char *c = local + strlen(ADSP_FW_DIR) + 1; *c != '\0'; c++) {
+				*c = (char)tolower((unsigned char)*c);
+			}
+			fd = open(local, O_RDONLY | O_CLOEXEC);
+			if (fd >= 0) {
+				return fd;
+			}
+		}
 		base = strrchr(rest, '/');
 		base = base != NULL ? base + 1 : rest;
 	} else {
@@ -1183,6 +1204,10 @@ tftp_open_ro(const char *req_path)
 		return -1;
 	}
 	snprintf(local, sizeof(local), "%s/%s", ADSP_FW_DIR, base);
+	fd = open(local, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		return fd;
+	}
 	for (char *c = local + strlen(ADSP_FW_DIR) + 1; *c != '\0'; c++) {
 		*c = (char)tolower((unsigned char)*c);
 	}
