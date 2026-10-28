@@ -32,6 +32,7 @@ KEEP_DAEMON_KEYS = (
     '/System/Library/LaunchDaemons/org.iosonpixel.dropbear.plist',
     '/System/Library/LaunchDaemons/org.iosonpixel.wland.plist',
     '/System/Library/LaunchDaemons/org.iosonpixel.sweetstored.plist',
+    '/System/Library/LaunchDaemons/org.iosonpixel.sweetauthd.plist',
 )
 
 SKIP_USERLAND_BINS = {'m2vtest'}
@@ -633,6 +634,19 @@ def main():
         'UserName': 'root',
     }
 
+    # Ensure sweetauthd Apple Account / iCloud helper is registered for SweetAuth.app & akd (127.0.0.1:29171).
+    jobs['/System/Library/LaunchDaemons/org.iosonpixel.sweetauthd.plist'] = {
+        'EnvironmentVariables': {'PATH': '/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'},
+        'KeepAlive': True,
+        'Label': 'org.iosonpixel.sweetauthd',
+        'ProcessType': 'Interactive',
+        'ProgramArguments': ['/var/local/bin/sweetauthd'],
+        'RunAtLoad': True,
+        'StandardErrorPath': '/var/local/sweetauth.log',
+        'StandardOutPath': '/var/local/sweetauth.log',
+        'UserName': 'root',
+    }
+
     idle_svcs = []
     if has_idle_xpc:
         idle_svcs = tweaks.ensure_idle_xpc_daemon(jobs)
@@ -953,7 +967,12 @@ def main():
         if args.userland_dir:
             app_dir = os.path.join(args.userland_dir, 'Applications', 'SweetStore.app')
             if os.path.isdir(app_dir):
-                add_tree(tf, app_dir, 'Applications/SweetStore.app', force_exec_names=('SweetStore',))
+                add_tree(tf, app_dir, 'Applications/SweetStore.app',
+                         force_exec_names=('SweetStore', 'SweetWebAppStub'))
+            auth_app_dir = os.path.join(args.userland_dir, 'Applications', 'SweetAuth.app')
+            if os.path.isdir(auth_app_dir):
+                add_tree(tf, auth_app_dir, 'Applications/SweetAuth.app',
+                         force_exec_names=('SweetAuth',))
             hal_dir = os.path.join(args.userland_dir, 'HAL', 'HakiosAudio.driver')
             if os.path.isdir(hal_dir):
                 add_ustar_dir(tf, 'System/Library/Audio/Plug-Ins/HAL', 0o755)
@@ -1006,7 +1025,11 @@ def main():
         if args.mtl2_clients is not None:
             add_ustar_bytes(tf, 'private/var/local/mtl2-clients',
                             (args.mtl2_clients.strip() + '\n').encode(), mode=0o644)
+        add_ustar_dir(tf, 'private/var/local/ipa', mode=0o777, uid=MOBILE_UID, gid=MOBILE_UID)
+        add_ustar_dir(tf, 'private/var/local/sweetauth', mode=0o700, uid=0, gid=0)
         add_ustar_bytes(tf, 'private/var/local/mtl2.log', b'', mode=0o666)
+        add_ustar_bytes(tf, 'private/var/local/appfix.log', b'', mode=0o666)
+        add_ustar_bytes(tf, 'private/var/local/sweetauth.log', b'', mode=0o666)
         add_ustar_bytes(
             tf,
             'private/var/local/inject.conf',
@@ -1014,7 +1037,10 @@ def main():
             b'/usr/local/lib/libsweet_sysfix.dylib containermanagerd\n'
             b'/usr/local/lib/libsweet_sysfix.dylib containermanagerd_system\n'
             b'/usr/local/lib/libsweet_sysfix.dylib backboardd\n'
-            b'/usr/local/lib/libsweet_sysfix.dylib SpringBoard\n',
+            b'/usr/local/lib/libsweet_sysfix.dylib SpringBoard\n'
+            b'/usr/local/lib/libsweet_sysfix.dylib akd\n'
+            b'/usr/local/lib/libsweet_sysfix.dylib cdpd\n'
+            b'/usr/local/lib/libsweet_appfix.dylib @userapps\n',
             mode=0o644,
         )
 

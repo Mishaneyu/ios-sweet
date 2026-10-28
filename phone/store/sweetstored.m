@@ -1,22 +1,33 @@
 /*
- * sweetstored: Root helper daemon for SweetStore.app (127.0.0.1:29170).
+ * sweetstored v2: Root installer & WebApp packager daemon for SweetStore 2.0 (127.0.0.1:29170).
  *
- * Unpacks decrypted .ipa archives (streaming ZIP32/ZIP64 via zlib), thins
- * universal binaries to arm64, verifies FairPlay cryptid == 0, embeds ad-hoc
- * SHA-256 LC_CODE_SIGNATURE + XML entitlements when missing, installs into
- * /Applications/<App>.app (root:wheel), and rebuilds LaunchServices via
- * /var/local/bin/lsreg -r. Also ensures SweetStore.app itself is registered
- * on first boot.
+ * Capabilities on iOS 26.5.2 (RMX1931 / SWEET):
+ *   1. Unpacks decrypted .ipa archives (streaming ZIP32/ZIP64 via zlib).
+ *   2. Thins universal binaries (accepting both arm64 and arm64e slices) and rewrites
+ *      non-hint ARMv8.3 PAC opcodes in-place on arm64e Mach-Os (excluding LC_DATA_IN_CODE).
+ *   3. Neutralizes __RESTRICT segments (so @userapps libsweet_appfix.dylib always loads)
+ *      and embeds clean 4 KB SHA-256 CodeDirectory + merged XML entitlements with
+ *      CodeDirectory.ident == CFBundleIdentifier.
+ *   4. Provisions isolated /private/var/mobile/Containers/Data/Application/<bundleId> and
+ *      Shared/AppGroup/* directories owned by mobile:mobile (501:501).
+ *   5. Packages 1-tap standalone native UIKit + WKWebView .app bundles (SweetWebAppStub)
+ *      with real App Store icons converted to PNG via ImageIO + CoreGraphics.
+ *   6. Manages per-app SweetMetal2 GPU / CPU mode (/var/local/mtl2-clients) and an optional
+ *      toggleable Wi-Fi LAN .ipa dropzone on port 29172.
  */
 #import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <libkern/OSByteOrder.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -35,13 +46,20 @@
 extern char **environ;
 
 #define SWEETSTORED_PORT        29170
+#define SWEETUPLOAD_PORT        29172
 #define STAGE_ROOT              "/private/var/local/store-stage"
 #define LOCAL_IPA_DIR           "/private/var/local/ipa"
 #define STAGED_SYSTEM_APPS_DIR  "/private/var/staged_system_apps"
 #define APP_PLACEHOLDERS_DIR    "/System/Library/AppPlaceholders"
 #define STAGED_PLACEHOLDERS_DIR "/private/var/local/staged-placeholders"
-#define REG_STAMP_PATH          "/private/var/local/.sweetstore-registered-v2"
+#define REG_STAMP_PATH          "/private/var/local/.sweetstore-registered-v3"
+#define MTL2_CLIENTS_PATH       "/private/var/local/mtl2-clients"
+#define APPFIX_LOG_PATH         "/private/var/local/appfix.log"
 #define MARKER_FILE             ".sweetstore_installed"
+
+#ifndef CPU_SUBTYPE_ARM64E
+#define CPU_SUBTYPE_ARM64E      ((cpu_subtype_t)2)
+#endif
 
 static pthread_mutex_t g_job_lock = PTHREAD_MUTEX_INITIALIZER;
 static BOOL g_busy = NO;
@@ -51,6 +69,9 @@ static NSString *g_step = @"Ready";
 static NSString *g_app_name = @"";
 static NSString *g_bundle_id = @"";
 static NSString *g_error = @"";
+
+static pthread_mutex_t g_lan_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_lan_srv = -1;
 
 static void set_job(NSString *state, double progress, NSString *step, NSString *appName, NSString *bundleId, NSString *err)
 {
@@ -62,6 +83,22 @@ static void set_job(NSString *state, double progress, NSString *step, NSString *
 	if (bundleId) g_bundle_id = [bundleId copy];
 	if (err) g_error = [err copy];
 	pthread_mutex_unlock(&g_job_lock);
+}
+
+static NSString *sanitize_slug(NSString *raw)
+{
+	if (raw.length == 0) return @"app";
+	NSMutableString *out = [NSMutableString stringWithCapacity:raw.length];
+	for (NSUInteger i = 0; i < raw.length; i++) {
+		unichar c = [raw characterAtIndex:i];
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		    (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+			[out appendFormat:@"%C", c];
+		} else {
+			[out appendString:@"_"];
+		}
+	}
+	return out.length > 0 ? out : @"app";
 }
 
 static int run_tool_env(const char *prog, char *const argv[], char *const envp[])
@@ -113,11 +150,11 @@ static int run_lsreg_rebuild(void)
 	return rc_mob == 0 ? 0 : rc_root;
 }
 
-static void chown_chmod_recursive(NSString *rootPath)
+static void chown_chmod_recursive_uid(NSString *rootPath, uid_t uid, gid_t gid)
 {
 	NSFileManager *fm = [NSFileManager defaultManager];
 	NSDirectoryEnumerator *en = [fm enumeratorAtPath:rootPath];
-	chown(rootPath.fileSystemRepresentation, 0, 0);
+	chown(rootPath.fileSystemRepresentation, uid, gid);
 	chmod(rootPath.fileSystemRepresentation, 0755);
 	NSString *rel;
 	while ((rel = [en nextObject]) != nil) {
@@ -125,10 +162,50 @@ static void chown_chmod_recursive(NSString *rootPath)
 		const char *cpath = full.fileSystemRepresentation;
 		struct stat st;
 		if (lstat(cpath, &st) != 0) continue;
-		lchown(cpath, 0, 0);
+		lchown(cpath, uid, gid);
 		if (S_ISLNK(st.st_mode)) continue;
 		if (S_ISDIR(st.st_mode)) {
 			chmod(cpath, 0755);
+		}
+	}
+}
+
+static void chown_chmod_recursive(NSString *rootPath)
+{
+	chown_chmod_recursive_uid(rootPath, 0, 0);
+}
+
+static void provision_app_containers(NSString *bundleId, NSArray *appGroups)
+{
+	NSFileManager *fm = [NSFileManager defaultManager];
+	NSString *cleanBid = sanitize_slug(bundleId);
+	NSString *base = [@"/private/var/mobile/Containers/Data/Application" stringByAppendingPathComponent:cleanBid];
+	NSArray<NSString *> *subs = @[
+		@"",
+		@"Documents",
+		@"Library",
+		@"Library/Preferences",
+		@"Library/Caches",
+		@"Library/Application Support",
+		@"Library/SplashBoard",
+		@"SystemData",
+		@"tmp",
+	];
+	for (NSString *s in subs) {
+		NSString *p = s.length > 0 ? [base stringByAppendingPathComponent:s] : base;
+		[fm createDirectoryAtPath:p withIntermediateDirectories:YES attributes:nil error:nil];
+		chown(p.fileSystemRepresentation, 501, 501);
+		chmod(p.fileSystemRepresentation, 0755);
+	}
+	for (id grp in appGroups) {
+		if (![grp isKindOfClass:[NSString class]] || [(NSString *)grp length] == 0) continue;
+		NSString *cleanGrp = sanitize_slug((NSString *)grp);
+		NSString *gbase = [@"/private/var/mobile/Containers/Shared/AppGroup" stringByAppendingPathComponent:cleanGrp];
+		for (NSString *gs in @[@"", @"Documents", @"Library", @"Library/Preferences", @"Library/Caches"]) {
+			NSString *gp = gs.length > 0 ? [gbase stringByAppendingPathComponent:gs] : gbase;
+			[fm createDirectoryAtPath:gp withIntermediateDirectories:YES attributes:nil error:nil];
+			chown(gp.fileSystemRepresentation, 501, 501);
+			chmod(gp.fileSystemRepresentation, 0755);
 		}
 	}
 }
@@ -218,7 +295,6 @@ static BOOL extract_ipa_zip(NSString *ipaPath, NSString *destDir, double pStart,
 	uint64_t cdSize  = rd32le(tail + eocdPos + 12);
 	uint64_t cdOff   = rd32le(tail + eocdPos + 16);
 
-	/* Check ZIP64 EOCD locator (20 bytes immediately before EOCD) */
 	if (eocdPos >= 20 && rd32le(tail + eocdPos - 20) == 0x07064b50u) {
 		uint64_t z64Off = rd64le(tail + eocdPos - 12);
 		uint8_t z64[56];
@@ -272,7 +348,6 @@ static BOOL extract_ipa_zip(NSString *ipaPath, NSString *destDir, double pStart,
 			break;
 		}
 
-		/* Parse ZIP64 extra field (0x0001) if needed */
 		const uint8_t *extra = cd + pos + 46 + nameLen;
 		size_t ep = 0;
 		while (ep + 4 <= extraLen) {
@@ -428,6 +503,149 @@ static BOOL extract_ipa_zip(NSString *ipaPath, NSString *destDir, double pStart,
 	return ok;
 }
 
+/* ---- Embedded ARMv8.3 PAC -> ARMv8.0 In-Place Rewriter (from tools/de_pac_fast.c) ---- */
+
+static inline uint32_t rewrite_pac_insn(uint32_t insn, int *changed)
+{
+	if ((insn & 0xfffffbffu) == 0xd65f0bffu) {
+		*changed = 1;
+		return 0xd65f03c0u; /* retaa / retab -> ret */
+	}
+	if ((insn & 0xfffff81fu) == 0xd61f081fu ||
+	    (insn & 0xfffff800u) == 0xd71f0800u) {
+		*changed = 1;
+		return 0xd61f0000u | (insn & 0x000003e0u); /* bra* -> br Xn */
+	}
+	if ((insn & 0xfffff81fu) == 0xd63f081fu ||
+	    (insn & 0xfffff800u) == 0xd73f0800u) {
+		*changed = 1;
+		return 0xd63f0000u | (insn & 0x000003e0u); /* blra* -> blr Xn */
+	}
+	if ((insn & 0xffffe000u) == 0xdac10000u ||
+	    (insn & 0xffffe3e0u) == 0xdac123e0u ||
+	    (insn & 0xfffffbe0u) == 0xdac143e0u) {
+		*changed = 1;
+		return 0xd503201fu; /* pacia..autdzb, xpaci, xpacd -> nop */
+	}
+	if ((insn & 0xff200400u) == 0xf8200400u && (insn & 0x00400800u) == 0u) {
+		uint32_t imm9 = (insn >> 12) & 0x1ffu;
+		*changed = 1;
+		return 0xf9400000u | (imm9 << 10) | (insn & 0x000003ffu); /* ldra* (W=0,S=0) -> ldr */
+	}
+	return insn;
+}
+
+typedef struct {
+	uint32_t offset;
+	uint16_t length;
+	uint16_t kind;
+} dice_entry_t;
+
+static int cmp_dice_entry(const void *a, const void *b)
+{
+	uint32_t oa = ((const dice_entry_t *)a)->offset;
+	uint32_t ob = ((const dice_entry_t *)b)->offset;
+	return (oa > ob) - (oa < ob);
+}
+
+static uint64_t depac_macho_fd(int rwFd, const struct mach_header_64 *mhdr, const uint8_t *cmds, uint64_t fileSize)
+{
+	/* Collect LC_DATA_IN_CODE intervals if present */
+	dice_entry_t *dice = NULL;
+	size_t diceCount = 0;
+
+	size_t off = 0;
+	for (uint32_t i = 0; i < mhdr->ncmds && off + sizeof(struct load_command) <= mhdr->sizeofcmds; i++) {
+		const struct load_command *lc = (const struct load_command *)(cmds + off);
+		if (lc->cmdsize < sizeof(struct load_command) || off + lc->cmdsize > mhdr->sizeofcmds) break;
+		if (lc->cmd == LC_DATA_IN_CODE && lc->cmdsize >= sizeof(struct linkedit_data_command)) {
+			const struct linkedit_data_command *dc = (const struct linkedit_data_command *)lc;
+			if (dc->datasize >= sizeof(dice_entry_t) &&
+			    (uint64_t)dc->dataoff + dc->datasize <= fileSize &&
+			    dc->datasize <= (16u << 20)) {
+				dice = (dice_entry_t *)malloc(dc->datasize);
+				if (dice && pread_all(rwFd, dice, dc->datasize, (off_t)dc->dataoff)) {
+					diceCount = dc->datasize / sizeof(dice_entry_t);
+					qsort(dice, diceCount, sizeof(dice_entry_t), cmp_dice_entry);
+				}
+			}
+			break;
+		}
+		off += lc->cmdsize;
+	}
+
+	uint8_t *chunk = (uint8_t *)malloc(65536);
+	if (!chunk) {
+		free(dice);
+		return 0;
+	}
+
+	uint64_t rewritten = 0;
+	off = 0;
+	for (uint32_t i = 0; i < mhdr->ncmds && off + sizeof(struct load_command) <= mhdr->sizeofcmds; i++) {
+		const struct load_command *lc = (const struct load_command *)(cmds + off);
+		if (lc->cmdsize < sizeof(struct load_command) || off + lc->cmdsize > mhdr->sizeofcmds) break;
+		if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+			const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+			const struct section_64 *sects = (const struct section_64 *)(seg + 1);
+			uint32_t maxSects = (lc->cmdsize - (uint32_t)sizeof(*seg)) / (uint32_t)sizeof(*sects);
+			for (uint32_t s = 0; s < seg->nsects && s < maxSects; s++) {
+				uint32_t sflags = sects[s].flags;
+				uint32_t stype = sflags & SECTION_TYPE;
+				if (stype == S_ZEROFILL || stype == S_GB_ZEROFILL || stype == S_THREAD_LOCAL_ZEROFILL) continue;
+				if ((sflags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) == 0) continue;
+				uint64_t sOff = sects[s].offset;
+				uint64_t sLen = sects[s].size & ~3ULL;
+				if (sLen == 0 || sOff + sLen > fileSize) continue;
+
+				size_t dIdx = 0;
+				while (dIdx < diceCount && (uint64_t)dice[dIdx].offset + dice[dIdx].length <= sOff) {
+					dIdx++;
+				}
+
+				uint64_t cur = sOff;
+				uint64_t end = sOff + sLen;
+				while (cur < end) {
+					size_t n = (size_t)MIN((uint64_t)65536, end - cur);
+					n &= ~3u;
+					if (n == 0 || !pread_all(rwFd, chunk, n, (off_t)cur)) break;
+					BOOL dirty = NO;
+					for (size_t p = 0; p < n; p += 4) {
+						uint64_t fpos = cur + p;
+						while (dIdx < diceCount && (uint64_t)dice[dIdx].offset + dice[dIdx].length <= fpos) {
+							dIdx++;
+						}
+						if (dIdx < diceCount && fpos >= dice[dIdx].offset &&
+						    fpos < (uint64_t)dice[dIdx].offset + dice[dIdx].length) {
+							continue;
+						}
+						uint32_t insn = rd32le(chunk + p);
+						uint32_t top = insn >> 28;
+						if (top != 0xd && top != 0xf) continue;
+						int chg = 0;
+						uint32_t out = rewrite_pac_insn(insn, &chg);
+						if (chg) {
+							uint32_t leOut = OSSwapHostToLittleInt32(out);
+							memcpy(chunk + p, &leOut, 4);
+							rewritten++;
+							dirty = YES;
+						}
+					}
+					if (dirty) {
+						(void)pwrite(rwFd, chunk, n, (off_t)cur);
+					}
+					cur += n;
+				}
+			}
+		}
+		off += lc->cmdsize;
+	}
+
+	free(chunk);
+	free(dice);
+	return rewritten;
+}
+
 /* ---- Mach-O thinning, FairPlay cryptid check & ad-hoc SHA-256 signing ---- */
 
 static NSData *build_adhoc_superblob(int fd, uint64_t codeLimit, uint64_t execSegBase, uint64_t execSegLimit,
@@ -460,10 +678,10 @@ static NSData *build_adhoc_superblob(int fd, uint64_t codeLimit, uint64_t execSe
 
 	NSMutableData *cd = [NSMutableData dataWithCapacity:cdLen];
 	uint32_t w32[12];
-	w32[0] = OSSwapHostToBigInt32(0xfade0c02u);                 /* CSMAGIC_CODEDIRECTORY */
+	w32[0] = OSSwapHostToBigInt32(0xfade0c02u);
 	w32[1] = OSSwapHostToBigInt32(cdLen);
-	w32[2] = OSSwapHostToBigInt32(0x00020400u);                 /* version 2.4.0 */
-	w32[3] = OSSwapHostToBigInt32(0x00000002u);                 /* CS_ADHOC */
+	w32[2] = OSSwapHostToBigInt32(0x00020400u);
+	w32[3] = OSSwapHostToBigInt32(0x00000002u); /* CS_ADHOC */
 	w32[4] = OSSwapHostToBigInt32(hashOff);
 	w32[5] = OSSwapHostToBigInt32(identOff);
 	w32[6] = OSSwapHostToBigInt32(nSpecialSlots);
@@ -471,22 +689,22 @@ static NSData *build_adhoc_superblob(int fd, uint64_t codeLimit, uint64_t execSe
 	w32[8] = OSSwapHostToBigInt32(codeLimit <= 0xffffffffULL ? (uint32_t)codeLimit : 0xffffffffu);
 	[cd appendBytes:w32 length:9 * 4];
 
-	uint8_t b4[4] = { 32, 2, 0, (uint8_t)pageShift };           /* SHA-256, 4K pages */
+	uint8_t b4[4] = { 32, 2, 0, (uint8_t)pageShift };
 	[cd appendBytes:b4 length:4];
-	uint32_t zeros4[4] = { 0, 0, 0, 0 };                        /* spare2, scatter, team, spare3 */
+	uint32_t zeros4[4] = { 0, 0, 0, 0 };
 	[cd appendBytes:zeros4 length:16];
 
 	uint64_t q64[4];
 	q64[0] = OSSwapHostToBigInt64(codeLimit > 0xffffffffULL ? codeLimit : 0);
 	q64[1] = OSSwapHostToBigInt64(execSegBase);
 	q64[2] = OSSwapHostToBigInt64(execSegLimit);
-	q64[3] = OSSwapHostToBigInt64(isMainBinary ? 1ULL : 0ULL);  /* CS_EXECSEG_MAIN_BINARY */
+	q64[3] = OSSwapHostToBigInt64(isMainBinary ? 1ULL : 0ULL);
 	[cd appendBytes:q64 length:32];
 
 	[cd appendBytes:identC length:identLen];
 	if (nSpecialSlots > 0) {
-		[cd appendBytes:entHash length:32];                 /* slot -5: entitlements */
-		uint8_t z4[128] = { 0 };                            /* slots -4..-1 */
+		[cd appendBytes:entHash length:32];
+		uint8_t z4[128] = { 0 };
 		[cd appendBytes:z4 length:128];
 	}
 
@@ -521,26 +739,53 @@ static NSData *build_adhoc_superblob(int fd, uint64_t codeLimit, uint64_t execSe
 	return sb;
 }
 
-static NSData *default_app_entitlements(NSString *bundleId)
+static NSData *merged_app_entitlements(NSData *existingXml, NSString *bundleId, NSArray **outGroups)
 {
 	NSString *bid = bundleId.length > 0 ? bundleId : @"org.iosonpixel.app";
-	NSDictionary *dict = @{
-		@"application-identifier": [NSString stringWithFormat:@"0000000000.%@", bid],
-		@"com.apple.developer.team-identifier": @"0000000000",
-		@"get-task-allow": @YES,
-		@"keychain-access-groups": @[
-			[NSString stringWithFormat:@"0000000000.%@", bid],
-			bid,
-			@"*"
-		],
-	};
+	NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+	if (existingXml.length > 0) {
+		id parsed = [NSPropertyListSerialization propertyListWithData:existingXml
+		                                                      options:NSPropertyListMutableContainersAndLeaves
+		                                                       format:NULL
+		                                                        error:nil];
+		if ([parsed isKindOfClass:[NSDictionary class]]) {
+			[dict addEntriesFromDictionary:(NSDictionary *)parsed];
+		}
+	}
+
+	NSArray *groups = [dict[@"com.apple.security.application-groups"] isKindOfClass:[NSArray class]]
+	                ? dict[@"com.apple.security.application-groups"] : @[];
+	if (outGroups) *outGroups = groups;
+
+	dict[@"application-identifier"] = [NSString stringWithFormat:@"0000000000.%@", bid];
+	dict[@"com.apple.developer.team-identifier"] = @"0000000000";
+	dict[@"get-task-allow"] = @YES;
+	dict[@"com.apple.private.security.no-sandbox"] = @YES;
+
+	NSMutableArray *kcGroups = [NSMutableArray array];
+	if ([dict[@"keychain-access-groups"] isKindOfClass:[NSArray class]]) {
+		for (id g in dict[@"keychain-access-groups"]) {
+			if ([g isKindOfClass:[NSString class]] && ![kcGroups containsObject:g]) {
+				[kcGroups addObject:g];
+			}
+		}
+	}
+	for (NSString *extra in @[
+		[NSString stringWithFormat:@"0000000000.%@", bid],
+		bid,
+		@"*"
+	]) {
+		if (![kcGroups containsObject:extra]) [kcGroups addObject:extra];
+	}
+	dict[@"keychain-access-groups"] = kcGroups;
+
 	return [NSPropertyListSerialization dataWithPropertyList:dict
 	                                                  format:NSPropertyListXMLFormat_v1_0
 	                                                 options:0
 	                                                   error:nil];
 }
 
-static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bundleId, NSString **errOut)
+static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bundleId, NSArray **outGroups, NSString **errOut)
 {
 	const char *cpath = filePath.fileSystemRepresentation;
 	struct stat st;
@@ -556,33 +801,49 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 		return YES;
 	}
 
-	/* Thin universal Mach-O (FAT_MAGIC / FAT_CIGAM) to plain arm64 slice */
-	if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
+	/* Thin universal Mach-O (FAT_MAGIC / FAT_MAGIC_64) to arm64 or arm64e slice */
+	if (magic == FAT_MAGIC || magic == FAT_CIGAM || magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64) {
+		BOOL is64 = (magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64);
 		struct fat_header fhdr;
 		if (!pread_all(fd, &fhdr, sizeof(fhdr), 0)) { close(fd); return YES; }
 		uint32_t narch = OSSwapBigToHostInt32(fhdr.nfat_arch);
 		if (narch > 32) { close(fd); return YES; }
-		uint64_t chosenOff = 0, chosenSize = 0;
-		BOOL sawArm64e = NO;
+
+		uint64_t arm64Off = 0, arm64Size = 0;
+		uint64_t arm64eOff = 0, arm64eSize = 0;
 		for (uint32_t i = 0; i < narch; i++) {
-			struct fat_arch fa;
-			if (!pread_all(fd, &fa, sizeof(fa), (off_t)(sizeof(fhdr) + i * sizeof(fa)))) break;
-			cpu_type_t ct = (cpu_type_t)OSSwapBigToHostInt32((uint32_t)fa.cputype);
-			cpu_subtype_t cs = (cpu_subtype_t)(OSSwapBigToHostInt32((uint32_t)fa.cpusubtype) & ~CPU_SUBTYPE_MASK);
+			cpu_type_t ct = 0;
+			cpu_subtype_t cs = 0;
+			uint64_t sOff = 0, sSz = 0;
+			if (!is64) {
+				struct fat_arch fa;
+				if (!pread_all(fd, &fa, sizeof(fa), (off_t)(sizeof(fhdr) + i * sizeof(fa)))) break;
+				ct = (cpu_type_t)OSSwapBigToHostInt32((uint32_t)fa.cputype);
+				cs = (cpu_subtype_t)(OSSwapBigToHostInt32((uint32_t)fa.cpusubtype) & ~CPU_SUBTYPE_MASK);
+				sOff = OSSwapBigToHostInt32(fa.offset);
+				sSz = OSSwapBigToHostInt32(fa.size);
+			} else {
+				struct fat_arch_64 fa64;
+				if (!pread_all(fd, &fa64, sizeof(fa64), (off_t)(sizeof(fhdr) + i * sizeof(fa64)))) break;
+				ct = (cpu_type_t)OSSwapBigToHostInt32((uint32_t)fa64.cputype);
+				cs = (cpu_subtype_t)(OSSwapBigToHostInt32((uint32_t)fa64.cpusubtype) & ~CPU_SUBTYPE_MASK);
+				sOff = OSSwapBigToHostInt64(fa64.offset);
+				sSz = OSSwapBigToHostInt64(fa64.size);
+			}
 			if (ct == CPU_TYPE_ARM64) {
-				if (cs == CPU_SUBTYPE_ARM64_ALL) {
-					chosenOff = OSSwapBigToHostInt32(fa.offset);
-					chosenSize = OSSwapBigToHostInt32(fa.size);
-					break;
-				} else if (cs == 2 /* CPU_SUBTYPE_ARM64E */) {
-					sawArm64e = YES;
+				if (cs == CPU_SUBTYPE_ARM64_ALL && arm64Size == 0) {
+					arm64Off = sOff; arm64Size = sSz;
+				} else if (cs == CPU_SUBTYPE_ARM64E && arm64eSize == 0) {
+					arm64eOff = sOff; arm64eSize = sSz;
 				}
 			}
 		}
+		uint64_t chosenOff = arm64Size > 0 ? arm64Off : arm64eOff;
+		uint64_t chosenSize = arm64Size > 0 ? arm64Size : arm64eSize;
 		if (chosenSize == 0) {
 			close(fd);
-			if (isMainExec && sawArm64e) {
-				if (errOut) *errOut = @"App binary only contains an arm64e (PAC) slice and no arm64 slice.";
+			if (isMainExec) {
+				if (errOut) *errOut = @"Binary has no 64-bit ARM (arm64/arm64e) slice (legacy 32-bit iOS app).";
 				return NO;
 			}
 			return YES;
@@ -602,7 +863,7 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 		close(fd);
 		if (!copyOk || rename(tmpSlice.fileSystemRepresentation, cpath) != 0) {
 			unlink(tmpSlice.fileSystemRepresentation);
-			if (errOut) *errOut = @"Failed thinning universal binary to arm64";
+			if (errOut) *errOut = @"Failed thinning universal binary";
 			return NO;
 		}
 		chown(cpath, 0, 0);
@@ -617,7 +878,6 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 		return YES;
 	}
 
-	/* Ensure executable permission on all Mach-O binaries/dylibs */
 	chown(cpath, 0, 0);
 	chmod(cpath, 0755);
 
@@ -638,6 +898,7 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 	ssize_t linkeditCmdOff = -1, sigCmdOff = -1;
 	uint32_t firstSectOff = 0xffffffffu;
 	uint32_t cryptId = 0;
+	BOOL cmdsModified = NO;
 
 	size_t off = 0;
 	for (uint32_t i = 0; i < mhdr.ncmds && off + sizeof(struct load_command) <= mhdr.sizeofcmds; i++) {
@@ -650,6 +911,10 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 				textFileSize = seg->filesize;
 			} else if (strncmp(seg->segname, "__LINKEDIT", 16) == 0) {
 				linkeditCmdOff = (ssize_t)off;
+			} else if (strncmp(seg->segname, "__RESTRICT", 16) == 0) {
+				memset(seg->segname, 0, 16);
+				memcpy(seg->segname, "__SWEETRST", 10);
+				cmdsModified = YES;
 			}
 			struct section_64 *sects = (struct section_64 *)(seg + 1);
 			uint32_t maxSects = (lc->cmdsize - (uint32_t)sizeof(*seg)) / (uint32_t)sizeof(*sects);
@@ -674,19 +939,18 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 		free(cmds);
 		close(fd);
 		if (errOut) {
-			*errOut = @"Encrypted App Store IPA (FairPlay DRM cryptid=1). Please use a decrypted .ipa (from a repo source, Decrypt.day, or GitHub Releases).";
+			*errOut = @"Encrypted App Store binary (FairPlay cryptid=1). Tap 'Install Web App' in SweetStore Discover or import an unencrypted (cryptid=0) .ipa.";
 		}
 		return NO;
 	}
 
 	BOOL hasValidCD = NO;
 	NSData *existingXmlEnts = nil;
-	uint32_t sigOff = 0, sigSize = 0;
 	if (sigCmdOff >= 0) {
 		struct linkedit_data_command *sc = (struct linkedit_data_command *)(cmds + sigCmdOff);
-		sigOff = sc->dataoff;
-		sigSize = sc->datasize;
-		if (sigSize >= 20 && (uint64_t)sigOff + sigSize <= fileSize) {
+		uint32_t sigOff = sc->dataoff;
+		uint32_t sigSize = sc->datasize;
+		if (sigSize >= 20 && (uint64_t)sigOff + sigSize <= fileSize && sigSize <= (16u << 20)) {
 			uint8_t *sb = (uint8_t *)malloc(sigSize);
 			if (sb && pread_all(fd, sb, sigSize, (off_t)sigOff)) {
 				uint32_t sbMagic = OSSwapBigToHostInt32(*(uint32_t *)sb);
@@ -712,20 +976,34 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 	}
 	close(fd);
 
-	/* If already signed with a valid CodeDirectory and (for main binary) XML entitlements, keep as-is! */
-	if (hasValidCD && (!isMainExec || existingXmlEnts.length > 0)) {
+	int rwFd = open(cpath, O_RDWR);
+	if (rwFd < 0) {
+		free(cmds);
+		return YES;
+	}
+
+	/* De-PAC arm64e slices in-place so ARMv8.3 PAC instructions run trap-free at full speed */
+	uint64_t depacCount = 0;
+	if ((mhdr.cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E) {
+		depacCount = depac_macho_fd(rwFd, &mhdr, cmds, fileSize);
+		if (depacCount > 0) {
+			fprintf(stderr, "sweetstored: de-PAC %s -> %llu instructions rewritten\n",
+			    filePath.lastPathComponent.UTF8String, (unsigned long long)depacCount);
+		}
+	}
+	if (cmdsModified) {
+		(void)pwrite(rwFd, cmds, mhdr.sizeofcmds, sizeof(mhdr));
+	}
+
+	/* Non-main dylibs that already carry a valid CD and were not modified can keep their signature */
+	if (!isMainExec && hasValidCD && depacCount == 0 && !cmdsModified) {
+		close(rwFd);
 		free(cmds);
 		return YES;
 	}
 
 	if (linkeditCmdOff < 0) {
-		free(cmds);
-		return YES;
-	}
-
-	/* Embed ad-hoc SHA-256 signature + XML entitlements */
-	int rwFd = open(cpath, O_RDWR);
-	if (rwFd < 0) {
+		close(rwFd);
 		free(cmds);
 		return YES;
 	}
@@ -739,7 +1017,6 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 		if ((uint64_t)sc->dataoff + sc->datasize == fileSize || sc->datasize == 0 || !hasValidCD) {
 			codeLimit = sc->dataoff;
 		} else {
-			/* Signature is not at EOF; leave existing valid CD untouched */
 			close(rwFd);
 			free(cmds);
 			return YES;
@@ -766,14 +1043,9 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 		return YES;
 	}
 
-	/* Write updated header + preliminary load commands BEFORE hashing page 0!
-	 * Because superblob length depends only on codeLimit,ident,xmlEnts (NOT page contents),
-	 * we can compute exact datasize & __LINKEDIT sizes first, write header+cmds to page 0,
-	 * then hash all pages [0..codeLimit) accurately! */
-	NSData *xmlEnts = existingXmlEnts ?: (isMainExec ? default_app_entitlements(bundleId) : nil);
+	NSData *xmlEnts = isMainExec ? merged_app_entitlements(existingXmlEnts, bundleId, outGroups) : existingXmlEnts;
 	NSString *ident = isMainExec ? bundleId : [filePath.lastPathComponent stringByDeletingPathExtension];
 
-	/* Calculate exact superblob size deterministically */
 	uint32_t nCodeSlots = (uint32_t)((codeLimit + 4095ULL) / 4096ULL);
 	uint32_t nSpecial = xmlEnts.length > 0 ? 5 : 0;
 	const char *identC = ident.length > 0 ? ident.UTF8String : "org.iosonpixel.app";
@@ -813,7 +1085,101 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 	return YES;
 }
 
-/* ---- Install / Uninstall jobs ---- */
+/* ---- Icon PNG Generation & Conversion (ImageIO + CoreGraphics) ---- */
+
+static NSData *encode_cgimage_png_square(CGImageRef srcImg, size_t pxSize)
+{
+	CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+	CGContextRef ctx = CGBitmapContextCreate(NULL, pxSize, pxSize, 8, pxSize * 4, cs,
+	    kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+	CGColorSpaceRelease(cs);
+	if (!ctx) return nil;
+
+	CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+	CGContextDrawImage(ctx, CGRectMake(0, 0, pxSize, pxSize), srcImg);
+	CGImageRef scaled = CGBitmapContextCreateImage(ctx);
+	CGContextRelease(ctx);
+	if (!scaled) return nil;
+
+	NSMutableData *png = [NSMutableData data];
+	CGImageDestinationRef dst = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)png, CFSTR("public.png"), 1, NULL);
+	if (dst) {
+		CGImageDestinationAddImage(dst, scaled, NULL);
+		CGImageDestinationFinalize(dst);
+		CFRelease(dst);
+	}
+	CGImageRelease(scaled);
+	return png.length > 0 ? png : nil;
+}
+
+static NSData *generate_fallback_icon_png(NSString *title, size_t pxSize)
+{
+	CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+	CGContextRef ctx = CGBitmapContextCreate(NULL, pxSize, pxSize, 8, pxSize * 4, cs,
+	    kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+	if (!ctx) { CGColorSpaceRelease(cs); return nil; }
+
+	/* Deterministic vibrant gradient based on title hash */
+	NSUInteger h = title.hash;
+	CGFloat r1 = 0.12 + ((h & 0x3f) / 140.0);
+	CGFloat g1 = 0.35 + (((h >> 6) & 0x3f) / 140.0);
+	CGFloat b1 = 0.72 + (((h >> 12) & 0x1f) / 120.0);
+	CGFloat comps[8] = { r1, g1, b1, 1.0, r1 * 0.55, g1 * 0.65, MIN(1.0, b1 * 1.15), 1.0 };
+	CGGradientRef grad = CGGradientCreateWithColorComponents(cs, comps, NULL, 2);
+	CGContextDrawLinearGradient(ctx, grad, CGPointMake(0, pxSize), CGPointMake(pxSize, 0), 0);
+	CGGradientRelease(grad);
+	CGColorSpaceRelease(cs);
+
+	/* Subtle glass ring */
+	CGContextSetRGBStrokeColor(ctx, 1.0, 1.0, 1.0, 0.38);
+	CGContextSetLineWidth(ctx, pxSize * 0.045);
+	CGContextStrokeEllipseInRect(ctx, CGRectMake(pxSize * 0.22, pxSize * 0.22, pxSize * 0.56, pxSize * 0.56));
+
+	CGImageRef img = CGBitmapContextCreateImage(ctx);
+	CGContextRelease(ctx);
+	if (!img) return nil;
+	NSData *png = encode_cgimage_png_square(img, pxSize);
+	CGImageRelease(img);
+	return png;
+}
+
+static void write_webapp_icons(NSString *appDir, NSString *iconURL, NSString *title)
+{
+	CGImageRef decoded = NULL;
+	if (iconURL.length > 8 && ([iconURL hasPrefix:@"http://"] || [iconURL hasPrefix:@"https://"])) {
+		dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+		__block NSData *rawData = nil;
+		NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+		cfg.timeoutIntervalForRequest = 10.0;
+		cfg.timeoutIntervalForResource = 12.0;
+		NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg];
+		[[sess dataTaskWithURL:[NSURL URLWithString:iconURL]
+		     completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+			(void)resp;
+			if (!err && data.length > 64) rawData = data;
+			dispatch_semaphore_signal(sem);
+		}] resume];
+		dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC));
+		[sess finishTasksAndInvalidate];
+
+		if (rawData) {
+			CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)rawData, NULL);
+			if (src) {
+				decoded = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+				CFRelease(src);
+			}
+		}
+	}
+
+	NSData *png180 = decoded ? encode_cgimage_png_square(decoded, 180) : generate_fallback_icon_png(title, 180);
+	NSData *png120 = decoded ? encode_cgimage_png_square(decoded, 120) : generate_fallback_icon_png(title, 120);
+	if (decoded) CGImageRelease(decoded);
+
+	if (png180) [png180 writeToFile:[appDir stringByAppendingPathComponent:@"AppIcon60x60@3x.png"] atomically:YES];
+	if (png120) [png120 writeToFile:[appDir stringByAppendingPathComponent:@"AppIcon60x60@2x.png"] atomically:YES];
+}
+
+/* ---- Install Native IPA & WebApp Workers ---- */
 
 static void install_ipa_worker(NSString *ipaPath, BOOL deleteAfter, NSString *hintName)
 {
@@ -853,7 +1219,7 @@ static void install_ipa_worker(NSString *ipaPath, BOOL deleteAfter, NSString *hi
 
 		NSString *stagedApp = [payloadDir stringByAppendingPathComponent:appFolder];
 		NSString *infoPath = [stagedApp stringByAppendingPathComponent:@"Info.plist"];
-		NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+		NSMutableDictionary *info = [NSMutableDictionary dictionaryWithContentsOfFile:infoPath];
 		NSString *bundleId = [info[@"CFBundleIdentifier"] isKindOfClass:[NSString class]] ? info[@"CFBundleIdentifier"] : @"";
 		NSString *execName = [info[@"CFBundleExecutable"] isKindOfClass:[NSString class]] ? info[@"CFBundleExecutable"] : @"";
 		NSString *dispName = [info[@"CFBundleDisplayName"] isKindOfClass:[NSString class]] ? info[@"CFBundleDisplayName"] :
@@ -870,7 +1236,15 @@ static void install_ipa_worker(NSString *ipaPath, BOOL deleteAfter, NSString *hi
 			return;
 		}
 
-		set_job(@"signing", 0.62, [NSString stringWithFormat:@"Verifying & signing %@...", dispName], dispName, bundleId, @"");
+		/* Ensure MinimumOSVersion never exceeds 26.5.2 if an exotic beta plist has a weird string */
+		if ([info[@"UIDeviceFamily"] isKindOfClass:[NSArray class]] && ![info[@"UIDeviceFamily"] containsObject:@1]) {
+			NSMutableArray *fam = [info[@"UIDeviceFamily"] mutableCopy];
+			[fam insertObject:@1 atIndex:0];
+			info[@"UIDeviceFamily"] = fam;
+			[info writeToFile:infoPath atomically:YES];
+		}
+
+		set_job(@"signing", 0.62, [NSString stringWithFormat:@"De-PAC & signing %@...", dispName], dispName, bundleId, @"");
 		chown_chmod_recursive(stagedApp);
 
 		NSString *mainExecPath = [stagedApp stringByAppendingPathComponent:execName];
@@ -883,7 +1257,8 @@ static void install_ipa_worker(NSString *ipaPath, BOOL deleteAfter, NSString *hi
 			return;
 		}
 
-		if (!prepare_macho_file(mainExecPath, YES, bundleId, &err)) {
+		NSArray *appGroups = @[];
+		if (!prepare_macho_file(mainExecPath, YES, bundleId, &appGroups, &err)) {
 			[fm removeItemAtPath:stageDir error:nil];
 			if (deleteAfter) [fm removeItemAtPath:ipaPath error:nil];
 			set_job(@"error", 0.0, @"Cannot install binary", dispName, bundleId, err ?: @"Incompatible binary");
@@ -896,7 +1271,7 @@ static void install_ipa_worker(NSString *ipaPath, BOOL deleteAfter, NSString *hi
 		while ((rel = [en nextObject]) != nil) {
 			NSString *full = [stagedApp stringByAppendingPathComponent:rel];
 			if ([full isEqualToString:mainExecPath]) continue;
-			if (!prepare_macho_file(full, NO, bundleId, &err)) {
+			if (!prepare_macho_file(full, NO, bundleId, NULL, &err)) {
 				[fm removeItemAtPath:stageDir error:nil];
 				if (deleteAfter) [fm removeItemAtPath:ipaPath error:nil];
 				set_job(@"error", 0.0, @"Framework verification failed", dispName, bundleId, err ?: @"Encrypted framework");
@@ -905,22 +1280,24 @@ static void install_ipa_worker(NSString *ipaPath, BOOL deleteAfter, NSString *hi
 			}
 		}
 
-		/* Choose safe destination in /Applications without clobbering stock Apple apps */
+		provision_app_containers(bundleId, appGroups);
+
 		NSString *destDirName = appFolder;
 		NSString *destApp = [@"/Applications" stringByAppendingPathComponent:destDirName];
 		if ([fm fileExistsAtPath:destApp] &&
 		    ![fm fileExistsAtPath:[destApp stringByAppendingPathComponent:@MARKER_FILE]] &&
-		    ![bundleId isEqualToString:@"org.iosonpixel.sweetstore"]) {
-			NSString *safeBid = [[bundleId componentsSeparatedByCharactersInSet:
-			    [[NSCharacterSet alphanumericCharacterSet] invertedSet]] componentsJoinedByString:@"_"];
-			destDirName = [NSString stringWithFormat:@"%@.app", safeBid];
+		    ![bundleId isEqualToString:@"org.iosonpixel.sweetstore"] &&
+		    ![bundleId isEqualToString:@"org.iosonpixel.sweetauth"]) {
+			destDirName = [NSString stringWithFormat:@"%@.app", sanitize_slug(bundleId)];
 			destApp = [@"/Applications" stringByAppendingPathComponent:destDirName];
 		}
 
 		NSDictionary *meta = @{
 			@"name": dispName,
 			@"bundleId": bundleId,
+			@"execName": execName,
 			@"version": version,
+			@"kind": @"native",
 			@"dirName": destDirName,
 			@"installedAt": @((long long)[[NSDate date] timeIntervalSince1970]),
 		};
@@ -953,10 +1330,378 @@ static void install_ipa_worker(NSString *ipaPath, BOOL deleteAfter, NSString *hi
 		(void)run_lsreg_rebuild();
 
 		set_job(@"done", 1.0, [NSString stringWithFormat:@"Installed %@ (%@)", dispName, version], dispName, bundleId, @"");
-		fprintf(stderr, "sweetstored: installed %s (%s) -> %s\n",
+		fprintf(stderr, "sweetstored: installed native %s (%s) -> %s\n",
 		    dispName.UTF8String, bundleId.UTF8String, destApp.UTF8String);
 		pthread_mutex_lock(&g_job_lock); g_busy = NO; pthread_mutex_unlock(&g_job_lock);
 	}
+}
+
+static void create_webapp_worker(NSString *dispName, NSString *startURL, NSString *uaMode, NSString *iconURL, NSString *origBid)
+{
+	@autoreleasepool {
+		NSFileManager *fm = [NSFileManager defaultManager];
+		NSString *stubPath = @"/Applications/SweetStore.app/SweetWebAppStub";
+		if (![fm fileExistsAtPath:stubPath]) {
+			stubPath = @"/var/local/bin/SweetWebAppStub";
+		}
+		if (![fm fileExistsAtPath:stubPath]) {
+			set_job(@"error", 0.0, @"WebApp stub missing", dispName, @"", @"SweetWebAppStub binary not found");
+			pthread_mutex_lock(&g_job_lock); g_busy = NO; pthread_mutex_unlock(&g_job_lock);
+			return;
+		}
+
+		NSString *slugBase = origBid.length > 0 ? origBid : dispName;
+		NSString *slug = [sanitize_slug(slugBase) lowercaseString];
+		if (slug.length > 48) slug = [slug substringToIndex:48];
+		NSString *bundleId = [NSString stringWithFormat:@"org.iosonpixel.webapp.%@", slug];
+		NSString *execName = [NSString stringWithFormat:@"SW_%@", slug];
+		NSString *destDirName = [NSString stringWithFormat:@"SW_%@.app", slug];
+		NSString *destApp = [@"/Applications" stringByAppendingPathComponent:destDirName];
+
+		NSString *stageDir = [NSString stringWithFormat:@"%s/web-%llu",
+		    STAGE_ROOT, (unsigned long long)([[NSDate date] timeIntervalSince1970] * 1000.0)];
+		NSString *stagedApp = [stageDir stringByAppendingPathComponent:destDirName];
+		[fm createDirectoryAtPath:stagedApp withIntermediateDirectories:YES attributes:nil error:nil];
+
+		set_job(@"extracting", 0.25, [NSString stringWithFormat:@"Fetching %@ icon & packaging...", dispName], dispName, bundleId, @"");
+		write_webapp_icons(stagedApp, iconURL, dispName);
+
+		NSString *execDst = [stagedApp stringByAppendingPathComponent:execName];
+		if (![fm copyItemAtPath:stubPath toPath:execDst error:nil]) {
+			[fm removeItemAtPath:stageDir error:nil];
+			set_job(@"error", 0.0, @"Failed copying WebApp binary", dispName, bundleId, @"Copy failed");
+			pthread_mutex_lock(&g_job_lock); g_busy = NO; pthread_mutex_unlock(&g_job_lock);
+			return;
+		}
+
+		NSDictionary *info = @{
+			@"CFBundleDevelopmentRegion": @"en",
+			@"CFBundleDisplayName": dispName,
+			@"CFBundleExecutable": execName,
+			@"CFBundleIdentifier": bundleId,
+			@"CFBundleInfoDictionaryVersion": @"6.0",
+			@"CFBundleName": dispName,
+			@"CFBundlePackageType": @"APPL",
+			@"CFBundleShortVersionString": @"1.0",
+			@"CFBundleVersion": @"1",
+			@"LSRequiresIPhoneOS": @YES,
+			@"UIDeviceFamily": @[@1, @2],
+			@"UILaunchScreen": @{},
+			@"UIRequiredDeviceCapabilities": @[@"arm64"],
+			@"UISupportedInterfaceOrientations": @[
+				@"UIInterfaceOrientationPortrait",
+				@"UIInterfaceOrientationLandscapeLeft",
+				@"UIInterfaceOrientationLandscapeRight",
+			],
+			@"CFBundleIcons": @{
+				@"CFBundlePrimaryIcon": @{
+					@"CFBundleIconFiles": @[@"AppIcon60x60"],
+					@"UIPrerenderedIcon": @NO,
+				},
+			},
+			@"NSAppTransportSecurity": @{ @"NSAllowsArbitraryLoads": @YES },
+			@"SWStartURL": startURL,
+			@"SWUserAgentMode": ([uaMode.lowercaseString isEqualToString:@"desktop"] ? @"desktop" : @"mobile"),
+		};
+		[info writeToFile:[stagedApp stringByAppendingPathComponent:@"Info.plist"] atomically:YES];
+
+		set_job(@"signing", 0.65, [NSString stringWithFormat:@"Signing %@...", dispName], dispName, bundleId, @"");
+		chown_chmod_recursive(stagedApp);
+		NSString *err = nil;
+		if (!prepare_macho_file(execDst, YES, bundleId, NULL, &err)) {
+			[fm removeItemAtPath:stageDir error:nil];
+			set_job(@"error", 0.0, @"Signing failed", dispName, bundleId, err ?: @"Sign error");
+			pthread_mutex_lock(&g_job_lock); g_busy = NO; pthread_mutex_unlock(&g_job_lock);
+			return;
+		}
+
+		provision_app_containers(bundleId, @[]);
+
+		NSDictionary *meta = @{
+			@"name": dispName,
+			@"bundleId": bundleId,
+			@"origBundleId": origBid ?: @"",
+			@"execName": execName,
+			@"version": @"WebApp",
+			@"kind": @"webapp",
+			@"startURL": startURL,
+			@"dirName": destDirName,
+			@"installedAt": @((long long)[[NSDate date] timeIntervalSince1970]),
+		};
+		NSString *markerPath = [stagedApp stringByAppendingPathComponent:@MARKER_FILE];
+		[meta writeToFile:markerPath atomically:YES];
+		chown(markerPath.fileSystemRepresentation, 0, 0);
+		chmod(markerPath.fileSystemRepresentation, 0644);
+
+		[fm removeItemAtPath:destApp error:nil];
+		if (![fm moveItemAtPath:stagedApp toPath:destApp error:nil]) {
+			[fm removeItemAtPath:stageDir error:nil];
+			set_job(@"error", 0.0, @"Move to /Applications failed", dispName, bundleId, @"Move error");
+			pthread_mutex_lock(&g_job_lock); g_busy = NO; pthread_mutex_unlock(&g_job_lock);
+			return;
+		}
+		[fm removeItemAtPath:stageDir error:nil];
+
+		set_job(@"installing", 0.90, @"Adding icon to Home Screen...", dispName, bundleId, @"");
+		(void)run_lsreg_mobile_args(@[destApp]);
+		(void)run_lsreg_rebuild();
+
+		set_job(@"done", 1.0, [NSString stringWithFormat:@"Installed %@ Web App", dispName], dispName, bundleId, @"");
+		fprintf(stderr, "sweetstored: installed webapp %s (%s -> %s) at %s\n",
+		    dispName.UTF8String, bundleId.UTF8String, startURL.UTF8String, destApp.UTF8String);
+		pthread_mutex_lock(&g_job_lock); g_busy = NO; pthread_mutex_unlock(&g_job_lock);
+	}
+}
+
+/* ---- GPU Mode (/var/local/mtl2-clients) & Wi-Fi IP Helpers ---- */
+
+static NSSet<NSString *> *read_mtl2_disabled_set(void)
+{
+	NSString *txt = [NSString stringWithContentsOfFile:@MTL2_CLIENTS_PATH encoding:NSUTF8StringEncoding error:nil];
+	NSMutableSet<NSString *> *set = [NSMutableSet set];
+	for (NSString *tok in [txt componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]) {
+		if (tok.length > 1 && [tok hasPrefix:@"-"]) {
+			[set addObject:[tok substringFromIndex:1]];
+		}
+	}
+	return set;
+}
+
+static BOOL set_app_gpu_enabled(NSString *execName, BOOL enabled)
+{
+	if (execName.length == 0) return NO;
+	NSString *txt = [NSString stringWithContentsOfFile:@MTL2_CLIENTS_PATH encoding:NSUTF8StringEncoding error:nil] ?: @"*\n";
+	NSMutableArray<NSString *> *lines = [NSMutableArray array];
+	NSString *negToken = [@"-" stringByAppendingString:execName];
+	BOOL sawStar = NO;
+	for (NSString *raw in [txt componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+		NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+		if (t.length == 0) continue;
+		if ([t isEqualToString:@"*"]) sawStar = YES;
+		if ([t isEqualToString:negToken]) continue;
+		[lines addObject:t];
+	}
+	if (!sawStar) [lines insertObject:@"*" atIndex:0];
+	if (!enabled) [lines addObject:negToken];
+	NSString *out = [[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+	return [out writeToFile:@MTL2_CLIENTS_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static NSString *current_wifi_ipv4(void)
+{
+	struct ifaddrs *ifaddr = NULL;
+	if (getifaddrs(&ifaddr) != 0) return nil;
+	NSString *best = nil;
+	for (struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+		if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+		if ((ifa->ifa_flags & IFF_UP) == 0 || (ifa->ifa_flags & IFF_LOOPBACK) != 0) continue;
+		char ip[INET_ADDRSTRLEN] = {0};
+		struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+		if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip))) continue;
+		NSString *ipStr = [NSString stringWithUTF8String:ip];
+		if (strcmp(ifa->ifa_name, "en0") == 0) {
+			best = ipStr;
+			break;
+		}
+		if (!best) best = ipStr;
+	}
+	freeifaddrs(ifaddr);
+	return best;
+}
+
+/* ---- Toggleable Wi-Fi LAN .ipa Dropzone (Port 29172) ---- */
+
+static void handle_lan_upload_client(int cfd)
+{
+	@autoreleasepool {
+		int one = 1;
+		setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+		struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+		setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+		NSMutableData *hdrBuf = [NSMutableData dataWithCapacity:4096];
+		uint8_t tmp[4096];
+		ssize_t hdrEnd = -1;
+		uint64_t contentLen = 0;
+
+		while (hdrBuf.length < 32768) {
+			ssize_t n = recv(cfd, tmp, sizeof(tmp), 0);
+			if (n <= 0) break;
+			[hdrBuf appendBytes:tmp length:(NSUInteger)n];
+			const char *b = (const char *)hdrBuf.bytes;
+			for (size_t i = 0; i + 3 < hdrBuf.length; i++) {
+				if (b[i] == '\r' && b[i+1] == '\n' && b[i+2] == '\r' && b[i+3] == '\n') {
+					hdrEnd = (ssize_t)(i + 4);
+					NSString *hs = [[NSString alloc] initWithBytes:b length:i encoding:NSISOLatin1StringEncoding];
+					for (NSString *line in [hs componentsSeparatedByString:@"\r\n"]) {
+						if ([line.lowercaseString hasPrefix:@"content-length:"]) {
+							contentLen = (uint64_t)[[line substringFromIndex:15] longLongValue];
+						}
+					}
+					break;
+				}
+			}
+			if (hdrEnd >= 0) break;
+		}
+		if (hdrEnd < 0) { close(cfd); return; }
+
+		NSString *firstLine = [[[NSString alloc] initWithBytes:hdrBuf.bytes length:(NSUInteger)(hdrEnd - 4)
+		                                              encoding:NSISOLatin1StringEncoding]
+		                       componentsSeparatedByString:@"\r\n"].firstObject ?: @"";
+		NSArray<NSString *> *parts = [firstLine componentsSeparatedByString:@" "];
+		NSString *method = parts.count > 0 ? parts[0] : @"";
+		NSString *uri    = parts.count > 1 ? parts[1] : @"";
+
+		if ([method isEqualToString:@"GET"]) {
+			static const char *html =
+				"<!doctype html><html><head><meta charset='utf-8'>"
+				"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+				"<title>SweetStore Wi-Fi IPA Dropzone</title>"
+				"<style>body{font-family:-apple-system,sans-serif;background:#0f1117;color:#f5f7ff;margin:0;padding:32px;text-align:center}"
+				".card{max-width:520px;margin:24px auto;background:#1a1e29;border:2px dashed #3b82f6;border-radius:20px;padding:36px 24px}"
+				"h1{font-size:22px;margin:0 0 8px}p{color:#9ca3af;font-size:14px;line-height:1.5}"
+				"input[type=file]{margin:18px 0;color:#e5e7eb}#st{margin-top:16px;font-weight:600;color:#60a5fa}"
+				"progress{width:100%;height:14px;display:none;margin-top:12px}</style></head><body>"
+				"<div class='card'><h1>SweetStore 2.0 Wi-Fi Uploader</h1>"
+				"<p>Select or drop any unencrypted <code>.ipa</code> (<code>cryptid=0</code>) to stream &amp; install directly onto iOS 26.5.2.</p>"
+				"<input type='file' id='f' accept='.ipa'><progress id='p' max='100' value='0'></progress><div id='st'>Ready</div></div>"
+				"<script>const f=document.getElementById('f'),p=document.getElementById('p'),st=document.getElementById('st');"
+				"f.onchange=()=>{const file=f.files[0];if(!file)return;p.style.display='block';st.textContent='Uploading '+file.name+'...';"
+				"const x=new XMLHttpRequest();x.open('POST','/upload?name='+encodeURIComponent(file.name));"
+				"x.upload.onprogress=e=>{if(e.lengthComputable)p.value=Math.round(e.loaded*100/e.total);};"
+				"x.onload=()=>{st.textContent=x.status===200?'Uploaded! Installing on iPhone now — check SweetStore.':'Error: '+x.responseText;};"
+				"x.onerror=()=>{st.textContent='Upload network error';};x.send(file);};</script></body></html>";
+			size_t hlen = strlen(html);
+			char hdr[256];
+			int n = snprintf(hdr, sizeof(hdr),
+			    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
+			    (unsigned long)hlen);
+			(void)write_all(cfd, hdr, (size_t)n);
+			(void)write_all(cfd, html, hlen);
+			close(cfd);
+			return;
+		}
+
+		if ([method isEqualToString:@"POST"] && [uri hasPrefix:@"/upload"] && contentLen > 64 && contentLen <= (4ULL << 30)) {
+			NSString *rawName = @"Uploaded.ipa";
+			NSRange q = [uri rangeOfString:@"name="];
+			if (q.location != NSNotFound) {
+				NSString *enc = [uri substringFromIndex:q.location + 5];
+				rawName = [enc stringByRemovingPercentEncoding] ?: @"Uploaded.ipa";
+			}
+			NSString *cleanName = sanitize_slug([rawName.lastPathComponent stringByDeletingPathExtension]);
+			NSString *dstPath = [NSString stringWithFormat:@"%s/%@.ipa", LOCAL_IPA_DIR, cleanName];
+			int outFd = open(dstPath.fileSystemRepresentation, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+			if (outFd < 0) {
+				const char *msg = "Cannot open destination file";
+				char hdr[160];
+				int n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 500 Error\r\nContent-Length: %lu\r\n\r\n%s", strlen(msg), msg);
+				(void)write_all(cfd, hdr, (size_t)n);
+				close(cfd);
+				return;
+			}
+			uint64_t written = 0;
+			size_t already = hdrBuf.length - (size_t)hdrEnd;
+			if (already > 0) {
+				size_t take = (size_t)MIN((uint64_t)already, contentLen);
+				(void)write_all(outFd, (const uint8_t *)hdrBuf.bytes + hdrEnd, take);
+				written += take;
+			}
+			uint8_t *ioBuf = (uint8_t *)malloc(65536);
+			while (ioBuf && written < contentLen) {
+				size_t want = (size_t)MIN((uint64_t)65536, contentLen - written);
+				ssize_t got = recv(cfd, ioBuf, want, 0);
+				if (got <= 0) break;
+				if (!write_all(outFd, ioBuf, (size_t)got)) break;
+				written += (uint64_t)got;
+			}
+			free(ioBuf);
+			close(outFd);
+
+			if (written == contentLen) {
+				pthread_mutex_lock(&g_job_lock);
+				if (!g_busy) {
+					g_busy = YES;
+					pthread_mutex_unlock(&g_job_lock);
+					set_job(@"extracting", 0.05, @"Installing Wi-Fi uploaded IPA...", cleanName, @"", @"");
+					dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+						install_ipa_worker(dstPath, NO, cleanName);
+					});
+				} else {
+					pthread_mutex_unlock(&g_job_lock);
+				}
+				const char *okMsg = "OK";
+				char hdr[128];
+				int n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n%s", okMsg);
+				(void)write_all(cfd, hdr, (size_t)n);
+			} else {
+				unlink(dstPath.fileSystemRepresentation);
+				const char *errMsg = "Incomplete upload";
+				char hdr[160];
+				int n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 400 Bad Request\r\nContent-Length: %lu\r\n\r\n%s", strlen(errMsg), errMsg);
+				(void)write_all(cfd, hdr, (size_t)n);
+			}
+			close(cfd);
+			return;
+		}
+
+		close(cfd);
+	}
+}
+
+static BOOL set_lan_upload_enabled(BOOL enable)
+{
+	pthread_mutex_lock(&g_lan_lock);
+	if (!enable) {
+		if (g_lan_srv >= 0) {
+			close(g_lan_srv);
+			g_lan_srv = -1;
+		}
+		pthread_mutex_unlock(&g_lan_lock);
+		return YES;
+	}
+	if (g_lan_srv >= 0) {
+		pthread_mutex_unlock(&g_lan_lock);
+		return YES;
+	}
+	int srv = socket(AF_INET, SOCK_STREAM, 0);
+	if (srv < 0) {
+		pthread_mutex_unlock(&g_lan_lock);
+		return NO;
+	}
+	int one = 1;
+	setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_len = sizeof(addr);
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(SWEETUPLOAD_PORT);
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(srv, 8) != 0) {
+		close(srv);
+		pthread_mutex_unlock(&g_lan_lock);
+		return NO;
+	}
+	g_lan_srv = srv;
+	pthread_mutex_unlock(&g_lan_lock);
+
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		for (;;) {
+			pthread_mutex_lock(&g_lan_lock);
+			int s = g_lan_srv;
+			pthread_mutex_unlock(&g_lan_lock);
+			if (s < 0) break;
+			int cfd = accept(s, NULL, NULL);
+			if (cfd < 0) {
+				if (errno == EINTR) continue;
+				break;
+			}
+			dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+				handle_lan_upload_client(cfd);
+			});
+		}
+	});
+	return YES;
 }
 
 /* ---- Scans & HTTP API ---- */
@@ -965,6 +1710,7 @@ static NSArray *scan_installed_apps(void)
 {
 	NSFileManager *fm = [NSFileManager defaultManager];
 	NSArray<NSString *> *apps = [fm contentsOfDirectoryAtPath:@"/Applications" error:nil];
+	NSSet<NSString *> *gpuDisabled = read_mtl2_disabled_set();
 	NSMutableArray *list = [NSMutableArray array];
 	for (NSString *dir in apps) {
 		if (![dir.pathExtension.lowercaseString isEqualToString:@"app"]) continue;
@@ -973,10 +1719,23 @@ static NSArray *scan_installed_apps(void)
 		if (![fm fileExistsAtPath:marker]) continue;
 		NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:marker];
 		if (!meta) continue;
+		NSString *execName = meta[@"execName"] ?: @"";
+		if (execName.length == 0) {
+			NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[full stringByAppendingPathComponent:@"Info.plist"]];
+			if ([info[@"CFBundleExecutable"] isKindOfClass:[NSString class]]) {
+				execName = info[@"CFBundleExecutable"];
+			}
+		}
+		BOOL gpuOn = (execName.length == 0) ? YES : ![gpuDisabled containsObject:execName];
 		[list addObject:@{
 			@"name": meta[@"name"] ?: [dir stringByDeletingPathExtension],
 			@"bundleId": meta[@"bundleId"] ?: @"",
+			@"origBundleId": meta[@"origBundleId"] ?: @"",
+			@"execName": execName ?: @"",
 			@"version": meta[@"version"] ?: @"1.0",
+			@"kind": meta[@"kind"] ?: @"native",
+			@"startURL": meta[@"startURL"] ?: @"",
+			@"gpuEnabled": @(gpuOn),
 			@"dirName": dir,
 			@"path": full,
 		}];
@@ -1032,10 +1791,22 @@ static NSDictionary *build_status_dict(void)
 		@"error": g_error ?: @"",
 	};
 	pthread_mutex_unlock(&g_job_lock);
+
+	pthread_mutex_lock(&g_lan_lock);
+	BOOL lanOn = (g_lan_srv >= 0);
+	pthread_mutex_unlock(&g_lan_lock);
+	NSString *wifiIP = current_wifi_ipv4();
+	NSString *lanURL = (lanOn && wifiIP.length > 0)
+	                 ? [NSString stringWithFormat:@"http://%@:%d", wifiIP, SWEETUPLOAD_PORT]
+	                 : @"";
+
 	return @{
 		@"ok": @YES,
 		@"busy": @(busy),
 		@"job": job,
+		@"lanEnabled": @(lanOn),
+		@"lanURL": lanURL,
+		@"wifiIP": wifiIP ?: @"",
 		@"installed": scan_installed_apps(),
 		@"localIpas": scan_local_ipas(),
 	};
@@ -1112,6 +1883,29 @@ static void handle_client(int cfd)
 			return;
 		}
 
+		if ([method isEqualToString:@"GET"] && [path hasPrefix:@"/appfix-log"]) {
+			NSData *d = [NSData dataWithContentsOfFile:@APPFIX_LOG_PATH];
+			NSString *logStr = @"";
+			if (d.length > 0) {
+				NSUInteger maxLen = 16384;
+				NSData *tail = d.length > maxLen ? [d subdataWithRange:NSMakeRange(d.length - maxLen, maxLen)] : d;
+				logStr = [[NSString alloc] initWithData:tail encoding:NSUTF8StringEncoding]
+				      ?: [[NSString alloc] initWithData:tail encoding:NSISOLatin1StringEncoding]
+				      ?: @"";
+			}
+			send_json(cfd, 200, @{ @"ok": @YES, @"log": logStr });
+			close(cfd);
+			return;
+		}
+
+		if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/clear-appfix-log"]) {
+			[@"" writeToFile:@APPFIX_LOG_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
+			chmod(APPFIX_LOG_PATH, 0666);
+			send_json(cfd, 200, @{ @"ok": @YES });
+			close(cfd);
+			return;
+		}
+
 		if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/install-file"]) {
 			NSString *ipaPath = [json[@"path"] isKindOfClass:[NSString class]] ? json[@"path"] : @"";
 			BOOL delAfter = [json[@"deleteAfter"] respondsToSelector:@selector(boolValue)] ? [json[@"deleteAfter"] boolValue] : NO;
@@ -1139,8 +1933,55 @@ static void handle_client(int cfd)
 			return;
 		}
 
+		if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/create-webapp"]) {
+			NSString *name = [json[@"name"] isKindOfClass:[NSString class]] ? json[@"name"] : @"";
+			NSString *url  = [json[@"url"] isKindOfClass:[NSString class]] ? json[@"url"] : @"";
+			NSString *ua   = [json[@"userAgent"] isKindOfClass:[NSString class]] ? json[@"userAgent"] : @"mobile";
+			NSString *icon = [json[@"iconURL"] isKindOfClass:[NSString class]] ? json[@"iconURL"] : @"";
+			NSString *obid = [json[@"origBundleId"] isKindOfClass:[NSString class]] ? json[@"origBundleId"] : @"";
+			if (name.length == 0 || url.length < 8 || (![url hasPrefix:@"http://"] && ![url hasPrefix:@"https://"])) {
+				send_json(cfd, 400, @{ @"ok": @NO, @"error": @"Valid app name and http(s) URL required" });
+				close(cfd);
+				return;
+			}
+			pthread_mutex_lock(&g_job_lock);
+			if (g_busy) {
+				pthread_mutex_unlock(&g_job_lock);
+				send_json(cfd, 409, @{ @"ok": @NO, @"error": @"Another installation is already in progress" });
+				close(cfd);
+				return;
+			}
+			g_busy = YES;
+			pthread_mutex_unlock(&g_job_lock);
+			set_job(@"extracting", 0.10, [NSString stringWithFormat:@"Creating %@ Web App...", name], name, @"", @"");
+			dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+				create_webapp_worker(name, url, ua, icon, obid);
+			});
+			send_json(cfd, 200, @{ @"ok": @YES });
+			close(cfd);
+			return;
+		}
+
+		if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/gpu-mode"]) {
+			NSString *execName = [json[@"execName"] isKindOfClass:[NSString class]] ? json[@"execName"] : @"";
+			BOOL en = [json[@"gpuEnabled"] respondsToSelector:@selector(boolValue)] ? [json[@"gpuEnabled"] boolValue] : YES;
+			BOOL ok = set_app_gpu_enabled(execName, en);
+			send_json(cfd, ok ? 200 : 400, @{ @"ok": @(ok), @"installed": scan_installed_apps() });
+			close(cfd);
+			return;
+		}
+
+		if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/lan-upload"]) {
+			BOOL en = [json[@"enabled"] respondsToSelector:@selector(boolValue)] ? [json[@"enabled"] boolValue] : NO;
+			BOOL ok = set_lan_upload_enabled(en);
+			send_json(cfd, ok ? 200 : 400, build_status_dict());
+			close(cfd);
+			return;
+		}
+
 		if ([method isEqualToString:@"POST"] && [path isEqualToString:@"/uninstall"]) {
 			NSString *dirName = [json[@"dirName"] isKindOfClass:[NSString class]] ? json[@"dirName"] : @"";
+			BOOL delData = [json[@"deleteData"] respondsToSelector:@selector(boolValue)] ? [json[@"deleteData"] boolValue] : NO;
 			if (dirName.length == 0 || [dirName containsString:@"/"] || [dirName containsString:@".."]) {
 				send_json(cfd, 400, @{ @"ok": @NO, @"error": @"Invalid bundle directory" });
 				close(cfd);
@@ -1154,7 +1995,13 @@ static void handle_client(int cfd)
 				close(cfd);
 				return;
 			}
+			NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:marker];
+			NSString *bid = [meta[@"bundleId"] isKindOfClass:[NSString class]] ? meta[@"bundleId"] : @"";
 			[fm removeItemAtPath:appPath error:nil];
+			if (delData && bid.length > 0) {
+				NSString *dataDir = [@"/private/var/mobile/Containers/Data/Application" stringByAppendingPathComponent:sanitize_slug(bid)];
+				[fm removeItemAtPath:dataDir error:nil];
+			}
 			(void)run_lsreg_rebuild();
 			send_json(cfd, 200, @{ @"ok": @YES, @"installed": scan_installed_apps() });
 			close(cfd);
@@ -1229,20 +2076,18 @@ static void ensure_first_boot_registration(int moved)
 		NSFileManager *fm = [NSFileManager defaultManager];
 		NSArray<NSString *> *promoted = [fm contentsOfDirectoryAtPath:@STAGED_PLACEHOLDERS_DIR error:nil];
 		struct stat st;
-		long long sw_sz = 0;
-		if (stat("/Applications/SweetStore.app/SweetStore", &st) == 0) {
-			sw_sz = (long long)st.st_size;
-		}
-		/* Omit mtime: boot overlay extraction refreshes SweetStore mtime on every boot */
-		NSString *want = [NSString stringWithFormat:@"v2:%lld:%lu\n",
-		    sw_sz, (unsigned long)promoted.count];
+		long long sw_sz = 0, sa_sz = 0;
+		if (stat("/Applications/SweetStore.app/SweetStore", &st) == 0) sw_sz = (long long)st.st_size;
+		if (stat("/Applications/SweetAuth.app/SweetAuth", &st) == 0) sa_sz = (long long)st.st_size;
+
+		NSString *want = [NSString stringWithFormat:@"v3:%lld:%lld:%lu\n",
+		    sw_sz, sa_sz, (unsigned long)promoted.count];
 		NSString *have = [NSString stringWithContentsOfFile:@REG_STAMP_PATH encoding:NSUTF8StringEncoding error:nil];
 		if (moved == 0 && [have isEqualToString:want]) return;
 
 		NSMutableArray<NSString *> *toReg = [NSMutableArray array];
-		if (sw_sz > 0) {
-			[toReg addObject:@"/Applications/SweetStore.app"];
-		}
+		if (sw_sz > 0) [toReg addObject:@"/Applications/SweetStore.app"];
+		if (sa_sz > 0) [toReg addObject:@"/Applications/SweetAuth.app"];
 		for (NSString *item in promoted) {
 			if (![item.pathExtension.lowercaseString isEqualToString:@"app"]) continue;
 			NSString *appPath = [@"/Applications" stringByAppendingPathComponent:item];
@@ -1251,7 +2096,6 @@ static void ensure_first_boot_registration(int moved)
 			}
 		}
 
-		/* Let SpringBoard reach Lock Screen first; only rebuild full LSDB when placeholders were newly displaced */
 		for (int attempt = 0; attempt < 5; attempt++) {
 			sleep(attempt == 0 ? 15 : 6);
 			int rc_reg = toReg.count > 0 ? run_lsreg_mobile_args(toReg) : 0;
@@ -1306,7 +2150,7 @@ int main(int argc, char **argv)
 			close(srv);
 			return 1;
 		}
-		fprintf(stderr, "sweetstored: listening on 127.0.0.1:%d\n", SWEETSTORED_PORT);
+		fprintf(stderr, "sweetstored v2: listening on 127.0.0.1:%d\n", SWEETSTORED_PORT);
 
 		for (;;) {
 			int cfd = accept(srv, NULL, NULL);

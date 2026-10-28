@@ -9,19 +9,36 @@ CC="$ROOT/work/userland/bin/ios-cc"
 rm -rf out
 mkdir -p out/SweetStore.app
 
-# 1. Root installer daemon (127.0.0.1:29170)
+# 1. Root installer & WebApp packager daemon (127.0.0.1:29170 + optional LAN :29172)
 "$CC" -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
-	-framework Foundation -lz \
+	-framework Foundation -framework CoreGraphics -framework ImageIO -lz \
 	-o out/sweetstored sweetstored.m
 strip -x out/sweetstored
 codesign -f -s - --entitlements sweetstored-ents.plist out/sweetstored
 
-# 2. Native UIKit Store & IPA Installer app
+# 2. Native UIKit Store, App Store Search & IPA Installer app
 "$CC" -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
 	-framework UIKit -framework QuartzCore -framework Foundation \
 	-framework CoreGraphics -framework UniformTypeIdentifiers \
 	-o out/SweetStore.app/SweetStore SweetStore.m
 strip -x out/SweetStore.app/SweetStore
+
+# 2b. Standalone UIKit + WKWebView app stub packaged by sweetstored (/create-webapp)
+"$CC" -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
+	-framework UIKit -framework QuartzCore -framework WebKit -framework Foundation \
+	-o out/SweetStore.app/SweetWebAppStub SweetWebApp.m
+strip -x out/SweetStore.app/SweetWebAppStub
+codesign -f -s - out/SweetStore.app/SweetWebAppStub
+
+# 2c. Per-app iOS 26 container, Keychain & StoreKit/APNs compatibility dylib (@userapps)
+# Built WITHOUT -fobjc-arc (MRC) so swizzled initWithSuiteName: preserves +1 retain semantics.
+"$CC" -O2 -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -dynamiclib \
+	-install_name /usr/local/lib/libsweet_appfix.dylib \
+	-framework Foundation -framework CoreFoundation -framework Security -lobjc \
+	-Wl,-dead_strip -o out/libsweet_appfix.dylib inject_appfix.m
+strip -x out/libsweet_appfix.dylib
+codesign -f -s - out/libsweet_appfix.dylib 2>/dev/null
+
 cp Info.plist out/SweetStore.app/Info.plist
 
 # 3. Generate crisp PNG app icons (pure Python stdlib, zero external deps)
@@ -103,4 +120,14 @@ write_icon("out/SweetStore.app/AppIcon60x60@3x.png", 180)
 PY
 
 codesign -f -s - --entitlements SweetStore-ents.plist out/SweetStore.app
+
+for bin in out/sweetstored out/SweetStore.app/SweetStore out/SweetStore.app/SweetWebAppStub out/libsweet_appfix.dylib; do
+	WEAK=$(nm -m "$bin" | grep "weak external" | grep -v "dynamically looked up" || true)
+	if [ -n "$WEAK" ]; then
+		echo "ERROR: unexpected weak external symbols in $bin:" >&2
+		echo "$WEAK" >&2
+		exit 1
+	fi
+done
+
 ls -la out out/SweetStore.app

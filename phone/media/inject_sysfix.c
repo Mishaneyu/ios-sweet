@@ -42,9 +42,12 @@
  *       background, preventing 10 s scene-update watchdog terminations.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <arpa/inet.h>
 #include <dirent.h>
+#include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <netinet/in.h>
 #include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -56,8 +59,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static void
@@ -829,6 +834,497 @@ bb_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 	}
 }
 
+/* ---- akd & cdpd (iOS 26+): SweetAuth non-SEP Apple ID & iCloud compatibility ---- */
+
+extern void *objc_autoreleasePoolPush(void);
+extern void objc_autoreleasePoolPop(void *pool);
+
+static void auth_logf(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void
+auth_logf(const char *format, ...)
+{
+	struct stat st;
+	char msg[512];
+	char line[640];
+	va_list ap;
+	int fd, n;
+
+	va_start(ap, format);
+	(void)vsnprintf(msg, sizeof(msg), format, ap);
+	va_end(ap);
+
+	n = snprintf(line, sizeof(line), "%s[%d]: %s\n",
+	    getprogname() != NULL ? getprogname() : "?", (int)getpid(), msg);
+	if (n <= 0) {
+		return;
+	}
+	if (n > (int)sizeof(line) - 1) {
+		n = (int)sizeof(line) - 1;
+	}
+	fd = open("/private/var/local/sweetauth.log",
+	    O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+	if (fd >= 0) {
+		if (fstat(fd, &st) == 0 && st.st_size > 65536) {
+			(void)ftruncate(fd, 0);
+		}
+		(void)write(fd, line, (size_t)n);
+		(void)close(fd);
+	}
+}
+
+static BOOL
+ak_return_no(__unused id self, __unused SEL selector)
+{
+	return NO;
+}
+
+static void
+hook_bool_method_no(Class cls, const char *cls_name, const char *sel_name)
+{
+	SEL sel;
+	Method m;
+	const char *enc;
+
+	if (cls == NULL) {
+		return;
+	}
+	sel = sel_registerName(sel_name);
+	m = class_getInstanceMethod(cls, sel);
+	if (m != NULL && method_getNumberOfArguments(m) == 2) {
+		enc = method_getTypeEncoding(m);
+		if (enc != NULL && (enc[0] == 'B' || enc[0] == 'c')) {
+			(void)method_setImplementation(m, (IMP)ak_return_no);
+			auth_logf("hooked -[%s %s] -> NO", cls_name, sel_name);
+		}
+	}
+	m = class_getClassMethod(cls, sel);
+	if (m != NULL && method_getNumberOfArguments(m) == 2) {
+		enc = method_getTypeEncoding(m);
+		if (enc != NULL && (enc[0] == 'B' || enc[0] == 'c')) {
+			(void)method_setImplementation(m, (IMP)ak_return_no);
+			auth_logf("hooked +[%s %s] -> NO", cls_name, sel_name);
+		}
+	}
+}
+
+static bool
+json_extract_string(const char *json, const char *key, char *out, size_t cap)
+{
+	char pat[64];
+	const char *p;
+	size_t o = 0;
+
+	if (json == NULL || out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	(void)snprintf(pat, sizeof(pat), "\"%s\"", key);
+	p = strstr(json, pat);
+	if (p == NULL) {
+		return false;
+	}
+	p += strlen(pat);
+	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':') {
+		p++;
+	}
+	if (*p != '"') {
+		return false;
+	}
+	p++;
+	while (*p != '\0' && *p != '"' && o + 1 < cap) {
+		if (*p == '\\' && p[1] != '\0') {
+			p++;
+		}
+		out[o++] = *p++;
+	}
+	out[o] = '\0';
+	return o > 0;
+}
+
+static bool
+json_extract_u64(const char *json, const char *key, uint64_t *out_val)
+{
+	char pat[64];
+	const char *p;
+	char *endp = NULL;
+
+	if (json == NULL || out_val == NULL) {
+		return false;
+	}
+	(void)snprintf(pat, sizeof(pat), "\"%s\"", key);
+	p = strstr(json, pat);
+	if (p == NULL) {
+		return false;
+	}
+	p += strlen(pat);
+	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':' || *p == '"') {
+		p++;
+	}
+	if (*p < '0' || *p > '9') {
+		return false;
+	}
+	*out_val = strtoull(p, &endp, 10);
+	return endp != p;
+}
+
+static bool
+sweetauthd_query_anisette(const char *op, char *body_out, size_t body_cap)
+{
+	struct sockaddr_in sin;
+	struct timeval tv;
+	char req[256];
+	char resp[4096];
+	const char *hdr_end;
+	ssize_t rd;
+	size_t total = 0;
+	int fd, n;
+
+	if (body_out != NULL && body_cap > 0) {
+		body_out[0] = '\0';
+	}
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		return false;
+	}
+	tv.tv_sec = 10;
+	tv.tv_usec = 0;
+	(void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	(void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons(29171);
+	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (connect(fd, (struct sockaddr *)&sin, sizeof(sin)) != 0) {
+		(void)close(fd);
+		return false;
+	}
+	n = snprintf(req, sizeof(req),
+	    "GET /v1/anisette?op=%s HTTP/1.1\r\n"
+	    "Host: 127.0.0.1:29171\r\n"
+	    "Connection: close\r\n\r\n",
+	    op != NULL ? op : "fetch");
+	if (n > 0) {
+		(void)send(fd, req, (size_t)n, 0);
+	}
+	while (total + 1 < sizeof(resp)) {
+		rd = recv(fd, resp + total, sizeof(resp) - 1 - total, 0);
+		if (rd <= 0) {
+			break;
+		}
+		total += (size_t)rd;
+	}
+	(void)close(fd);
+	resp[total] = '\0';
+
+	hdr_end = strstr(resp, "\r\n\r\n");
+	if (hdr_end == NULL) {
+		return false;
+	}
+	hdr_end += 4;
+	if (body_out != NULL && body_cap > 0) {
+		(void)strlcpy(body_out, hdr_end, body_cap);
+	}
+	return true;
+}
+
+static id
+make_ak_error(int64_t code, const char *desc)
+{
+	Class err_cls = objc_getClass("NSError");
+	CFStringRef cf_dom, cf_desc;
+	CFDictionaryRef user_info = NULL;
+	const void *keys[1];
+	const void *vals[1];
+	id err_obj = NULL;
+
+	if (err_cls == NULL) {
+		return NULL;
+	}
+	cf_dom = CFSTR("AKAnisetteError");
+	cf_desc = CFStringCreateWithCString(kCFAllocatorDefault,
+	    desc != NULL ? desc : "SweetAuth Anisette bridge unavailable",
+	    kCFStringEncodingUTF8);
+	if (cf_desc != NULL) {
+		keys[0] = CFSTR("NSLocalizedDescription");
+		vals[0] = cf_desc;
+		user_info = CFDictionaryCreate(kCFAllocatorDefault, keys, vals, 1,
+		    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	}
+	err_obj = ((id (*)(id, SEL, id, int64_t, id))objc_msgSend)(
+	    (id)err_cls,
+	    sel_registerName("errorWithDomain:code:userInfo:"),
+	    (id)cf_dom, code, (id)user_info);
+	if (user_info != NULL) {
+		CFRelease(user_info);
+	}
+	if (cf_desc != NULL) {
+		CFRelease(cf_desc);
+	}
+	return err_obj;
+}
+
+static void
+ak_fetch_anisette_common(const char *op, void (^completion)(id, id))
+{
+	if (completion == NULL) {
+		return;
+	}
+	dispatch_async(dispatch_get_global_queue(0, 0), ^{
+		void *pool = objc_autoreleasePoolPush();
+		char body[2048];
+		char mid[256];
+		char otp[256];
+		char err_msg[384];
+		uint64_t rinfo = 17106176ULL;
+
+		if (!sweetauthd_query_anisette(op, body, sizeof(body))) {
+			auth_logf("akd %s: sweetauthd unreachable on 127.0.0.1:29171", op);
+			completion(NULL, make_ak_error(-8004,
+			    "sweetauthd is not reachable on 127.0.0.1:29171"));
+			objc_autoreleasePoolPop(pool);
+			return;
+		}
+		if (strstr(body, "\"ok\":true") != NULL &&
+		    json_extract_string(body, "machineID", mid, sizeof(mid)) &&
+		    json_extract_string(body, "oneTimePassword", otp, sizeof(otp))) {
+			Class cls_ad = objc_getClass("AKAnisetteData");
+			id ad = NULL;
+
+			(void)json_extract_u64(body, "routingInfo", &rinfo);
+			if (cls_ad != NULL) {
+				ad = ((id (*)(id, SEL))objc_msgSend)(
+				    ((id (*)(id, SEL))objc_msgSend)((id)cls_ad, sel_registerName("alloc")),
+				    sel_registerName("init"));
+			}
+			if (ad != NULL) {
+				CFStringRef cf_mid = CFStringCreateWithCString(kCFAllocatorDefault,
+				    mid, kCFStringEncodingUTF8);
+				CFStringRef cf_otp = CFStringCreateWithCString(kCFAllocatorDefault,
+				    otp, kCFStringEncodingUTF8);
+				SEL sel_rinfo = sel_registerName("setRoutingInfo:");
+				Method m_rinfo = class_getInstanceMethod(cls_ad, sel_rinfo);
+
+				if (cf_mid != NULL) {
+					((void (*)(id, SEL, id))objc_msgSend)(ad,
+					    sel_registerName("setMachineID:"), (id)cf_mid);
+					CFRelease(cf_mid);
+				}
+				if (cf_otp != NULL) {
+					((void (*)(id, SEL, id))objc_msgSend)(ad,
+					    sel_registerName("setOneTimePassword:"), (id)cf_otp);
+					CFRelease(cf_otp);
+				}
+				if (m_rinfo != NULL) {
+					char arg_t[16];
+					memset(arg_t, 0, sizeof(arg_t));
+					method_getArgumentType(m_rinfo, 2, arg_t, sizeof(arg_t) - 1);
+					if (arg_t[0] == 'Q' || arg_t[0] == 'q' ||
+					    arg_t[0] == 'I' || arg_t[0] == 'i') {
+						((void (*)(id, SEL, uint64_t))objc_msgSend)(
+						    ad, sel_rinfo, rinfo);
+					}
+				}
+				ad = ((id (*)(id, SEL))objc_msgSend)(ad, sel_registerName("autorelease"));
+				auth_logf("akd %s: supplied AKAnisetteData (mid_len=%zu otp_len=%zu rinfo=%llu)",
+				    op, strlen(mid), strlen(otp), (unsigned long long)rinfo);
+				completion(ad, NULL);
+				objc_autoreleasePoolPop(pool);
+				return;
+			}
+		}
+
+		if (!json_extract_string(body, "error", err_msg, sizeof(err_msg))) {
+			(void)strlcpy(err_msg,
+			    "Open SweetAuth -> Settings Sign-In to configure Anisette, or use iCloud Sync (App Password).",
+			    sizeof(err_msg));
+		}
+		auth_logf("akd %s failed: %s", op, err_msg);
+		completion(NULL, make_ak_error(-8004, err_msg));
+		objc_autoreleasePoolPop(pool);
+	});
+}
+
+static void
+ak_bool_anisette_common(const char *op, void (^completion)(BOOL, id))
+{
+	if (completion == NULL) {
+		return;
+	}
+	dispatch_async(dispatch_get_global_queue(0, 0), ^{
+		void *pool = objc_autoreleasePoolPush();
+		char body[2048];
+		char err_msg[384];
+
+		if (sweetauthd_query_anisette(op, body, sizeof(body)) &&
+		    strstr(body, "\"ok\":true") != NULL) {
+			auth_logf("akd %s: OK", op);
+			completion(YES, NULL);
+			objc_autoreleasePoolPop(pool);
+			return;
+		}
+		if (!json_extract_string(body, "error", err_msg, sizeof(err_msg))) {
+			(void)strlcpy(err_msg, "Anisette provisioning not configured in SweetAuth",
+			    sizeof(err_msg));
+		}
+		auth_logf("akd %s: %s", op, err_msg);
+		completion(NO, make_ak_error(-8004, err_msg));
+		objc_autoreleasePoolPop(pool);
+	});
+}
+
+static void
+ak_fetch_anisette(__unused id self, __unused SEL selector, __unused BOOL prov,
+    void (^completion)(id, id))
+{
+	ak_fetch_anisette_common(prov ? "fetch_prov" : "fetch", completion);
+}
+
+static void
+ak_legacy_anisette(__unused id self, __unused SEL selector, __unused id dsid,
+    void (^completion)(id, id))
+{
+	ak_fetch_anisette_common("legacy", completion);
+}
+
+static void
+ak_provision_anisette(__unused id self, __unused SEL selector,
+    void (^completion)(BOOL, id))
+{
+	ak_bool_anisette_common("provision", completion);
+}
+
+static void
+ak_sync_anisette(__unused id self, __unused SEL selector, __unused id sim_data,
+    void (^completion)(BOOL, id))
+{
+	ak_bool_anisette_common("sync", completion);
+}
+
+static void
+ak_erase_anisette(__unused id self, __unused SEL selector,
+    void (^completion)(BOOL, id))
+{
+	ak_bool_anisette_common("erase", completion);
+}
+
+static bool akd_baa_hooked;
+static bool akd_anisette_hooked;
+
+static void
+akd_image_added(__unused const struct mach_header *header, __unused intptr_t slide)
+{
+	static const char *const baa_classes[] = {
+		"AKStrongDeviceIdentitySigner",
+		"_AKStrongDeviceIdentitySigner",
+		"AKDeviceIdentityWrapper",
+		"AKDevice",
+	};
+	Class cls;
+	Method m;
+	size_t i;
+
+	if (!akd_baa_hooked && objc_getClass("AKStrongDeviceIdentitySigner") != NULL) {
+		akd_baa_hooked = true;
+		for (i = 0; i < sizeof(baa_classes) / sizeof(baa_classes[0]); i++) {
+			cls = objc_getClass(baa_classes[i]);
+			hook_bool_method_no(cls, baa_classes[i], "isStrongDeviceIdentitySupported");
+			hook_bool_method_no(cls, baa_classes[i], "isPhysicalDeviceBAAEnabled");
+		}
+	}
+
+	if (!akd_anisette_hooked &&
+	    (cls = objc_getClass("AKNativeAnisetteService")) != NULL) {
+		akd_anisette_hooked = true;
+		m = class_getInstanceMethod(cls,
+		    sel_registerName("fetchAnisetteDataAndProvisionIfNecessary:withCompletion:"));
+		if (m != NULL) {
+			(void)method_setImplementation(m, (IMP)ak_fetch_anisette);
+		}
+		m = class_getInstanceMethod(cls,
+		    sel_registerName("legacyAnisetteDataForDSID:withCompletion:"));
+		if (m != NULL) {
+			(void)method_setImplementation(m, (IMP)ak_legacy_anisette);
+		}
+		m = class_getInstanceMethod(cls,
+		    sel_registerName("provisionAnisetteWithCompletion:"));
+		if (m != NULL) {
+			(void)method_setImplementation(m, (IMP)ak_provision_anisette);
+		}
+		m = class_getInstanceMethod(cls,
+		    sel_registerName("syncAnisetteWithSIMData:completion:"));
+		if (m != NULL) {
+			(void)method_setImplementation(m, (IMP)ak_sync_anisette);
+		}
+		m = class_getInstanceMethod(cls,
+		    sel_registerName("eraseAnisetteWithCompletion:"));
+		if (m != NULL) {
+			(void)method_setImplementation(m, (IMP)ak_erase_anisette);
+		}
+		auth_logf("hooked AKNativeAnisetteService -> sweetauthd (127.0.0.1:29171)");
+	}
+}
+
+static void
+cdp_set_kc_sync_enabled(__unused id self, __unused SEL selector, BOOL enabled,
+    void (^completion)(BOOL, id))
+{
+	auth_logf("cdpd setUserVisibleKeychainSyncEnabled:%d -> local non-SEP success",
+	    (int)enabled);
+	if (completion != NULL) {
+		completion(YES, NULL);
+	}
+}
+
+static BOOL
+cdp_should_perform_repair(__unused id self, __unused SEL selector,
+    __unused BOOL force_fetch, id *out_error)
+{
+	if (out_error != NULL) {
+		*out_error = NULL;
+	}
+	return NO;
+}
+
+static bool cdp_kc_hooked;
+static bool cdp_sm_hooked;
+
+static void
+cdp_image_added(__unused const struct mach_header *header, __unused intptr_t slide)
+{
+	Class cls;
+	Method m;
+
+	if (!cdp_kc_hooked && (cls = objc_getClass("CDPDKeychainSync")) != NULL) {
+		cdp_kc_hooked = true;
+		hook_bool_method_no(cls, "CDPDKeychainSync", "isUserVisibleKeychainSyncEnabled");
+		m = class_getInstanceMethod(cls,
+		    sel_registerName("setUserVisibleKeychainSyncEnabled:withCompletion:"));
+		if (m != NULL && method_getNumberOfArguments(m) == 4) {
+			(void)method_setImplementation(m, (IMP)cdp_set_kc_sync_enabled);
+			auth_logf("hooked -[CDPDKeychainSync setUserVisibleKeychainSyncEnabled:withCompletion:]");
+		}
+		m = class_getClassMethod(cls,
+		    sel_registerName("setUserVisibleKeychainSyncEnabled:withCompletion:"));
+		if (m != NULL && method_getNumberOfArguments(m) == 4) {
+			(void)method_setImplementation(m, (IMP)cdp_set_kc_sync_enabled);
+			auth_logf("hooked +[CDPDKeychainSync setUserVisibleKeychainSyncEnabled:withCompletion:]");
+		}
+	}
+	if (!cdp_sm_hooked && (cls = objc_getClass("CDPDStateMachine")) != NULL) {
+		cdp_sm_hooked = true;
+		m = class_getInstanceMethod(cls,
+		    sel_registerName("shouldPerformRepairWithOptionForceFetch:error:"));
+		if (m != NULL && method_getNumberOfArguments(m) == 4) {
+			const char *enc = method_getTypeEncoding(m);
+			if (enc != NULL && (enc[0] == 'B' || enc[0] == 'c')) {
+				(void)method_setImplementation(m, (IMP)cdp_should_perform_repair);
+				auth_logf("hooked -[CDPDStateMachine shouldPerformRepairWithOptionForceFetch:error:] -> NO");
+			}
+		}
+	}
+}
+
 __attribute__((constructor))
 static void
 sweet_sysfix_init(void)
@@ -851,5 +1347,11 @@ sweet_sysfix_init(void)
 		_dyld_register_func_for_add_image(sb_image_added);
 		sb_image_added(NULL, 0);
 		sb_start_ringer_unmute();
+	} else if (strcmp(name, "akd") == 0) {
+		_dyld_register_func_for_add_image(akd_image_added);
+		akd_image_added(NULL, 0);
+	} else if (strcmp(name, "cdpd") == 0) {
+		_dyld_register_func_for_add_image(cdp_image_added);
+		cdp_image_added(NULL, 0);
 	}
 }

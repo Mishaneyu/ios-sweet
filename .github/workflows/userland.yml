@@ -102,7 +102,7 @@ jobs:
           done
           ls -la work/dxb/xnu/bsd/dev/
 
-      - name: Build wland, cellular, adsp, gpu/pmem, media/audio, store, and phone/tools
+      - name: Build wland, cellular, adsp, gpu/pmem, media/audio, store, auth, and phone/tools
         run: |
           sh phone/wifi/build.sh
           sh phone/cellular/build.sh
@@ -111,6 +111,7 @@ jobs:
           sh phone/media/build.sh
           sh phone/audio/build.sh
           sh phone/store/build.sh
+          sh phone/auth/build.sh
           bash phone/tools/build.sh
 
       - name: Build Mesa Turnip (libvulkan_freedreno.dylib) for iOS 16 arm64
@@ -233,10 +234,10 @@ jobs:
         run: |
           mkdir -p dist-userland/bin dist-userland/Extensions dist-userland/lib dist-userland/HAL dist-userland/Applications
           cp -R phone/metal2/out/SweetMetal2.bundle dist-userland/Extensions/
-          cp phone/media/out/libsweet_media.dylib phone/media/out/libsweet_sysfix.dylib dist-userland/lib/
+          cp phone/media/out/libsweet_media.dylib phone/media/out/libsweet_sysfix.dylib phone/store/out/libsweet_appfix.dylib dist-userland/lib/
           cp -R phone/audio/out/HakiosAudio.driver dist-userland/HAL/
-          cp -R phone/store/out/SweetStore.app dist-userland/Applications/
-          cp phone/store/out/sweetstored dist-userland/bin/
+          cp -R phone/store/out/SweetStore.app phone/auth/out/SweetAuth.app dist-userland/Applications/
+          cp phone/store/out/sweetstored phone/auth/out/sweetauthd dist-userland/bin/
           cp phone/metal2/out/m2vtest dist-userland/bin/
           cp phone/wifi/out/wland dist-userland/bin/
           cp phone/cellular/out/* dist-userland/bin/

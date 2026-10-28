@@ -1,10 +1,15 @@
 /*
- * SweetStore.m — On-device IPA Store & Installer for HackiOS (RMX1931 / iOS 16)
+ * SweetStore 2.0 — App Store Discovery, Multi-Repo Native IPA Installer & WebApp Studio
+ * for iOS 26.5.2 on RMX1931 / SWEET.
  *
- * Talks to local root daemon sweetstored (http://127.0.0.1:29170) to extract,
- * thin, ad-hoc SHA-256 sign, install to /Applications, and register via lsreg -r.
- * Supports AltStore / SideStore / Feather JSON repositories, direct .ipa URLs,
- * Files / Safari Downloads .ipa import, and Open-In .ipa launch.
+ * Talks to local root daemon sweetstored v2 (http://127.0.0.1:29170) to:
+ *   1. Search & browse live Apple App Store Top Charts (itunes.apple.com public API).
+ *   2. Cross-match bundleIds against AltStore / SideStore / Feather / GitHub unencrypted
+ *      (cryptid=0) .ipa repositories for 1-tap native arm64/arm64e installation.
+ *   3. Package commercial FairPlay-only services into standalone native Home Screen
+ *      WKWebView .app bundles (SweetWebAppStub) with official 512px App Store icons.
+ *   4. Manage installed apps, per-app Adreno 640 SweetMetal2 GPU / CPU toggles,
+ *      Wi-Fi browser .ipa uploads (port 29172), and libsweet_appfix.dylib logs.
  */
 
 #import <UIKit/UIKit.h>
@@ -15,12 +20,116 @@
 #include <sys/stat.h>
 
 static NSString *const kDaemonBaseURL = @"http://127.0.0.1:29170";
-static NSString *const kSourcesDefaultsKey = @"SSRepoSources_v1";
-static NSString *const kMaxSupportedIOS = @"16.7.16";
+static NSString *const kSourcesDefaultsKey = @"SSRepoSources_v2";
 static NSString *const kLocalIpaStageDir = @"/private/var/local/ipa";
 
 static NSNotificationName const SSStateDidChangeNotification = @"SSStateDidChangeNotification";
 static NSNotificationName const SSReposDidChangeNotification = @"SSReposDidChangeNotification";
+
+/* ---- Helpers ---- */
+
+static NSString *SSString(id obj)
+{
+	if ([obj isKindOfClass:[NSString class]]) return (NSString *)obj;
+	if ([obj respondsToSelector:@selector(stringValue)]) return [obj stringValue];
+	return @"";
+}
+
+static NSString *SSFormatBytes(long long bytes)
+{
+	if (bytes <= 0) return @"";
+	double mb = (double)bytes / (1024.0 * 1024.0);
+	if (mb >= 1024.0) return [NSString stringWithFormat:@"%.2f GB", mb / 1024.0];
+	if (mb >= 1.0) return [NSString stringWithFormat:@"%.1f MB", mb];
+	return [NSString stringWithFormat:@"%.0f KB", (double)bytes / 1024.0];
+}
+
+static NSString *SSCurrentIOSVersion(void)
+{
+	NSString *v = [[UIDevice currentDevice] systemVersion];
+	return v.length > 0 ? v : @"26.5.2";
+}
+
+static BOOL SSIsOSVersionCompatible(NSString *minOS)
+{
+	if (minOS.length == 0) return YES;
+	NSArray<NSString *> *a = [minOS componentsSeparatedByString:@"."];
+	NSArray<NSString *> *b = [SSCurrentIOSVersion() componentsSeparatedByString:@"."];
+	NSUInteger count = MAX(a.count, b.count);
+	for (NSUInteger i = 0; i < count; i++) {
+		NSInteger va = (i < a.count) ? [a[i] integerValue] : 0;
+		NSInteger vb = (i < b.count) ? [b[i] integerValue] : 0;
+		if (va < vb) return YES;
+		if (va > vb) return NO;
+	}
+	return YES;
+}
+
+/* Curated optimal WebApp endpoints & User-Agent profiles for popular FairPlay-locked commercial apps */
+static NSDictionary<NSString *, NSDictionary *> *SSCuratedWebAppMap(void)
+{
+	static NSDictionary *map;
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		map = @{
+			@"net.whatsapp.whatsapp":          @{ @"url": @"https://web.whatsapp.com",          @"ua": @"desktop" },
+			@"com.google.ios.youtube":         @{ @"url": @"https://m.youtube.com",             @"ua": @"mobile"  },
+			@"com.burbn.instagram":            @{ @"url": @"https://www.instagram.com",         @"ua": @"mobile"  },
+			@"com.atebits.tweetie2":           @{ @"url": @"https://x.com",                     @"ua": @"mobile"  },
+			@"com.spotify.client":             @{ @"url": @"https://open.spotify.com",          @"ua": @"desktop" },
+			@"com.hammerandchisel.discord":    @{ @"url": @"https://discord.com/app",           @"ua": @"desktop" },
+			@"ph.telegra.telegraph":           @{ @"url": @"https://web.telegram.org/k/",       @"ua": @"mobile"  },
+			@"com.openai.chat":                @{ @"url": @"https://chatgpt.com",               @"ua": @"mobile"  },
+			@"com.anthropic.claude":           @{ @"url": @"https://claude.ai",                 @"ua": @"mobile"  },
+			@"ai.perplexity.app":              @{ @"url": @"https://www.perplexity.ai",         @"ua": @"mobile"  },
+			@"com.reddit.reddit":              @{ @"url": @"https://www.reddit.com",            @"ua": @"mobile"  },
+			@"com.facebook.facebook":          @{ @"url": @"https://m.facebook.com",            @"ua": @"mobile"  },
+			@"com.facebook.messenger":         @{ @"url": @"https://www.messenger.com",         @"ua": @"desktop" },
+			@"com.burbn.barcelona":            @{ @"url": @"https://www.threads.net",           @"ua": @"mobile"  },
+			@"com.toyopagroup.picaboo":        @{ @"url": @"https://web.snapchat.com",          @"ua": @"desktop" },
+			@"com.zhiliaoapp.musically":       @{ @"url": @"https://www.tiktok.com",            @"ua": @"mobile"  },
+			@"com.linkedin.linkedin":          @{ @"url": @"https://www.linkedin.com",          @"ua": @"mobile"  },
+			@"pinterest":                      @{ @"url": @"https://www.pinterest.com",         @"ua": @"mobile"  },
+			@"tv.twitch":                      @{ @"url": @"https://m.twitch.tv",               @"ua": @"mobile"  },
+			@"com.netflix.netflix":            @{ @"url": @"https://www.netflix.com",           @"ua": @"desktop" },
+			@"com.amazon.aiv.aivapp":          @{ @"url": @"https://www.primevideo.com",        @"ua": @"desktop" },
+			@"in.startv.hotstar":              @{ @"url": @"https://www.hotstar.com/in",        @"ua": @"mobile"  },
+			@"com.amazon.amazonin":            @{ @"url": @"https://www.amazon.in",             @"ua": @"mobile"  },
+			@"com.amazon.amazon":              @{ @"url": @"https://www.amazon.com",            @"ua": @"mobile"  },
+			@"com.flipkart.iphone":            @{ @"url": @"https://www.flipkart.com",          @"ua": @"mobile"  },
+			@"com.ubercab.uberclient":         @{ @"url": @"https://m.uber.com",                @"ua": @"mobile"  },
+			@"in.swiggy.swiggyapp":            @{ @"url": @"https://www.swiggy.com",            @"ua": @"mobile"  },
+			@"com.zomato.zomato":              @{ @"url": @"https://www.zomato.com",            @"ua": @"mobile"  },
+			@"com.google.gmail":               @{ @"url": @"https://mail.google.com",           @"ua": @"mobile"  },
+			@"com.google.maps":                @{ @"url": @"https://maps.google.com",           @"ua": @"mobile"  },
+			@"com.google.drive":               @{ @"url": @"https://drive.google.com",          @"ua": @"mobile"  },
+			@"com.github.stormbreaker.prod":   @{ @"url": @"https://github.com",                @"ua": @"mobile"  },
+			@"notion.id":                      @{ @"url": @"https://www.notion.so",             @"ua": @"mobile"  },
+		};
+	});
+	return map;
+}
+
+static NSDictionary *SSResolveWebAppSpec(NSString *bundleId, NSString *name, NSString *sellerURL)
+{
+	NSDictionary *curated = SSCuratedWebAppMap()[bundleId.lowercaseString ?: @""];
+	if (curated) return curated;
+
+	NSString *lowName = name.lowercaseString ?: @"";
+	if ([lowName hasPrefix:@"whatsapp"])  return @{ @"url": @"https://web.whatsapp.com",    @"ua": @"desktop" };
+	if ([lowName hasPrefix:@"youtube"])   return @{ @"url": @"https://m.youtube.com",       @"ua": @"mobile"  };
+	if ([lowName hasPrefix:@"instagram"]) return @{ @"url": @"https://www.instagram.com",   @"ua": @"mobile"  };
+	if ([lowName hasPrefix:@"spotify"])   return @{ @"url": @"https://open.spotify.com",    @"ua": @"desktop" };
+	if ([lowName hasPrefix:@"discord"])   return @{ @"url": @"https://discord.com/app",     @"ua": @"desktop" };
+	if ([lowName hasPrefix:@"telegram"])  return @{ @"url": @"https://web.telegram.org/k/", @"ua": @"mobile"  };
+	if ([lowName hasPrefix:@"chatgpt"])   return @{ @"url": @"https://chatgpt.com",         @"ua": @"mobile"  };
+
+	if (sellerURL.length > 8 && ([sellerURL.lowercaseString hasPrefix:@"http://"] || [sellerURL.lowercaseString hasPrefix:@"https://"])) {
+		return @{ @"url": sellerURL, @"ua": @"mobile" };
+	}
+	NSString *q = [name stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"app";
+	return @{ @"url": [NSString stringWithFormat:@"https://duckduckgo.com/?q=%%5C%@", q], @"ua": @"mobile" };
+}
 
 /* ---- Models ---- */
 
@@ -52,6 +161,24 @@ static NSNotificationName const SSReposDidChangeNotification = @"SSReposDidChang
 @implementation SSRepoApp
 @end
 
+@interface SSStoreCatalogItem : NSObject
+@property (nonatomic, copy) NSString *trackId;
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic, copy) NSString *bundleId;
+@property (nonatomic, copy) NSString *developer;
+@property (nonatomic, copy) NSString *genre;
+@property (nonatomic, copy) NSString *summary;
+@property (nonatomic, copy) NSString *version;
+@property (nonatomic, copy) NSString *iconURL;
+@property (nonatomic, copy) NSString *sellerURL;
+@property (nonatomic, assign) double rating;
+@property (nonatomic, assign) long long sizeBytes;
+@property (nonatomic, strong) NSArray<NSString *> *screenshotURLs;
+@end
+
+@implementation SSStoreCatalogItem
+@end
+
 @interface SSRepoSourceInfo : NSObject
 @property (nonatomic, copy) NSString *url;
 @property (nonatomic, copy) NSString *name;
@@ -63,40 +190,7 @@ static NSNotificationName const SSReposDidChangeNotification = @"SSReposDidChang
 @implementation SSRepoSourceInfo
 @end
 
-/* ---- Helpers ---- */
-
-static NSString *SSString(id obj)
-{
-	if ([obj isKindOfClass:[NSString class]]) return (NSString *)obj;
-	if ([obj respondsToSelector:@selector(stringValue)]) return [obj stringValue];
-	return @"";
-}
-
-static NSString *SSFormatBytes(long long bytes)
-{
-	if (bytes <= 0) return @"";
-	double mb = (double)bytes / (1024.0 * 1024.0);
-	if (mb >= 1024.0) return [NSString stringWithFormat:@"%.2f GB", mb / 1024.0];
-	if (mb >= 1.0) return [NSString stringWithFormat:@"%.1f MB", mb];
-	return [NSString stringWithFormat:@"%.0f KB", (double)bytes / 1024.0];
-}
-
-static BOOL SSIsOSVersionCompatible(NSString *minOS)
-{
-	if (minOS.length == 0) return YES;
-	NSArray<NSString *> *a = [minOS componentsSeparatedByString:@"."];
-	NSArray<NSString *> *b = [kMaxSupportedIOS componentsSeparatedByString:@"."];
-	NSUInteger count = MAX(a.count, b.count);
-	for (NSUInteger i = 0; i < count; i++) {
-		NSInteger va = (i < a.count) ? [a[i] integerValue] : 0;
-		NSInteger vb = (i < b.count) ? [b[i] integerValue] : 0;
-		if (va < vb) return YES;
-		if (va > vb) return NO;
-	}
-	return YES;
-}
-
-/* ---- Icon Loader ---- */
+/* ---- Icon & Image Loader ---- */
 
 @interface SSIconLoader : NSObject
 @property (nonatomic, strong) NSCache<NSString *, UIImage *> *cache;
@@ -105,6 +199,7 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 + (instancetype)shared;
 - (UIImage *)placeholderIcon;
 - (void)loadIconURL:(NSString *)urlStr completion:(void (^)(UIImage *img))completion;
+- (void)loadRawImageURL:(NSString *)urlStr completion:(void (^)(UIImage *img))completion;
 @end
 
 @implementation SSIconLoader
@@ -123,7 +218,7 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 {
 	if ((self = [super init])) {
 		_cache = [[NSCache alloc] init];
-		_cache.countLimit = 400;
+		_cache.countLimit = 500;
 		_pending = [NSMutableDictionary dictionary];
 		NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
 		cfg.timeoutIntervalForRequest = 15.0;
@@ -143,7 +238,6 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 		[[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, 56, 56) cornerRadius:13] fill];
 		UIImage *sym = [UIImage systemImageNamed:@"app.fill"];
 		if (sym) {
-			[[UIColor tertiaryLabelColor] set];
 			UIImage *tinted = [sym imageWithTintColor:[UIColor tertiaryLabelColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
 			[tinted drawInRect:CGRectMake(14, 14, 28, 28)];
 		}
@@ -178,7 +272,7 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 		self.pending[urlStr] = [NSMutableArray arrayWithObject:[completion copy]];
 	}
 	NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-	[req setValue:@"SweetStore/1.0 (iOS 16.7.16)" forHTTPHeaderField:@"User-Agent"];
+	[req setValue:@"SweetStore/2.0 (iOS 26.5.2)" forHTTPHeaderField:@"User-Agent"];
 	[[self.session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
 		(void)resp; (void)err;
 		UIImage *decoded = nil;
@@ -208,16 +302,38 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 	}] resume];
 }
 
+- (void)loadRawImageURL:(NSString *)urlStr completion:(void (^)(UIImage *img))completion
+{
+	if (urlStr.length == 0) { completion(nil); return; }
+	NSString *key = [@"raw|" stringByAppendingString:urlStr];
+	UIImage *cached = [self.cache objectForKey:key];
+	if (cached) { completion(cached); return; }
+	NSURL *url = [NSURL URLWithString:urlStr];
+	if (!url) { completion(nil); return; }
+	[[self.session dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+		(void)resp; (void)err;
+		UIImage *img = data.length > 0 ? [UIImage imageWithData:data] : nil;
+		if (img) [self.cache setObject:img forKey:key];
+		dispatch_async(dispatch_get_main_queue(), ^{
+			completion(img);
+		});
+	}] resume];
+}
+
 @end
 
-/* ---- Store Controller (Daemon + Download + Repo Manager) ---- */
+/* ---- Store Controller ---- */
 
 @interface SSStoreController : NSObject <NSURLSessionDownloadDelegate>
 @property (nonatomic, assign) BOOL daemonOnline;
 @property (nonatomic, assign) BOOL daemonBusy;
 @property (nonatomic, strong) NSDictionary *daemonJob;
+@property (nonatomic, assign) BOOL lanEnabled;
+@property (nonatomic, copy) NSString *lanURL;
+@property (nonatomic, copy) NSString *wifiIP;
 @property (nonatomic, strong) NSArray<NSDictionary *> *installedApps;
 @property (nonatomic, strong) NSDictionary<NSString *, NSDictionary *> *installedByBundleId;
+@property (nonatomic, strong) NSDictionary<NSString *, NSDictionary *> *installedByOrigBundleId;
 @property (nonatomic, strong) NSArray<NSDictionary *> *localIpas;
 
 @property (nonatomic, assign) BOOL downloading;
@@ -234,6 +350,7 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 @property (nonatomic, strong) NSMutableArray<NSString *> *sourceURLs;
 @property (nonatomic, strong) NSArray<SSRepoSourceInfo *> *sourceInfos;
 @property (nonatomic, strong) NSArray<SSRepoApp *> *allApps;
+@property (nonatomic, strong) NSDictionary<NSString *, SSRepoApp *> *repoAppByBundleId;
 @property (nonatomic, assign) BOOL loadingRepos;
 
 @property (nonatomic, weak) UITabBarController *rootTabs;
@@ -248,12 +365,20 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 - (void)resetDefaultSources;
 
 - (BOOL)isBusy;
+- (NSDictionary *)installedEntryForBundleId:(NSString *)bundleId;
+- (SSRepoApp *)matchedRepoAppForBundleId:(NSString *)bundleId name:(NSString *)name;
+
 - (void)downloadAndInstallURL:(NSString *)urlStr title:(NSString *)title fromVC:(UIViewController *)vc;
 - (void)cancelActiveDownload;
 - (void)installLocalFile:(NSString *)path deleteAfter:(BOOL)delAfter title:(NSString *)title;
 - (void)importExternalFileURL:(NSURL *)url switchTab:(BOOL)switchTab;
+- (void)createWebAppWithName:(NSString *)name url:(NSString *)urlStr userAgent:(NSString *)ua iconURL:(NSString *)iconURL origBundleId:(NSString *)origBid switchTab:(BOOL)switchTab;
+- (void)setGPUMode:(BOOL)enabled forExecName:(NSString *)execName completion:(void (^)(BOOL ok))completion;
+- (void)setLanUploadEnabled:(BOOL)enabled completion:(void (^)(BOOL ok))completion;
+- (void)fetchAppFixLogWithCompletion:(void (^)(NSString *log))completion;
+- (void)clearAppFixLogWithCompletion:(void (^)(BOOL ok))completion;
 - (void)openBundleId:(NSString *)bundleId;
-- (void)uninstallDirName:(NSString *)dirName completion:(void (^)(BOOL ok, NSString *err))completion;
+- (void)uninstallDirName:(NSString *)dirName deleteData:(BOOL)delData completion:(void (^)(BOOL ok, NSString *err))completion;
 - (void)rebuildIconsWithCompletion:(void (^)(BOOL ok))completion;
 @end
 
@@ -274,6 +399,7 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 	return @[
 		@"https://community-apps.sidestore.io/sidecommunity.json",
 		@"https://cdn.altstore.io/file/altstore/apps.json",
+		@"https://raw.githubusercontent.com/swaggyP36000/TrollStore-IPAs/main/apps_esign.json",
 		@"https://wuxu1.github.io/wuxu-complete-plus.json",
 		@"https://ipa.cypwn.xyz/cypwn.json",
 	];
@@ -284,12 +410,14 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 	if ((self = [super init])) {
 		_installedApps = @[];
 		_installedByBundleId = @{};
+		_installedByOrigBundleId = @{};
 		_localIpas = @[];
 		_allApps = @[];
+		_repoAppByBundleId = @{};
 		_sourceInfos = @[];
 
 		NSURLSessionConfiguration *apiCfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-		apiCfg.timeoutIntervalForRequest = 4.0;
+		apiCfg.timeoutIntervalForRequest = 6.0;
 		_apiSession = [NSURLSession sessionWithConfiguration:apiCfg];
 
 		NSURLSessionConfiguration *dlCfg = [NSURLSessionConfiguration defaultSessionConfiguration];
@@ -311,6 +439,28 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 - (BOOL)isBusy
 {
 	return self.downloading || self.daemonBusy;
+}
+
+- (NSDictionary *)installedEntryForBundleId:(NSString *)bundleId
+{
+	if (bundleId.length == 0) return nil;
+	NSString *low = bundleId.lowercaseString;
+	return self.installedByBundleId[low] ?: self.installedByOrigBundleId[low];
+}
+
+- (SSRepoApp *)matchedRepoAppForBundleId:(NSString *)bundleId name:(NSString *)name
+{
+	if (bundleId.length > 0) {
+		SSRepoApp *m = self.repoAppByBundleId[bundleId.lowercaseString];
+		if (m) return m;
+	}
+	if (name.length > 2) {
+		NSString *ln = name.lowercaseString;
+		for (SSRepoApp *a in self.allApps) {
+			if ([a.name.lowercaseString isEqualToString:ln]) return a;
+		}
+	}
+	return nil;
 }
 
 - (void)startPolling
@@ -344,20 +494,30 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 
 		NSArray *inst = [json[@"installed"] isKindOfClass:[NSArray class]] ? json[@"installed"] : @[];
 		NSMutableDictionary *byBid = [NSMutableDictionary dictionaryWithCapacity:inst.count];
+		NSMutableDictionary *byOrig = [NSMutableDictionary dictionaryWithCapacity:inst.count];
 		for (NSDictionary *item in inst) {
-			NSString *bid = SSString(item[@"bundleId"]);
+			NSString *bid = SSString(item[@"bundleId"]).lowercaseString;
+			NSString *obid = SSString(item[@"origBundleId"]).lowercaseString;
 			if (bid.length > 0) byBid[bid] = item;
+			if (obid.length > 0) byOrig[obid] = item;
 		}
 		NSArray *locals = [json[@"localIpas"] isKindOfClass:[NSArray class]] ? json[@"localIpas"] : @[];
 		NSDictionary *job = [json[@"job"] isKindOfClass:[NSDictionary class]] ? json[@"job"] : @{};
 		BOOL busy = [json[@"busy"] respondsToSelector:@selector(boolValue)] ? [json[@"busy"] boolValue] : NO;
+		BOOL lanOn = [json[@"lanEnabled"] respondsToSelector:@selector(boolValue)] ? [json[@"lanEnabled"] boolValue] : NO;
+		NSString *lanU = SSString(json[@"lanURL"]);
+		NSString *wIP = SSString(json[@"wifiIP"]);
 
 		dispatch_async(dispatch_get_main_queue(), ^{
 			self.daemonOnline = YES;
 			self.daemonBusy = busy;
 			self.daemonJob = job;
+			self.lanEnabled = lanOn;
+			self.lanURL = lanU;
+			self.wifiIP = wIP;
 			self.installedApps = inst;
 			self.installedByBundleId = byBid;
+			self.installedByOrigBundleId = byOrig;
 			self.localIpas = locals;
 			[[NSNotificationCenter defaultCenter] postNotificationName:SSStateDidChangeNotification object:self];
 		});
@@ -386,7 +546,7 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 	}] resume];
 }
 
-/* ---- Download & Install ---- */
+/* ---- Download, Install & WebApp Creation ---- */
 
 - (void)downloadAndInstallURL:(NSString *)urlStr title:(NSString *)title fromVC:(UIViewController *)vc
 {
@@ -401,7 +561,7 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 		return;
 	}
 	if ([self isBusy]) {
-		UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Busy"
+		UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Installer Busy"
 		                                                            message:@"An app download or installation is already running. Check the Install tab."
 		                                                     preferredStyle:UIAlertControllerStyleAlert];
 		[ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -417,12 +577,12 @@ static BOOL SSIsOSVersionCompatible(NSString *minOS)
 	self.expectedBytes = 0;
 
 	NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-	[req setValue:@"AltStore/1.6 SweetStore/1.0 (iPhone; iOS 16.7.16)" forHTTPHeaderField:@"User-Agent"];
+	[req setValue:@"AltStore/2.0 SweetStore/2.0 (iPhone; iOS 26.5.2)" forHTTPHeaderField:@"User-Agent"];
 	self.activeDownloadTask = [self.downloadSession downloadTaskWithRequest:req];
 	[self.activeDownloadTask resume];
 
-	if (self.rootTabs && self.rootTabs.selectedIndex != 1) {
-		self.rootTabs.selectedIndex = 1;
+	if (self.rootTabs && self.rootTabs.selectedIndex != 2) {
+		self.rootTabs.selectedIndex = 2;
 	}
 	[[NSNotificationCenter defaultCenter] postNotificationName:SSStateDidChangeNotification object:self];
 }
@@ -446,11 +606,7 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 	(void)session; (void)downloadTask; (void)bytesWritten;
 	self.downloadedBytes = totalBytesWritten;
 	self.expectedBytes = totalBytesExpectedToWrite;
-	if (totalBytesExpectedToWrite > 0) {
-		self.downloadProgress = (double)totalBytesWritten / (double)totalBytesExpectedToWrite;
-	} else {
-		self.downloadProgress = 0.0;
-	}
+	self.downloadProgress = totalBytesExpectedToWrite > 0 ? ((double)totalBytesWritten / (double)totalBytesExpectedToWrite) : 0.0;
 	[[NSNotificationCenter defaultCenter] postNotificationName:SSStateDidChangeNotification object:self];
 }
 
@@ -495,8 +651,7 @@ didFinishDownloadingToURL:(NSURL *)location
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error
 {
 	(void)session; (void)task;
-	if (!error) return;
-	if (error.code == NSURLErrorCancelled) return;
+	if (!error || error.code == NSURLErrorCancelled) return;
 	self.downloading = NO;
 	self.activeDownloadTask = nil;
 	self.downloadError = error.localizedDescription ?: @"Download failed";
@@ -541,9 +696,71 @@ didFinishDownloadingToURL:(NSURL *)location
 	}
 	chmod(dest.UTF8String, 0644);
 	if (switchTab && self.rootTabs) {
-		self.rootTabs.selectedIndex = 1;
+		self.rootTabs.selectedIndex = 2;
 	}
 	[self installLocalFile:dest deleteAfter:YES title:[baseName stringByDeletingPathExtension]];
+}
+
+- (void)createWebAppWithName:(NSString *)name url:(NSString *)urlStr userAgent:(NSString *)ua iconURL:(NSString *)iconURL origBundleId:(NSString *)origBid switchTab:(BOOL)switchTab
+{
+	self.downloadError = nil;
+	if (switchTab && self.rootTabs) {
+		self.rootTabs.selectedIndex = 2;
+	}
+	[self postDaemonPath:@"/create-webapp" payload:@{
+		@"name": name ?: @"Web App",
+		@"url": urlStr ?: @"",
+		@"userAgent": ua ?: @"mobile",
+		@"iconURL": iconURL ?: @"",
+		@"origBundleId": origBid ?: @"",
+	} completion:^(NSDictionary *resp, NSError *err) {
+		if (err || ![resp[@"ok"] boolValue]) {
+			self.downloadError = SSString(resp[@"error"]).length > 0
+			                   ? SSString(resp[@"error"])
+			                   : (err.localizedDescription ?: @"Failed creating Web App");
+			[[NSNotificationCenter defaultCenter] postNotificationName:SSStateDidChangeNotification object:self];
+		}
+	}];
+}
+
+- (void)setGPUMode:(BOOL)enabled forExecName:(NSString *)execName completion:(void (^)(BOOL ok))completion
+{
+	[self postDaemonPath:@"/gpu-mode" payload:@{
+		@"execName": execName ?: @"",
+		@"gpuEnabled": @(enabled),
+	} completion:^(NSDictionary *resp, NSError *err) {
+		if (completion) completion(!err && [resp[@"ok"] boolValue]);
+	}];
+}
+
+- (void)setLanUploadEnabled:(BOOL)enabled completion:(void (^)(BOOL ok))completion
+{
+	[self postDaemonPath:@"/lan-upload" payload:@{ @"enabled": @(enabled) } completion:^(NSDictionary *resp, NSError *err) {
+		if (completion) completion(!err && [resp[@"ok"] boolValue]);
+	}];
+}
+
+- (void)fetchAppFixLogWithCompletion:(void (^)(NSString *log))completion
+{
+	NSURL *u = [NSURL URLWithString:[kDaemonBaseURL stringByAppendingString:@"/appfix-log"]];
+	[[self.apiSession dataTaskWithURL:u completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+		(void)resp;
+		NSString *log = @"";
+		if (!err && data.length > 0) {
+			NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+			if ([j isKindOfClass:[NSDictionary class]]) log = SSString(j[@"log"]);
+		}
+		dispatch_async(dispatch_get_main_queue(), ^{
+			if (completion) completion(log);
+		});
+	}] resume];
+}
+
+- (void)clearAppFixLogWithCompletion:(void (^)(BOOL ok))completion
+{
+	[self postDaemonPath:@"/clear-appfix-log" payload:@{} completion:^(NSDictionary *resp, NSError *err) {
+		if (completion) completion(!err && [resp[@"ok"] boolValue]);
+	}];
 }
 
 - (void)openBundleId:(NSString *)bundleId
@@ -552,9 +769,12 @@ didFinishDownloadingToURL:(NSURL *)location
 	[self postDaemonPath:@"/open" payload:@{ @"bundleId": bundleId } completion:nil];
 }
 
-- (void)uninstallDirName:(NSString *)dirName completion:(void (^)(BOOL ok, NSString *err))completion
+- (void)uninstallDirName:(NSString *)dirName deleteData:(BOOL)delData completion:(void (^)(BOOL ok, NSString *err))completion
 {
-	[self postDaemonPath:@"/uninstall" payload:@{ @"dirName": dirName ?: @"" } completion:^(NSDictionary *resp, NSError *err) {
+	[self postDaemonPath:@"/uninstall" payload:@{
+		@"dirName": dirName ?: @"",
+		@"deleteData": @(delData),
+	} completion:^(NSDictionary *resp, NSError *err) {
 		BOOL ok = (!err && [resp[@"ok"] boolValue]);
 		NSString *msg = ok ? nil : (SSString(resp[@"error"]).length > 0 ? SSString(resp[@"error"]) : err.localizedDescription);
 		if (completion) completion(ok, msg);
@@ -696,6 +916,7 @@ didFinishDownloadingToURL:(NSURL *)location
 	if (urls.count == 0) {
 		self.sourceInfos = @[];
 		self.allApps = @[];
+		self.repoAppByBundleId = @{};
 		self.loadingRepos = NO;
 		[[NSNotificationCenter defaultCenter] postNotificationName:SSReposDidChangeNotification object:self];
 		return;
@@ -729,7 +950,7 @@ didFinishDownloadingToURL:(NSURL *)location
 		}
 		dispatch_group_enter(grp);
 		NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:nsu];
-		[req setValue:@"AltStore/1.6 SweetStore/1.0" forHTTPHeaderField:@"User-Agent"];
+		[req setValue:@"AltStore/2.0 SweetStore/2.0" forHTTPHeaderField:@"User-Agent"];
 		[[repoSess dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
 			(void)resp;
 			if (err || data.length == 0) {
@@ -760,7 +981,9 @@ didFinishDownloadingToURL:(NSURL *)location
 	}
 
 	dispatch_group_notify(grp, dispatch_get_main_queue(), ^{
+		[repoSess finishTasksAndInvalidate];
 		NSMutableArray<SSRepoApp *> *merged = [NSMutableArray array];
+		NSMutableDictionary<NSString *, SSRepoApp *> *byBid = [NSMutableDictionary dictionary];
 		NSMutableSet<NSString *> *seenKeys = [NSMutableSet set];
 		for (NSString *u in urls) {
 			for (SSRepoApp *a in (perSource[u] ?: @[])) {
@@ -770,12 +993,16 @@ didFinishDownloadingToURL:(NSURL *)location
 				if ([seenKeys containsObject:dedupKey]) continue;
 				[seenKeys addObject:dedupKey];
 				[merged addObject:a];
+				if (a.bundleId.length > 0 && !byBid[a.bundleId.lowercaseString]) {
+					byBid[a.bundleId.lowercaseString] = a;
+				}
 			}
 		}
 		[merged sortUsingComparator:^NSComparisonResult(SSRepoApp *x, SSRepoApp *y) {
 			return [x.name localizedCaseInsensitiveCompare:y.name];
 		}];
 		self.allApps = merged;
+		self.repoAppByBundleId = byBid;
 		self.loadingRepos = NO;
 		[[NSNotificationCenter defaultCenter] postNotificationName:SSReposDidChangeNotification object:self];
 	});
@@ -830,10 +1057,10 @@ didFinishDownloadingToURL:(NSURL *)location
 
 		_actionButton = [UIButton buttonWithType:UIButtonTypeSystem];
 		_actionButton.translatesAutoresizingMaskIntoConstraints = NO;
-		_actionButton.titleLabel.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightBold];
+		_actionButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
 		_actionButton.backgroundColor = [UIColor secondarySystemFillColor];
 		_actionButton.layer.cornerRadius = 15.0;
-		_actionButton.contentEdgeInsets = UIEdgeInsetsMake(6, 14, 6, 14);
+		_actionButton.contentEdgeInsets = UIEdgeInsetsMake(6, 12, 6, 12);
 		[_actionButton addTarget:self action:@selector(handleTap) forControlEvents:UIControlEventTouchUpInside];
 		[self.contentView addSubview:_actionButton];
 
@@ -846,7 +1073,7 @@ didFinishDownloadingToURL:(NSURL *)location
 			[_actionButton.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16],
 			[_actionButton.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
 			[_actionButton.heightAnchor constraintEqualToConstant:30],
-			[_actionButton.widthAnchor constraintGreaterThanOrEqualToConstant:66],
+			[_actionButton.widthAnchor constraintGreaterThanOrEqualToConstant:68],
 
 			[_titleLabel.leadingAnchor constraintEqualToAnchor:_iconView.trailingAnchor constant:12],
 			[_titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_actionButton.leadingAnchor constant:-10],
@@ -869,34 +1096,12 @@ didFinishDownloadingToURL:(NSURL *)location
 	if (self.onActionTap) self.onActionTap();
 }
 
-- (void)configureWithApp:(SSRepoApp *)app installed:(BOOL)installed
+- (void)setIconWithURL:(NSString *)iconURL
 {
-	self.titleLabel.text = app.name;
-	NSString *sub = app.subtitle.length > 0 ? app.subtitle : (app.developer.length > 0 ? app.developer : app.bundleId);
-	self.subLabel.text = sub.length > 0 ? sub : @"iOS Application";
-
-	NSMutableArray *parts = [NSMutableArray array];
-	if (app.bestVersion.version.length > 0) [parts addObject:[@"v" stringByAppendingString:app.bestVersion.version]];
-	NSString *sz = SSFormatBytes(app.bestVersion.sizeBytes);
-	if (sz.length > 0) [parts addObject:sz];
-	if (app.sourceName.length > 0) [parts addObject:app.sourceName];
-	if (!SSIsOSVersionCompatible(app.bestVersion.minOSVersion)) {
-		[parts addObject:[NSString stringWithFormat:@"Requires iOS %@+", app.bestVersion.minOSVersion]];
-	}
-	self.metaLabel.text = [parts componentsJoinedByString:@" • "];
-
-	if (installed) {
-		[self.actionButton setTitle:@"OPEN" forState:UIControlStateNormal];
-		[self.actionButton setTitleColor:[UIColor systemGreenColor] forState:UIControlStateNormal];
-	} else {
-		[self.actionButton setTitle:@"GET" forState:UIControlStateNormal];
-		[self.actionButton setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
-	}
-
-	self.loadedIconURL = app.iconURL;
+	self.loadedIconURL = iconURL;
 	self.iconView.image = [[SSIconLoader shared] placeholderIcon];
-	if (app.iconURL.length > 0) {
-		NSString *expected = [app.iconURL copy];
+	if (iconURL.length > 0) {
+		NSString *expected = [iconURL copy];
 		[[SSIconLoader shared] loadIconURL:expected completion:^(UIImage *img) {
 			if ([self.loadedIconURL isEqualToString:expected]) {
 				self.iconView.image = img;
@@ -905,9 +1110,62 @@ didFinishDownloadingToURL:(NSURL *)location
 	}
 }
 
+- (void)configureWithRepoApp:(SSRepoApp *)app installedEntry:(NSDictionary *)inst
+{
+	self.titleLabel.text = app.name;
+	NSString *sub = app.subtitle.length > 0 ? app.subtitle : (app.developer.length > 0 ? app.developer : app.bundleId);
+	self.subLabel.text = sub.length > 0 ? sub : @"Native iOS App";
+
+	NSMutableArray *parts = [NSMutableArray array];
+	if (app.bestVersion.version.length > 0) [parts addObject:[@"v" stringByAppendingString:app.bestVersion.version]];
+	NSString *sz = SSFormatBytes(app.bestVersion.sizeBytes);
+	if (sz.length > 0) [parts addObject:sz];
+	if (app.sourceName.length > 0) [parts addObject:app.sourceName];
+	self.metaLabel.text = [parts componentsJoinedByString:@" • "];
+
+	if (inst) {
+		[self.actionButton setTitle:@"OPEN" forState:UIControlStateNormal];
+		[self.actionButton setTitleColor:[UIColor systemGreenColor] forState:UIControlStateNormal];
+	} else {
+		[self.actionButton setTitle:@"GET" forState:UIControlStateNormal];
+		[self.actionButton setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
+	}
+	[self setIconWithURL:app.iconURL];
+}
+
+- (void)configureWithCatalogItem:(SSStoreCatalogItem *)item installedEntry:(NSDictionary *)inst matchedRepo:(SSRepoApp *)repoApp
+{
+	self.titleLabel.text = item.name;
+	NSMutableArray *subParts = [NSMutableArray array];
+	if (item.developer.length > 0) [subParts addObject:item.developer];
+	if (item.genre.length > 0) [subParts addObject:item.genre];
+	self.subLabel.text = subParts.count > 0 ? [subParts componentsJoinedByString:@" • "] : item.bundleId;
+
+	NSMutableArray *meta = [NSMutableArray array];
+	if (item.rating > 0.0) [meta addObject:[NSString stringWithFormat:@"★ %.1f", item.rating]];
+	if (repoApp) {
+		[meta addObject:[NSString stringWithFormat:@"Native IPA (%@)", repoApp.sourceName ?: @"Repo"]];
+	} else {
+		[meta addObject:@"Instant WebApp"];
+	}
+	self.metaLabel.text = [meta componentsJoinedByString:@" • "];
+
+	if (inst) {
+		[self.actionButton setTitle:@"OPEN" forState:UIControlStateNormal];
+		[self.actionButton setTitleColor:[UIColor systemGreenColor] forState:UIControlStateNormal];
+	} else if (repoApp) {
+		[self.actionButton setTitle:@"GET" forState:UIControlStateNormal];
+		[self.actionButton setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
+	} else {
+		[self.actionButton setTitle:@"WEB APP" forState:UIControlStateNormal];
+		[self.actionButton setTitleColor:[UIColor systemIndigoColor] forState:UIControlStateNormal];
+	}
+	[self setIconWithURL:item.iconURL];
+}
+
 @end
 
-/* ---- App Detail View Controller ---- */
+/* ---- Repo App Detail View Controller ---- */
 
 @interface SSAppDetailViewController : UITableViewController
 @property (nonatomic, strong) SSRepoApp *app;
@@ -927,24 +1185,17 @@ didFinishDownloadingToURL:(NSURL *)location
 - (void)viewDidLoad
 {
 	[super viewDidLoad];
-	[[NSNotificationCenter defaultCenter] addObserver:self.tableView
-	                                         selector:@selector(reloadData)
-	                                             name:SSStateDidChangeNotification
-	                                           object:nil];
+	[[NSNotificationCenter defaultCenter] addObserver:self.tableView selector:@selector(reloadData) name:SSStateDidChangeNotification object:nil];
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
-{
-	(void)tableView;
-	return 3;
-}
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { (void)tableView; return 3; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
 	(void)tableView;
 	if (section == 0) return 2;
 	if (section == 1) return 1;
-	return (NSInteger)MIN(self.app.versions.count, 10);
+	return (NSInteger)MIN(self.app.versions.count, 12);
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
@@ -979,10 +1230,10 @@ didFinishDownloadingToURL:(NSURL *)location
 	}
 	if (indexPath.section == 0 && indexPath.row == 1) {
 		UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-		BOOL isInstalled = (self.app.bundleId.length > 0 && [SSStoreController shared].installedByBundleId[self.app.bundleId] != nil);
+		NSDictionary *inst = [[SSStoreController shared] installedEntryForBundleId:self.app.bundleId];
 		c.textLabel.textAlignment = NSTextAlignmentCenter;
 		c.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
-		if (isInstalled) {
+		if (inst) {
 			c.textLabel.text = [NSString stringWithFormat:@"Open %@ (or Reinstall v%@)", self.app.name, self.app.bestVersion.version];
 			c.textLabel.textColor = [UIColor systemGreenColor];
 		} else {
@@ -1013,9 +1264,8 @@ didFinishDownloadingToURL:(NSURL *)location
 	NSMutableArray *info = [NSMutableArray array];
 	if (v.minOSVersion.length > 0) [info addObject:[NSString stringWithFormat:@"iOS %@+", v.minOSVersion]];
 	if (v.date.length > 0) [info addObject:[v.date substringToIndex:MIN((NSUInteger)10, v.date.length)]];
-	if (!SSIsOSVersionCompatible(v.minOSVersion)) [info addObject:@"May require newer iOS"];
 	c.detailTextLabel.text = info.count > 0 ? [info componentsJoinedByString:@" • "] : v.downloadURL;
-	c.detailTextLabel.textColor = SSIsOSVersionCompatible(v.minOSVersion) ? [UIColor secondaryLabelColor] : [UIColor systemOrangeColor];
+	c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
 	c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 	return c;
 }
@@ -1024,17 +1274,15 @@ didFinishDownloadingToURL:(NSURL *)location
 {
 	[tableView deselectRowAtIndexPath:indexPath animated:YES];
 	if (indexPath.section == 0 && indexPath.row == 1) {
-		BOOL isInstalled = (self.app.bundleId.length > 0 && [SSStoreController shared].installedByBundleId[self.app.bundleId] != nil);
-		if (isInstalled) {
+		NSDictionary *inst = [[SSStoreController shared] installedEntryForBundleId:self.app.bundleId];
+		if (inst) {
 			UIAlertController *ac = [UIAlertController alertControllerWithTitle:self.app.name message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-			[ac addAction:[UIAlertAction actionWithTitle:@"Open App" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-				(void)a;
-				[[SSStoreController shared] openBundleId:self.app.bundleId];
+			[ac addAction:[UIAlertAction actionWithTitle:@"Open App" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+				[[SSStoreController shared] openBundleId:SSString(inst[@"bundleId"])];
 			}]];
 			[ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Reinstall / Update (v%@)", self.app.bestVersion.version]
 			                                       style:UIAlertActionStyleDefault
-			                                     handler:^(UIAlertAction *a) {
-				(void)a;
+			                                     handler:^(__unused UIAlertAction *a) {
 				[[SSStoreController shared] downloadAndInstallURL:self.app.bestVersion.downloadURL title:self.app.name fromVC:self];
 			}]];
 			[ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
@@ -1044,8 +1292,247 @@ didFinishDownloadingToURL:(NSURL *)location
 		}
 	} else if (indexPath.section == 2) {
 		SSAppVersion *v = self.app.versions[(NSUInteger)indexPath.row];
-		NSString *t = [NSString stringWithFormat:@"%@ v%@", self.app.name, v.version];
-		[[SSStoreController shared] downloadAndInstallURL:v.downloadURL title:t fromVC:self];
+		[[SSStoreController shared] downloadAndInstallURL:v.downloadURL title:[NSString stringWithFormat:@"%@ v%@", self.app.name, v.version] fromVC:self];
+	}
+}
+
+@end
+
+/* ---- App Store Catalog Detail View Controller (Screenshots + Native/WebApp Actions) ---- */
+
+@interface SSCatalogDetailViewController : UITableViewController <UIDocumentPickerDelegate>
+@property (nonatomic, strong) SSStoreCatalogItem *item;
+@end
+
+@implementation SSCatalogDetailViewController
+
+- (instancetype)initWithCatalogItem:(SSStoreCatalogItem *)item
+{
+	if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) {
+		_item = item;
+		self.title = item.name;
+	}
+	return self;
+}
+
+- (void)viewDidLoad
+{
+	[super viewDidLoad];
+	[[NSNotificationCenter defaultCenter] addObserver:self.tableView selector:@selector(reloadData) name:SSStateDidChangeNotification object:nil];
+	[[NSNotificationCenter defaultCenter] addObserver:self.tableView selector:@selector(reloadData) name:SSReposDidChangeNotification object:nil];
+
+	/* Enrich RSS chart entries with full iTunes Lookup screenshots & description */
+	if (self.item.screenshotURLs.count == 0 && self.item.bundleId.length > 0) {
+		NSString *enc = [self.item.bundleId stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
+		NSURL *lu = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&country=in", enc]];
+		if (lu) {
+			[[[NSURLSession sharedSession] dataTaskWithURL:lu completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+				(void)resp;
+				if (err || data.length == 0) return;
+				NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+				NSArray *res = [j[@"results"] isKindOfClass:[NSArray class]] ? j[@"results"] : nil;
+				NSDictionary *r = [res.firstObject isKindOfClass:[NSDictionary class]] ? res.firstObject : nil;
+				if (!r) return;
+				dispatch_async(dispatch_get_main_queue(), ^{
+					if ([r[@"screenshotUrls"] isKindOfClass:[NSArray class]]) {
+						self.item.screenshotURLs = r[@"screenshotUrls"];
+					}
+					if (SSString(r[@"description"]).length > 0) self.item.summary = SSString(r[@"description"]);
+					if (SSString(r[@"artworkUrl512"]).length > 0) self.item.iconURL = SSString(r[@"artworkUrl512"]);
+					if (SSString(r[@"sellerUrl"]).length > 0) self.item.sellerURL = SSString(r[@"sellerUrl"]);
+					if ([r[@"averageUserRating"] respondsToSelector:@selector(doubleValue)]) {
+						self.item.rating = [r[@"averageUserRating"] doubleValue];
+					}
+					[self.tableView reloadData];
+				});
+			}] resume];
+		}
+	}
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
+{
+	(void)tableView;
+	return self.item.screenshotURLs.count > 0 ? 3 : 2;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
+{
+	(void)tableView;
+	if (section == 0) return 3;
+	return 1;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
+{
+	(void)tableView;
+	if (section == 0) return @"App Store Listing";
+	if (self.item.screenshotURLs.count > 0 && section == 1) return @"Screenshots";
+	return @"About";
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
+{
+	SSStoreController *sc = [SSStoreController shared];
+	NSDictionary *inst = [sc installedEntryForBundleId:self.item.bundleId];
+	SSRepoApp *repoMatch = [sc matchedRepoAppForBundleId:self.item.bundleId name:self.item.name];
+
+	if (indexPath.section == 0 && indexPath.row == 0) {
+		UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+		c.selectionStyle = UITableViewCellSelectionStyleNone;
+		c.textLabel.text = self.item.name;
+		c.textLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightBold];
+		NSMutableString *det = [NSMutableString stringWithFormat:@"%@\n%@",
+		                        self.item.developer.length > 0 ? self.item.developer : @"App Store Developer",
+		                        self.item.bundleId ?: @""];
+		if (self.item.rating > 0) [det appendFormat:@" • ★ %.1f", self.item.rating];
+		c.detailTextLabel.text = det;
+		c.detailTextLabel.numberOfLines = 0;
+		c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+		c.imageView.image = [[SSIconLoader shared] placeholderIcon];
+		c.imageView.layer.cornerRadius = 11;
+		c.imageView.clipsToBounds = YES;
+		[[SSIconLoader shared] loadIconURL:self.item.iconURL completion:^(UIImage *img) {
+			c.imageView.image = img;
+			[c setNeedsLayout];
+		}];
+		return c;
+	}
+
+	if (indexPath.section == 0 && indexPath.row == 1) {
+		UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+		c.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+		if (inst) {
+			c.textLabel.text = [NSString stringWithFormat:@"Open %@", self.item.name];
+			c.textLabel.textColor = [UIColor systemGreenColor];
+			c.detailTextLabel.text = [NSString stringWithFormat:@"Installed (%@)", SSString(inst[@"kind"])];
+		} else if (repoMatch) {
+			c.textLabel.text = [NSString stringWithFormat:@"Install Native IPA (v%@)", repoMatch.bestVersion.version];
+			c.textLabel.textColor = [UIColor systemBlueColor];
+			c.detailTextLabel.text = [NSString stringWithFormat:@"Matched in %@ • Full ARM64 + Metal2", repoMatch.sourceName ?: @"Repo"];
+		} else {
+			NSDictionary *spec = SSResolveWebAppSpec(self.item.bundleId, self.item.name, self.item.sellerURL);
+			c.textLabel.text = @"Install Standalone Web App";
+			c.textLabel.textColor = [UIColor systemIndigoColor];
+			c.detailTextLabel.text = [NSString stringWithFormat:@"Adds %@ icon to Home Screen (%@)", self.item.name, spec[@"url"]];
+		}
+		c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+		c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+		return c;
+	}
+
+	if (indexPath.section == 0 && indexPath.row == 2) {
+		UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+		c.textLabel.text = @"Import Unencrypted .ipa File for This App...";
+		c.textLabel.font = [UIFont systemFontOfSize:14.5 weight:UIFontWeightMedium];
+		c.textLabel.textColor = [UIColor systemBlueColor];
+		c.imageView.image = [UIImage systemImageNamed:@"arrow.down.doc"];
+		return c;
+	}
+
+	if (self.item.screenshotURLs.count > 0 && indexPath.section == 1) {
+		UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+		c.selectionStyle = UITableViewCellSelectionStyleNone;
+		UIScrollView *sv = [[UIScrollView alloc] init];
+		sv.translatesAutoresizingMaskIntoConstraints = NO;
+		sv.showsHorizontalScrollIndicator = NO;
+		[c.contentView addSubview:sv];
+		[NSLayoutConstraint activateConstraints:@[
+			[sv.topAnchor constraintEqualToAnchor:c.contentView.topAnchor constant:12],
+			[sv.bottomAnchor constraintEqualToAnchor:c.contentView.bottomAnchor constant:-12],
+			[sv.leadingAnchor constraintEqualToAnchor:c.contentView.leadingAnchor],
+			[sv.trailingAnchor constraintEqualToAnchor:c.contentView.trailingAnchor],
+			[sv.heightAnchor constraintEqualToConstant:260],
+		]];
+		NSUInteger cnt = MIN((NSUInteger)5, self.item.screenshotURLs.count);
+		CGFloat x = 16.0;
+		for (NSUInteger i = 0; i < cnt; i++) {
+			UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(x, 0, 146, 260)];
+			iv.backgroundColor = [UIColor secondarySystemFillColor];
+			iv.contentMode = UIViewContentModeScaleAspectFill;
+			iv.layer.cornerRadius = 12.0;
+			iv.clipsToBounds = YES;
+			[sv addSubview:iv];
+			[[SSIconLoader shared] loadRawImageURL:self.item.screenshotURLs[i] completion:^(UIImage *img) {
+				if (img) iv.image = img;
+			}];
+			x += 156.0;
+		}
+		sv.contentSize = CGSizeMake(x + 4.0, 260);
+		return c;
+	}
+
+	UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+	c.selectionStyle = UITableViewCellSelectionStyleNone;
+	c.textLabel.numberOfLines = 0;
+	c.textLabel.font = [UIFont systemFontOfSize:14];
+	c.textLabel.textColor = [UIColor secondaryLabelColor];
+	c.textLabel.text = self.item.summary.length > 0 ? self.item.summary : @"No description available.";
+	return c;
+}
+
+- (void)promptWebAppInstall
+{
+	NSDictionary *spec = SSResolveWebAppSpec(self.item.bundleId, self.item.name, self.item.sellerURL);
+	UIAlertController *ac = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Install %@ Web App", self.item.name]
+	                                                            message:@"Creates a standalone native Home Screen app with official icon & persistent storage:"
+	                                                     preferredStyle:UIAlertControllerStyleAlert];
+	[ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+		tf.text = spec[@"url"];
+		tf.keyboardType = UIKeyboardTypeURL;
+		tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+		tf.autocorrectionType = UITextAutocorrectionTypeNo;
+	}];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Install (Mobile UA)" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+		[[SSStoreController shared] createWebAppWithName:self.item.name
+		                                             url:ac.textFields.firstObject.text
+		                                       userAgent:@"mobile"
+		                                         iconURL:self.item.iconURL
+		                                    origBundleId:self.item.bundleId
+		                                       switchTab:YES];
+	}]];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Install (Desktop UA)" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+		[[SSStoreController shared] createWebAppWithName:self.item.name
+		                                             url:ac.textFields.firstObject.text
+		                                       userAgent:@"desktop"
+		                                         iconURL:self.item.iconURL
+		                                    origBundleId:self.item.bundleId
+		                                       switchTab:YES];
+	}]];
+	[self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
+{
+	[tableView deselectRowAtIndexPath:indexPath animated:YES];
+	if (indexPath.section != 0) return;
+
+	SSStoreController *sc = [SSStoreController shared];
+	NSDictionary *inst = [sc installedEntryForBundleId:self.item.bundleId];
+	SSRepoApp *repoMatch = [sc matchedRepoAppForBundleId:self.item.bundleId name:self.item.name];
+
+	if (indexPath.row == 1) {
+		if (inst) {
+			[sc openBundleId:SSString(inst[@"bundleId"])];
+		} else if (repoMatch) {
+			[sc downloadAndInstallURL:repoMatch.bestVersion.downloadURL title:repoMatch.name fromVC:self];
+		} else {
+			[self promptWebAppInstall];
+		}
+	} else if (indexPath.row == 2) {
+		UTType *ipaType = [UTType typeWithFilenameExtension:@"ipa"] ?: UTTypeData;
+		UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[ipaType, UTTypeArchive, UTTypeData] asCopy:YES];
+		picker.delegate = self;
+		[self presentViewController:picker animated:YES completion:nil];
+	}
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
+{
+	(void)controller;
+	if (urls.firstObject) {
+		[[SSStoreController shared] importExternalFileURL:urls.firstObject switchTab:YES];
 	}
 }
 
@@ -1058,35 +1545,22 @@ didFinishDownloadingToURL:(NSURL *)location
 
 @implementation SSSourcesViewController
 
-- (instancetype)init
-{
-	return [super initWithStyle:UITableViewStyleInsetGrouped];
-}
+- (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
 
 - (void)viewDidLoad
 {
 	[super viewDidLoad];
 	self.title = @"Repo Sources";
-	self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
-	                                                                                      target:self
-	                                                                                      action:@selector(closeSelf)];
-	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
-	                                                                                       target:self
-	                                                                                       action:@selector(promptAddSource)];
-	[[NSNotificationCenter defaultCenter] addObserver:self.tableView
-	                                         selector:@selector(reloadData)
-	                                             name:SSReposDidChangeNotification
-	                                           object:nil];
+	self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(closeSelf)];
+	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(promptAddSource)];
+	[[NSNotificationCenter defaultCenter] addObserver:self.tableView selector:@selector(reloadData) name:SSReposDidChangeNotification object:nil];
 }
 
-- (void)closeSelf
-{
-	[self dismissViewControllerAnimated:YES completion:nil];
-}
+- (void)closeSelf { [self dismissViewControllerAnimated:YES completion:nil]; }
 
 - (void)promptAddSource
 {
-	UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Add AltStore / Feather Repo"
+	UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Add AltStore / SideStore / Feather Repo"
 	                                                            message:@"Paste any JSON repository URL:"
 	                                                     preferredStyle:UIAlertControllerStyleAlert];
 	[ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
@@ -1100,37 +1574,23 @@ didFinishDownloadingToURL:(NSURL *)location
 		}
 	}];
 	[ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-	[ac addAction:[UIAlertAction actionWithTitle:@"Add" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-		(void)a;
-		NSString *u = ac.textFields.firstObject.text;
-		[[SSStoreController shared] addSourceURL:u];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Add" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+		[[SSStoreController shared] addSourceURL:ac.textFields.firstObject.text];
 	}]];
 	[self presentViewController:ac animated:YES completion:nil];
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
-{
-	(void)tableView;
-	return 2;
-}
-
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { (void)tableView; return 2; }
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
 	(void)tableView;
-	if (section == 0) return (NSInteger)[SSStoreController shared].sourceInfos.count;
-	return 1;
+	return section == 0 ? (NSInteger)[SSStoreController shared].sourceInfos.count : 1;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
 	(void)tableView;
 	return section == 0 ? @"Configured JSON Repositories" : @"Actions";
-}
-
-- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
-{
-	(void)tableView;
-	return section == 0 ? @"Compatible with AltStore, SideStore, Feather, and ESign JSON repository URLs. Swipe left to remove a source." : nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -1161,11 +1621,7 @@ didFinishDownloadingToURL:(NSURL *)location
 	return c;
 }
 
-- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath
-{
-	(void)tableView;
-	return indexPath.section == 0;
-}
+- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath { (void)tableView; return indexPath.section == 0; }
 
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath
 {
@@ -1178,14 +1634,232 @@ didFinishDownloadingToURL:(NSURL *)location
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
 {
 	[tableView deselectRowAtIndexPath:indexPath animated:YES];
-	if (indexPath.section == 1) {
-		[[SSStoreController shared] resetDefaultSources];
-	}
+	if (indexPath.section == 1) [[SSStoreController shared] resetDefaultSources];
 }
 
 @end
 
-/* ---- Tab 1: Browse View Controller ---- */
+/* ---- Tab 1: App Store Discover & Live Search (itunes.apple.com) ---- */
+
+@interface SSDiscoverViewController : UITableViewController <UISearchResultsUpdating, UISearchBarDelegate>
+@property (nonatomic, strong) UISearchController *searchController;
+@property (nonatomic, strong) NSArray<SSStoreCatalogItem *> *topCharts;
+@property (nonatomic, strong) NSArray<SSStoreCatalogItem *> *searchResults;
+@property (nonatomic, assign) BOOL loadingCharts;
+@property (nonatomic, assign) BOOL searching;
+@property (nonatomic, copy) NSString *statusText;
+@property (nonatomic, strong) NSTimer *debounceTimer;
+@end
+
+@implementation SSDiscoverViewController
+
+- (void)viewDidLoad
+{
+	[super viewDidLoad];
+	self.title = @"App Store";
+	self.navigationController.navigationBar.prefersLargeTitles = YES;
+	self.tableView.rowHeight = 76.0;
+	[self.tableView registerClass:[SSAppTableCell class] forCellReuseIdentifier:@"CatCell"];
+
+	self.topCharts = @[];
+	self.searchResults = @[];
+
+	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
+	                                                                                       target:self
+	                                                                                       action:@selector(loadTopCharts)];
+
+	self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
+	self.searchController.searchResultsUpdater = self;
+	self.searchController.obscuresBackgroundDuringPresentation = NO;
+	self.searchController.searchBar.placeholder = @"Search any App Store app or game...";
+	self.searchController.searchBar.delegate = self;
+	self.navigationItem.searchController = self.searchController;
+	self.navigationItem.hidesSearchBarWhenScrolling = NO;
+	self.definesPresentationContext = YES;
+
+	UIRefreshControl *rc = [[UIRefreshControl alloc] init];
+	[rc addTarget:self action:@selector(loadTopCharts) forControlEvents:UIControlEventValueChanged];
+	self.refreshControl = rc;
+
+	[[NSNotificationCenter defaultCenter] addObserver:self.tableView selector:@selector(reloadData) name:SSStateDidChangeNotification object:nil];
+	[[NSNotificationCenter defaultCenter] addObserver:self.tableView selector:@selector(reloadData) name:SSReposDidChangeNotification object:nil];
+
+	[self loadTopCharts];
+}
+
+- (void)updateBanner
+{
+	UILabel *hdr = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 36)];
+	hdr.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium];
+	hdr.textColor = [UIColor secondaryLabelColor];
+	hdr.textAlignment = NSTextAlignmentCenter;
+	hdr.text = self.statusText ?: @"Live Apple App Store Catalog • Auto Repo & WebApp Resolver";
+	self.tableView.tableHeaderView = hdr;
+}
+
+- (void)loadTopCharts
+{
+	self.loadingCharts = YES;
+	self.statusText = @"Loading Apple App Store Top Free Charts...";
+	[self updateBanner];
+
+	NSURL *u = [NSURL URLWithString:@"https://itunes.apple.com/in/rss/topfreeapplications/limit=40/json"];
+	[[[NSURLSession sharedSession] dataTaskWithURL:u completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+		(void)resp;
+		NSMutableArray<SSStoreCatalogItem *> *items = [NSMutableArray array];
+		if (!err && data.length > 0) {
+			NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+			NSDictionary *feed = [root[@"feed"] isKindOfClass:[NSDictionary class]] ? root[@"feed"] : nil;
+			NSArray *entries = [feed[@"entry"] isKindOfClass:[NSArray class]] ? feed[@"entry"] : @[];
+			for (NSDictionary *e in entries) {
+				if (![e isKindOfClass:[NSDictionary class]]) continue;
+				SSStoreCatalogItem *it = [[SSStoreCatalogItem alloc] init];
+				it.name = SSString(e[@"im:name"][@"label"]);
+				if (it.name.length == 0) continue;
+				it.bundleId = SSString(e[@"id"][@"attributes"][@"im:bundleId"]);
+				it.trackId = SSString(e[@"id"][@"attributes"][@"im:id"]);
+				it.developer = SSString(e[@"im:artist"][@"label"]);
+				it.genre = SSString(e[@"category"][@"attributes"][@"label"]);
+				it.summary = SSString(e[@"summary"][@"label"]);
+				NSArray *imgs = [e[@"im:image"] isKindOfClass:[NSArray class]] ? e[@"im:image"] : @[];
+				NSDictionary *lastImg = [imgs.lastObject isKindOfClass:[NSDictionary class]] ? imgs.lastObject : nil;
+				NSString *rawIcon = SSString(lastImg[@"label"]);
+				/* Upgrade 100x100 RSS icon URL to 512x512 when served from mzstatic */
+				it.iconURL = [rawIcon stringByReplacingOccurrencesOfString:@"100x100bb" withString:@"512x512bb"];
+				[items addObject:it];
+			}
+		}
+		dispatch_async(dispatch_get_main_queue(), ^{
+			self.loadingCharts = NO;
+			if (self.refreshControl.refreshing) [self.refreshControl endRefreshing];
+			if (items.count > 0) {
+				self.topCharts = items;
+				self.statusText = [NSString stringWithFormat:@"Top %lu Free iPhone Apps • iOS %@", (unsigned long)items.count, SSCurrentIOSVersion()];
+			} else {
+				self.statusText = err ? [NSString stringWithFormat:@"App Store offline (%@)", err.localizedDescription] : @"No chart items returned";
+			}
+			[self updateBanner];
+			[self.tableView reloadData];
+		});
+	}] resume];
+}
+
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController
+{
+	[self.debounceTimer invalidate];
+	NSString *q = [searchController.searchBar.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	if (q.length == 0) {
+		self.searching = NO;
+		self.searchResults = @[];
+		self.statusText = self.topCharts.count > 0
+		                ? [NSString stringWithFormat:@"Top %lu Free iPhone Apps • iOS %@", (unsigned long)self.topCharts.count, SSCurrentIOSVersion()]
+		                : @"Live Apple App Store Catalog";
+		[self updateBanner];
+		[self.tableView reloadData];
+		return;
+	}
+	self.searching = YES;
+	self.debounceTimer = [NSTimer scheduledTimerWithTimeInterval:0.35 repeats:NO block:^(__unused NSTimer *t) {
+		[self performITunesSearch:q];
+	}];
+}
+
+- (void)performITunesSearch:(NSString *)query
+{
+	self.statusText = [NSString stringWithFormat:@"Searching App Store for \"%@\"...", query];
+	[self updateBanner];
+	NSString *enc = [query stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
+	NSURL *u = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/search?country=in&entity=software&limit=35&term=%@", enc]];
+	if (!u) return;
+
+	[[[NSURLSession sharedSession] dataTaskWithURL:u completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+		(void)resp;
+		NSMutableArray<SSStoreCatalogItem *> *out = [NSMutableArray array];
+		if (!err && data.length > 0) {
+			NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+			NSArray *res = [j[@"results"] isKindOfClass:[NSArray class]] ? j[@"results"] : @[];
+			for (NSDictionary *r in res) {
+				if (![r isKindOfClass:[NSDictionary class]]) continue;
+				SSStoreCatalogItem *it = [[SSStoreCatalogItem alloc] init];
+				it.name = SSString(r[@"trackName"]);
+				if (it.name.length == 0) continue;
+				it.bundleId = SSString(r[@"bundleId"]);
+				it.trackId = SSString(r[@"trackId"]);
+				it.developer = SSString(r[@"artistName"]);
+				it.genre = SSString(r[@"primaryGenreName"]);
+				it.summary = SSString(r[@"description"]);
+				it.version = SSString(r[@"version"]);
+				it.sellerURL = SSString(r[@"sellerUrl"]);
+				it.iconURL = SSString(r[@"artworkUrl512"]).length > 0 ? SSString(r[@"artworkUrl512"]) : SSString(r[@"artworkUrl100"]);
+				it.rating = [r[@"averageUserRating"] respondsToSelector:@selector(doubleValue)] ? [r[@"averageUserRating"] doubleValue] : 0.0;
+				it.sizeBytes = [r[@"fileSizeBytes"] respondsToSelector:@selector(longLongValue)] ? [r[@"fileSizeBytes"] longLongValue] : 0;
+				it.screenshotURLs = [r[@"screenshotUrls"] isKindOfClass:[NSArray class]] ? r[@"screenshotUrls"] : @[];
+				[out addObject:it];
+			}
+		}
+		dispatch_async(dispatch_get_main_queue(), ^{
+			if (!self.searching) return;
+			self.searchResults = out;
+			self.statusText = err ? [NSString stringWithFormat:@"Search error: %@", err.localizedDescription]
+			                      : [NSString stringWithFormat:@"%lu App Store results for \"%@\"", (unsigned long)out.count, query];
+			[self updateBanner];
+			[self.tableView reloadData];
+		});
+	}] resume];
+}
+
+- (NSArray<SSStoreCatalogItem *> *)activeList
+{
+	return self.searching ? self.searchResults : self.topCharts;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
+{
+	(void)tableView; (void)section;
+	return (NSInteger)[self activeList].count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
+{
+	SSAppTableCell *cell = [tableView dequeueReusableCellWithIdentifier:@"CatCell" forIndexPath:indexPath];
+	SSStoreCatalogItem *item = [self activeList][(NSUInteger)indexPath.row];
+	SSStoreController *sc = [SSStoreController shared];
+	NSDictionary *inst = [sc installedEntryForBundleId:item.bundleId];
+	SSRepoApp *repoMatch = [sc matchedRepoAppForBundleId:item.bundleId name:item.name];
+	[cell configureWithCatalogItem:item installedEntry:inst matchedRepo:repoMatch];
+
+	__weak typeof(self) weakSelf = self;
+	cell.onActionTap = ^{
+		__strong typeof(weakSelf) strongSelf = weakSelf;
+		if (!strongSelf) return;
+		if (inst) {
+			[sc openBundleId:SSString(inst[@"bundleId"])];
+		} else if (repoMatch) {
+			[sc downloadAndInstallURL:repoMatch.bestVersion.downloadURL title:repoMatch.name fromVC:strongSelf];
+		} else {
+			NSDictionary *spec = SSResolveWebAppSpec(item.bundleId, item.name, item.sellerURL);
+			[sc createWebAppWithName:item.name
+			                     url:spec[@"url"]
+			               userAgent:spec[@"ua"]
+			                 iconURL:item.iconURL
+			            origBundleId:item.bundleId
+			               switchTab:YES];
+		}
+	};
+	return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
+{
+	[tableView deselectRowAtIndexPath:indexPath animated:YES];
+	SSStoreCatalogItem *item = [self activeList][(NSUInteger)indexPath.row];
+	SSCatalogDetailViewController *vc = [[SSCatalogDetailViewController alloc] initWithCatalogItem:item];
+	[self.navigationController pushViewController:vc animated:YES];
+}
+
+@end
+
+/* ---- Tab 2: Repos (Native cryptid=0 IPAs) ---- */
 
 @interface SSBrowseViewController : UITableViewController <UISearchResultsUpdating>
 @property (nonatomic, strong) UISearchController *searchController;
@@ -1197,23 +1871,18 @@ didFinishDownloadingToURL:(NSURL *)location
 - (void)viewDidLoad
 {
 	[super viewDidLoad];
-	self.title = @"SweetStore";
+	self.title = @"Repos";
 	self.navigationController.navigationBar.prefersLargeTitles = YES;
 	self.tableView.rowHeight = 76.0;
 	[self.tableView registerClass:[SSAppTableCell class] forCellReuseIdentifier:@"AppCell"];
 
-	self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Sources"
-	                                                                         style:UIBarButtonItemStylePlain
-	                                                                        target:self
-	                                                                        action:@selector(openSources)];
-	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
-	                                                                                       target:self
-	                                                                                       action:@selector(refreshRepos)];
+	self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Sources" style:UIBarButtonItemStylePlain target:self action:@selector(openSources)];
+	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshRepos)];
 
 	self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
 	self.searchController.searchResultsUpdater = self;
 	self.searchController.obscuresBackgroundDuringPresentation = NO;
-	self.searchController.searchBar.placeholder = @"Search YouTube, WhatsApp, tools, games...";
+	self.searchController.searchBar.placeholder = @"Filter native .ipa repositories...";
 	self.navigationItem.searchController = self.searchController;
 	self.navigationItem.hidesSearchBarWhenScrolling = NO;
 	self.definesPresentationContext = YES;
@@ -1230,20 +1899,12 @@ didFinishDownloadingToURL:(NSURL *)location
 
 - (void)openSources
 {
-	SSSourcesViewController *vc = [[SSSourcesViewController alloc] init];
-	UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+	UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[[SSSourcesViewController alloc] init]];
 	[self presentViewController:nav animated:YES completion:nil];
 }
 
-- (void)refreshRepos
-{
-	[[SSStoreController shared] reloadAllRepos];
-}
-
-- (void)stateUpdated
-{
-	[self.tableView reloadData];
-}
+- (void)refreshRepos { [[SSStoreController shared] reloadAllRepos]; }
+- (void)stateUpdated { [self.tableView reloadData]; }
 
 - (void)reposUpdated
 {
@@ -1278,24 +1939,16 @@ didFinishDownloadingToURL:(NSURL *)location
 		}
 		self.filteredApps = out;
 	}
-	[self updateHeaderBanner];
-	[self.tableView reloadData];
-}
-
-- (void)updateHeaderBanner
-{
 	UILabel *hdr = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 34)];
 	hdr.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium];
 	hdr.textColor = [UIColor secondaryLabelColor];
 	hdr.textAlignment = NSTextAlignmentCenter;
-	if ([SSStoreController shared].loadingRepos) {
-		hdr.text = @"Refreshing repositories...";
-	} else {
-		hdr.text = [NSString stringWithFormat:@"%lu apps across %lu sources • Permanent on-device signing",
-		            (unsigned long)self.filteredApps.count,
-		            (unsigned long)[SSStoreController shared].sourceURLs.count];
-	}
+	hdr.text = [SSStoreController shared].loadingRepos
+	         ? @"Refreshing native IPA repositories..."
+	         : [NSString stringWithFormat:@"%lu native IPAs across %lu sources • De-PAC + Ad-Hoc Signed",
+	            (unsigned long)self.filteredApps.count, (unsigned long)[SSStoreController shared].sourceURLs.count];
 	self.tableView.tableHeaderView = hdr;
+	[self.tableView reloadData];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
@@ -1308,14 +1961,14 @@ didFinishDownloadingToURL:(NSURL *)location
 {
 	SSAppTableCell *cell = [tableView dequeueReusableCellWithIdentifier:@"AppCell" forIndexPath:indexPath];
 	SSRepoApp *app = self.filteredApps[(NSUInteger)indexPath.row];
-	BOOL installed = (app.bundleId.length > 0 && [SSStoreController shared].installedByBundleId[app.bundleId] != nil);
-	[cell configureWithApp:app installed:installed];
+	NSDictionary *inst = [[SSStoreController shared] installedEntryForBundleId:app.bundleId];
+	[cell configureWithRepoApp:app installedEntry:inst];
 	__weak typeof(self) weakSelf = self;
 	cell.onActionTap = ^{
 		__strong typeof(weakSelf) strongSelf = weakSelf;
 		if (!strongSelf) return;
-		if (installed) {
-			[[SSStoreController shared] openBundleId:app.bundleId];
+		if (inst) {
+			[[SSStoreController shared] openBundleId:SSString(inst[@"bundleId"])];
 		} else {
 			[[SSStoreController shared] downloadAndInstallURL:app.bestVersion.downloadURL title:app.name fromVC:strongSelf];
 		}
@@ -1327,13 +1980,12 @@ didFinishDownloadingToURL:(NSURL *)location
 {
 	[tableView deselectRowAtIndexPath:indexPath animated:YES];
 	SSRepoApp *app = self.filteredApps[(NSUInteger)indexPath.row];
-	SSAppDetailViewController *detail = [[SSAppDetailViewController alloc] initWithApp:app];
-	[self.navigationController pushViewController:detail animated:YES];
+	[self.navigationController pushViewController:[[SSAppDetailViewController alloc] initWithApp:app] animated:YES];
 }
 
 @end
 
-/* ---- Tab 2: Direct URL & Local IPA Installer ---- */
+/* ---- Tab 3: Install IPA / Wi-Fi Dropzone / Custom WebApp ---- */
 
 @interface SSInstallViewController : UITableViewController <UIDocumentPickerDelegate, UITextFieldDelegate>
 @property (nonatomic, strong) UITextField *urlField;
@@ -1341,15 +1993,12 @@ didFinishDownloadingToURL:(NSURL *)location
 
 @implementation SSInstallViewController
 
-- (instancetype)init
-{
-	return [super initWithStyle:UITableViewStyleInsetGrouped];
-}
+- (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
 
 - (void)viewDidLoad
 {
 	[super viewDidLoad];
-	self.title = @"Install IPA";
+	self.title = @"Install";
 	self.navigationController.navigationBar.prefersLargeTitles = YES;
 
 	_urlField = [[UITextField alloc] init];
@@ -1362,10 +2011,7 @@ didFinishDownloadingToURL:(NSURL *)location
 	_urlField.returnKeyType = UIReturnKeyGo;
 	_urlField.delegate = self;
 
-	[[NSNotificationCenter defaultCenter] addObserver:self.tableView
-	                                         selector:@selector(reloadData)
-	                                             name:SSStateDidChangeNotification
-	                                           object:nil];
+	[[NSNotificationCenter defaultCenter] addObserver:self.tableView selector:@selector(reloadData) name:SSStateDidChangeNotification object:nil];
 }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)textField
@@ -1377,17 +2023,14 @@ didFinishDownloadingToURL:(NSURL *)location
 	return YES;
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
-{
-	(void)tableView;
-	return 3;
-}
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { (void)tableView; return 4; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
 	(void)tableView;
 	if (section == 0) return 1;
-	if (section == 1) return 3;
+	if (section == 1) return 2;
+	if (section == 2) return 3;
 	return 1 + (NSInteger)[SSStoreController shared].localIpas.count;
 }
 
@@ -1395,17 +2038,9 @@ didFinishDownloadingToURL:(NSURL *)location
 {
 	(void)tableView;
 	if (section == 0) return @"Installer Status";
-	if (section == 1) return @"Install from Direct .ipa Link";
+	if (section == 1) return @"Wi-Fi Browser Upload & WebApp Studio";
+	if (section == 2) return @"Install from Direct .ipa Link";
 	return @"Install from Device Storage";
-}
-
-- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
-{
-	(void)tableView;
-	if (section == 2) {
-		return @"Drop any decrypted .ipa (cryptid=0) into Safari Downloads or /var/local/ipa, or import via Files. Apps are ad-hoc SHA-256 signed on-device and never expire.";
-	}
-	return nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -1462,29 +2097,53 @@ didFinishDownloadingToURL:(NSURL *)location
 		} else if ([jState isEqualToString:@"done"]) {
 			c.textLabel.text = jStep.length > 0 ? jStep : @"Installation Complete!";
 			c.textLabel.textColor = [UIColor systemGreenColor];
-			c.detailTextLabel.text = jBid.length > 0 ? [NSString stringWithFormat:@"%@ • Added to Home Screen", jBid] : @"Added to Home Screen";
+			c.detailTextLabel.text = jBid.length > 0 ? [NSString stringWithFormat:@"%@ • Tap to Open", jBid] : @"Added to Home Screen";
 			c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
 			if (jBid.length > 0) {
 				c.selectionStyle = UITableViewCellSelectionStyleDefault;
 				c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 			}
 		} else if (!sc.daemonOnline) {
-			c.textLabel.text = @"Connecting to sweetstored...";
+			c.textLabel.text = @"Connecting to sweetstored v2...";
 			c.textLabel.textColor = [UIColor systemOrangeColor];
 			c.detailTextLabel.text = @"Waiting for local installer daemon on 127.0.0.1:29170";
 			c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
 		} else {
-			c.textLabel.text = @"sweetstored Ready";
+			c.textLabel.text = @"sweetstored v2 Ready (iOS 26 De-PAC + AppFix)";
 			c.textLabel.textColor = [UIColor systemGreenColor];
-			c.detailTextLabel.text = [NSString stringWithFormat:@"%lu installed apps • %lu local .ipa files found",
-			                          (unsigned long)sc.installedApps.count,
-			                          (unsigned long)sc.localIpas.count];
+			c.detailTextLabel.text = [NSString stringWithFormat:@"%lu installed apps • %lu local .ipa files",
+			                          (unsigned long)sc.installedApps.count, (unsigned long)sc.localIpas.count];
 			c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
 		}
 		return c;
 	}
 
 	if (indexPath.section == 1) {
+		if (indexPath.row == 0) {
+			UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+			c.textLabel.text = @"Wi-Fi Browser .ipa Dropzone";
+			c.textLabel.font = [UIFont systemFontOfSize:15.5 weight:UIFontWeightSemibold];
+			c.detailTextLabel.text = sc.lanEnabled
+			                       ? (sc.lanURL.length > 0 ? [NSString stringWithFormat:@"Open %@ on your PC/Mac", sc.lanURL] : @"Active on port 29172")
+			                       : @"Upload .ipa files from any browser over Wi-Fi";
+			c.detailTextLabel.textColor = sc.lanEnabled ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+			UISwitch *sw = [[UISwitch alloc] init];
+			sw.on = sc.lanEnabled;
+			[sw addTarget:self action:@selector(toggleLanSwitch:) forControlEvents:UIControlEventValueChanged];
+			c.accessoryView = sw;
+			return c;
+		}
+		UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+		c.textLabel.text = @"Create Custom Standalone Web App...";
+		c.textLabel.font = [UIFont systemFontOfSize:15.5 weight:UIFontWeightSemibold];
+		c.textLabel.textColor = [UIColor systemIndigoColor];
+		c.detailTextLabel.text = @"Turn any website into a native Home Screen app";
+		c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+		c.imageView.image = [UIImage systemImageNamed:@"globe.badge.chevron.backward"];
+		return c;
+	}
+
+	if (indexPath.section == 2) {
 		if (indexPath.row == 0) {
 			UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
 			c.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -1528,6 +2187,45 @@ didFinishDownloadingToURL:(NSURL *)location
 	return c;
 }
 
+- (void)toggleLanSwitch:(UISwitch *)sw
+{
+	[[SSStoreController shared] setLanUploadEnabled:sw.isOn completion:nil];
+}
+
+- (void)promptCustomWebApp
+{
+	UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Create Standalone Web App"
+	                                                            message:@"Installs a real full-screen 20:9 WKWebView app onto your Home Screen:"
+	                                                     preferredStyle:UIAlertControllerStyleAlert];
+	[ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+		tf.placeholder = @"App Name (e.g. YouTube Studio)";
+	}];
+	[ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+		tf.placeholder = @"https://example.com";
+		tf.keyboardType = UIKeyboardTypeURL;
+		tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+		tf.autocorrectionType = UITextAutocorrectionTypeNo;
+	}];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Install (Mobile)" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+		[[SSStoreController shared] createWebAppWithName:ac.textFields[0].text
+		                                             url:ac.textFields[1].text
+		                                       userAgent:@"mobile"
+		                                         iconURL:@""
+		                                    origBundleId:@""
+		                                       switchTab:NO];
+	}]];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Install (Desktop)" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+		[[SSStoreController shared] createWebAppWithName:ac.textFields[0].text
+		                                             url:ac.textFields[1].text
+		                                       userAgent:@"desktop"
+		                                         iconURL:@""
+		                                    origBundleId:@""
+		                                       switchTab:NO];
+	}]];
+	[self presentViewController:ac animated:YES completion:nil];
+}
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
 {
 	[tableView deselectRowAtIndexPath:indexPath animated:YES];
@@ -1541,8 +2239,20 @@ didFinishDownloadingToURL:(NSURL *)location
 		}
 		return;
 	}
-
 	if (indexPath.section == 1) {
+		if (indexPath.row == 0 && sc.lanURL.length > 0) {
+			[UIPasteboard generalPasteboard].string = sc.lanURL;
+			UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Copied Upload URL"
+			                                                            message:sc.lanURL
+			                                                     preferredStyle:UIAlertControllerStyleAlert];
+			[ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+			[self presentViewController:ac animated:YES completion:nil];
+		} else if (indexPath.row == 1) {
+			[self promptCustomWebApp];
+		}
+		return;
+	}
+	if (indexPath.section == 2) {
 		if (indexPath.row == 1) {
 			[self.urlField resignFirstResponder];
 			[sc downloadAndInstallURL:self.urlField.text title:nil fromVC:self];
@@ -1553,7 +2263,6 @@ didFinishDownloadingToURL:(NSURL *)location
 		}
 		return;
 	}
-
 	if (indexPath.row == 0) {
 		UTType *ipaType = [UTType typeWithFilenameExtension:@"ipa"] ?: UTTypeData;
 		UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[ipaType, UTTypeArchive, UTTypeData] asCopy:YES];
@@ -1563,9 +2272,7 @@ didFinishDownloadingToURL:(NSURL *)location
 	}
 
 	NSDictionary *item = sc.localIpas[(NSUInteger)(indexPath.row - 1)];
-	NSString *path = SSString(item[@"path"]);
-	NSString *name = SSString(item[@"name"]);
-	[sc installLocalFile:path deleteAfter:NO title:[name stringByDeletingPathExtension]];
+	[sc installLocalFile:SSString(item[@"path"]) deleteAfter:NO title:[SSString(item[@"name"]) stringByDeletingPathExtension]];
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
@@ -1578,31 +2285,71 @@ didFinishDownloadingToURL:(NSURL *)location
 
 @end
 
-/* ---- Tab 3: Installed Apps ---- */
+/* ---- AppFix Log Viewer Modal ---- */
+
+@interface SSLogViewController : UIViewController
+@property (nonatomic, strong) UITextView *textView;
+@end
+
+@implementation SSLogViewController
+
+- (void)viewDidLoad
+{
+	[super viewDidLoad];
+	self.title = @"AppFix Runtime Log";
+	self.view.backgroundColor = [UIColor systemBackgroundColor];
+	self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(closeSelf)];
+	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Clear" style:UIBarButtonItemStylePlain target:self action:@selector(clearLog)];
+
+	self.textView = [[UITextView alloc] initWithFrame:self.view.bounds];
+	self.textView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+	self.textView.editable = NO;
+	self.textView.font = [UIFont monospacedSystemFontOfSize:11.5 weight:UIFontWeightRegular];
+	[self.view addSubview:self.textView];
+	[self reloadLog];
+}
+
+- (void)closeSelf { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+- (void)reloadLog
+{
+	[[SSStoreController shared] fetchAppFixLogWithCompletion:^(NSString *log) {
+		self.textView.text = log.length > 0 ? log : @"(No appfix runtime events logged yet. Launch any installed third-party app to see container, AppGroup, and Keychain diagnostics here.)";
+	}];
+}
+
+- (void)clearLog
+{
+	[[SSStoreController shared] clearAppFixLogWithCompletion:^(__unused BOOL ok) {
+		[self reloadLog];
+	}];
+}
+
+@end
+
+/* ---- Tab 4: Installed Apps & Per-App GPU/Container Manager ---- */
 
 @interface SSInstalledViewController : UITableViewController
 @end
 
 @implementation SSInstalledViewController
 
-- (instancetype)init
-{
-	return [super initWithStyle:UITableViewStyleInsetGrouped];
-}
+- (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
 
 - (void)viewDidLoad
 {
 	[super viewDidLoad];
 	self.title = @"Installed";
 	self.navigationController.navigationBar.prefersLargeTitles = YES;
-	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Rebuild Icons"
-	                                                                          style:UIBarButtonItemStylePlain
-	                                                                         target:self
-	                                                                         action:@selector(rebuildIcons)];
-	[[NSNotificationCenter defaultCenter] addObserver:self.tableView
-	                                         selector:@selector(reloadData)
-	                                             name:SSStateDidChangeNotification
-	                                           object:nil];
+	self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"AppFix Log" style:UIBarButtonItemStylePlain target:self action:@selector(openLog)];
+	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Rebuild Icons" style:UIBarButtonItemStylePlain target:self action:@selector(rebuildIcons)];
+	[[NSNotificationCenter defaultCenter] addObserver:self.tableView selector:@selector(reloadData) name:SSStateDidChangeNotification object:nil];
+}
+
+- (void)openLog
+{
+	UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[[SSLogViewController alloc] init]];
+	[self presentViewController:nav animated:YES completion:nil];
 }
 
 - (void)rebuildIcons
@@ -1627,7 +2374,7 @@ didFinishDownloadingToURL:(NSURL *)location
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
 	(void)tableView; (void)section;
-	return @"Tap an app to launch it on SpringBoard, or swipe left to uninstall it from /Applications.";
+	return @"Tap an app to launch, toggle Adreno 640 Metal2 GPU / CPU rendering, or uninstall.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -1636,7 +2383,7 @@ didFinishDownloadingToURL:(NSURL *)location
 	if (apps.count == 0) {
 		UITableViewCell *empty = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
 		empty.selectionStyle = UITableViewCellSelectionStyleNone;
-		empty.textLabel.text = @"No third-party apps installed yet";
+		empty.textLabel.text = @"No apps installed yet — check App Store or Repos";
 		empty.textLabel.textColor = [UIColor secondaryLabelColor];
 		empty.textLabel.textAlignment = NSTextAlignmentCenter;
 		return empty;
@@ -1647,51 +2394,21 @@ didFinishDownloadingToURL:(NSURL *)location
 	NSDictionary *app = apps[(NSUInteger)indexPath.row];
 	c.textLabel.text = SSString(app[@"name"]);
 	c.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-	c.detailTextLabel.text = [NSString stringWithFormat:@"v%@ • %@", SSString(app[@"version"]), SSString(app[@"bundleId"])];
+	BOOL gpuOn = [app[@"gpuEnabled"] respondsToSelector:@selector(boolValue)] ? [app[@"gpuEnabled"] boolValue] : YES;
+	NSString *kind = [SSString(app[@"kind"]) isEqualToString:@"webapp"] ? @"WebApp" : [NSString stringWithFormat:@"v%@", SSString(app[@"version"])];
+	c.detailTextLabel.text = [NSString stringWithFormat:@"%@ • %@ • %@",
+	                          kind, gpuOn ? @"GPU: Metal2" : @"CPU Mode", SSString(app[@"bundleId"])];
 	c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
 
 	NSString *appDir = SSString(app[@"path"]);
-	UIImage *bundleIcon = [UIImage imageWithContentsOfFile:[appDir stringByAppendingPathComponent:@"AppIcon60x60@2x.png"]]
-	                   ?: [UIImage imageWithContentsOfFile:[appDir stringByAppendingPathComponent:@"AppIcon60x60@3x.png"]]
+	UIImage *bundleIcon = [UIImage imageWithContentsOfFile:[appDir stringByAppendingPathComponent:@"AppIcon60x60@3x.png"]]
+	                   ?: [UIImage imageWithContentsOfFile:[appDir stringByAppendingPathComponent:@"AppIcon60x60@2x.png"]]
 	                   ?: [[SSIconLoader shared] placeholderIcon];
 	c.imageView.image = bundleIcon;
 	c.imageView.layer.cornerRadius = 10;
 	c.imageView.clipsToBounds = YES;
-
-	UILabel *openBadge = [[UILabel alloc] init];
-	openBadge.text = @"OPEN";
-	openBadge.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
-	openBadge.textColor = [UIColor systemBlueColor];
-	[openBadge sizeToFit];
-	c.accessoryView = openBadge;
+	c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 	return c;
-}
-
-- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath
-{
-	(void)tableView; (void)indexPath;
-	return [SSStoreController shared].installedApps.count > 0;
-}
-
-- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath
-{
-	(void)tableView;
-	if (editingStyle != UITableViewCellEditingStyleDelete) return;
-	NSArray *apps = [SSStoreController shared].installedApps;
-	if ((NSUInteger)indexPath.row >= apps.count) return;
-	NSDictionary *app = apps[(NSUInteger)indexPath.row];
-	NSString *dirName = SSString(app[@"dirName"]);
-	NSString *name = SSString(app[@"name"]);
-
-	UIAlertController *ac = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Uninstall %@?", name]
-	                                                            message:@"This removes the app bundle from /Applications."
-	                                                     preferredStyle:UIAlertControllerStyleAlert];
-	[ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-	[ac addAction:[UIAlertAction actionWithTitle:@"Uninstall" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-		(void)a;
-		[[SSStoreController shared] uninstallDirName:dirName completion:nil];
-	}]];
-	[self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
@@ -1700,7 +2417,30 @@ didFinishDownloadingToURL:(NSURL *)location
 	NSArray *apps = [SSStoreController shared].installedApps;
 	if ((NSUInteger)indexPath.row >= apps.count) return;
 	NSDictionary *app = apps[(NSUInteger)indexPath.row];
-	[[SSStoreController shared] openBundleId:SSString(app[@"bundleId"])];
+	NSString *name = SSString(app[@"name"]);
+	NSString *bid = SSString(app[@"bundleId"]);
+	NSString *dirName = SSString(app[@"dirName"]);
+	NSString *execName = SSString(app[@"execName"]);
+	BOOL gpuOn = [app[@"gpuEnabled"] respondsToSelector:@selector(boolValue)] ? [app[@"gpuEnabled"] boolValue] : YES;
+
+	UIAlertController *ac = [UIAlertController alertControllerWithTitle:name message:bid preferredStyle:UIAlertControllerStyleActionSheet];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Open App" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+		[[SSStoreController shared] openBundleId:bid];
+	}]];
+	if (execName.length > 0) {
+		NSString *gpuTitle = gpuOn ? @"Switch to CPU Rendering (Compatibility Mode)" : @"Enable Adreno 640 Metal2 GPU";
+		[ac addAction:[UIAlertAction actionWithTitle:gpuTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+			[[SSStoreController shared] setGPUMode:!gpuOn forExecName:execName completion:nil];
+		}]];
+	}
+	[ac addAction:[UIAlertAction actionWithTitle:@"Uninstall (Keep App Data)" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+		[[SSStoreController shared] uninstallDirName:dirName deleteData:NO completion:nil];
+	}]];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Uninstall & Delete App Data" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+		[[SSStoreController shared] uninstallDirName:dirName deleteData:YES completion:nil];
+	}]];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+	[self presentViewController:ac animated:YES completion:nil];
 }
 
 @end
@@ -1717,26 +2457,20 @@ didFinishDownloadingToURL:(NSURL *)location
 {
 	(void)application; (void)launchOptions;
 
-	SSBrowseViewController *browseVC = [[SSBrowseViewController alloc] initWithStyle:UITableViewStylePlain];
-	UINavigationController *browseNav = [[UINavigationController alloc] initWithRootViewController:browseVC];
-	browseNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Browse"
-	                                                     image:[UIImage systemImageNamed:@"square.grid.2x2.fill"]
-	                                                       tag:0];
+	UINavigationController *discNav = [[UINavigationController alloc] initWithRootViewController:[[SSDiscoverViewController alloc] initWithStyle:UITableViewStylePlain]];
+	discNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"App Store" image:[UIImage systemImageNamed:@"bag.fill"] tag:0];
 
-	SSInstallViewController *installVC = [[SSInstallViewController alloc] init];
-	UINavigationController *installNav = [[UINavigationController alloc] initWithRootViewController:installVC];
-	installNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Install IPA"
-	                                                      image:[UIImage systemImageNamed:@"arrow.down.doc.fill"]
-	                                                        tag:1];
+	UINavigationController *reposNav = [[UINavigationController alloc] initWithRootViewController:[[SSBrowseViewController alloc] initWithStyle:UITableViewStylePlain]];
+	reposNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Repos" image:[UIImage systemImageNamed:@"square.grid.2x2.fill"] tag:1];
 
-	SSInstalledViewController *installedVC = [[SSInstalledViewController alloc] init];
-	UINavigationController *installedNav = [[UINavigationController alloc] initWithRootViewController:installedVC];
-	installedNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Installed"
-	                                                        image:[UIImage systemImageNamed:@"checkmark.seal.fill"]
-	                                                          tag:2];
+	UINavigationController *installNav = [[UINavigationController alloc] initWithRootViewController:[[SSInstallViewController alloc] init]];
+	installNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Install" image:[UIImage systemImageNamed:@"arrow.down.doc.fill"] tag:2];
+
+	UINavigationController *installedNav = [[UINavigationController alloc] initWithRootViewController:[[SSInstalledViewController alloc] init]];
+	installedNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Installed" image:[UIImage systemImageNamed:@"checkmark.seal.fill"] tag:3];
 
 	UITabBarController *tabs = [[UITabBarController alloc] init];
-	tabs.viewControllers = @[browseNav, installNav, installedNav];
+	tabs.viewControllers = @[discNav, reposNav, installNav, installedNav];
 
 	[SSStoreController shared].rootTabs = tabs;
 	[[SSStoreController shared] startPolling];
@@ -1751,7 +2485,7 @@ didFinishDownloadingToURL:(NSURL *)location
 - (BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey,id> *)options
 {
 	(void)app; (void)options;
-	if ([url isFileURL]) {
+	if (url.isFileURL) {
 		[[SSStoreController shared] importExternalFileURL:url switchTab:YES];
 		return YES;
 	}

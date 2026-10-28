@@ -55,19 +55,10 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[1], "-p")) {
 			int bad = 0;
 			for (int i = 2; i < argc; i++) {
-				/* what -registerPlugin: does, keeping the status it throws away */
 				NSURL *u = [NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[i]]];
-				/* not exported: -registerPlugin: calls it with bl at +0x28, target = start + 0x334 (20H392) */
-				IMP imp = [ws methodForSelector:@selector(registerPlugin:)];
-				printf("registerPlugin: at %p\n", (void *)imp);
-				if (!imp)
-					return 1;
-				uint32_t bl = *(uint32_t *)((char *)imp + 0x28);
-				int (*reg)(NSURL *, NSDictionary *) = (bl >> 26) == 0x25 ?
-					(void *)((char *)imp + 0x28 + ((int32_t)(bl << 6) >> 4)) : NULL;
-				int st = reg ? reg(u, nil) : -1;
-				printf("register plugin %s -> %d\n", argv[i], st);
-				bad += st != 0;
+				BOOL ok = [ws respondsToSelector:@selector(registerPlugin:)] ? [ws registerPlugin:u] : NO;
+				printf("register plugin %s -> %d\n", argv[i], ok);
+				bad += !ok;
 			}
 			return bad != 0;
 		}

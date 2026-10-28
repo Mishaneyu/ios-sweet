@@ -15,7 +15,7 @@ codesign -f -s - out/libsweet_media.dylib 2>/dev/null
 
 "$CC" -O2 -Wall -Wextra -Wno-unused-parameter -dynamiclib \
 	-install_name /usr/local/lib/libsweet_sysfix.dylib \
-	-framework CoreFoundation -lobjc \
+	-framework CoreFoundation -framework Foundation -lobjc \
 	-Wl,-dead_strip -o out/libsweet_sysfix.dylib inject_sysfix.c
 strip -x out/libsweet_sysfix.dylib
 codesign -f -s - out/libsweet_sysfix.dylib 2>/dev/null
