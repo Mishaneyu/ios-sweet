@@ -1,0 +1,405 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 1d5cc18..b87a0de 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -8,8 +8,8 @@
+  *   1       all-core max turbo (1785 / 2419 / 2956 MHz; high voltage/heat)
+  *   2       static voltage-knee sweet spot (1632 / 1805 / 2016 MHz)
+  *   3       (default) dynamic touch + frame-rate OSM governor:
+- *             - Active / Touch / Boot (<45s): 1785 / 2131 / 2419 MHz
+- *             - Screen-On Idle:                941 / 1056 / 1056 MHz
++ *             - Active / Touch / Boot (<45s): 1785 / 2419 / 2841 MHz
++ *             - Screen-On Idle:               1382 / 1708 / 1900 MHz
+  *             - Screen-Off Sleep:              576 /  710 /  825 MHz
+  *   N > 3   static highest entry at or below N MHz across all clusters
+  */
+@@ -35,7 +35,7 @@ void sweet_cpufreq_init(void);
+ #define OSM_CLUSTERS            3u
+ #define OSM_GOV_TICK_MS         250u
+ #define OSM_BOOT_BOOST_NS       (45ULL * NSEC_PER_SEC)
+-#define OSM_TOUCH_BOOST_NS      (1200ULL * NSEC_PER_MSEC)
++#define OSM_TOUCH_BOOST_NS      (3000ULL * NSEC_PER_MSEC)
+ 
+ enum {
+ 	OSM_TIER_SLEEP  = 0,
+@@ -50,9 +50,9 @@ static const struct {
+ 	unsigned sweet_mhz;
+ 	unsigned tier_cap_mhz[OSM_TIERS];       /* SLEEP, IDLE, ACTIVE */
+ } osm_clusters[OSM_CLUSTERS] = {
+-	{"pwrcl (A55 x4)",     0x18323000u, 1632u, { 576u,  941u, 1786u}},
+-	{"perfcl (A76 x3)",    0x18325800u, 1805u, { 711u, 1056u, 2132u}},
+-	{"perfpcl (A76 prime)",0x18327800u, 2016u, { 826u, 1056u, 2420u}},
++	{"pwrcl (A55 x4)",     0x18323000u, 1632u, { 576u, 1383u, 1786u}},
++	{"perfcl (A76 x3)",    0x18325800u, 1805u, { 711u, 1709u, 2420u}},
++	{"perfpcl (A76 prime)",0x18327800u, 2016u, { 826u, 1901u, 2842u}},
+ };
+ 
+ static vm_offset_t osm_base[OSM_CLUSTERS];
+@@ -153,7 +153,7 @@ osm_gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	osm_last_swaps = swaps;
+ 
+ 	int want_tier;
+-	if (boot_ns < OSM_BOOT_BOOST_NS || touch_ns < OSM_TOUCH_BOOST_NS || delta_swaps >= 4u) {
++	if (boot_ns < OSM_BOOT_BOOST_NS || touch_ns < OSM_TOUCH_BOOST_NS || delta_swaps >= 2u) {
+ 		want_tier = OSM_TIER_ACTIVE;
+ 	} else if (sweet_fb_is_blanked()) {
+ 		want_tier = OSM_TIER_SLEEP;
+@@ -204,7 +204,8 @@ sweet_cpufreq_init(void)
+ 				len += snprintf(line + len, sizeof(line) - len, " %u%s", khz / 1000,
+ 				    cores == 1 ? "*" : "");
+ 			}
+-			if (cores == 1) {
++			/* Cluster 2 (perfpcl) is a physical 1-core cluster; its top OPPs all report cores==1. */
++			if (cores == 1 && c != 2u) {
+ 				continue;
+ 			}
+ 			for (unsigned t = 0; t < OSM_TIERS; ++t) {
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 4a6148f..4487112 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -293,7 +293,7 @@ sweet_gpu_init(void)
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+ 	a6_init_state(&gpu, ptoa_64(pn));
+-	uint32_t lvl = 4;	/* 499 MHz SVS_L2 sweet spot on SM8150-AC; boot-arg sweetgpufreq=1..6 */
++	uint32_t lvl = 6;	/* 675 MHz NOM_L1 on SM8150-AC (585 on SM8150); boot-arg sweetgpufreq=1..6 */
+ 	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
+ 	gpu.perf_level = lvl;
+ 	pool_kva = va;
+@@ -497,7 +497,7 @@ sweet_gpu_panel_stride(uint32_t stride)
+ 
+ static int present_wait_locked(uint32_t k, const char *why);
+ 
+-#define SLOTS           4
++#define SLOTS           8
+ #define SLOT_IOVA(n)    (0x100000000ULL + 0x1000000ULL * (n))
+ #define SLOT_MAX        0x1000000ULL
+ #define SLOT_PAGES      1024
+@@ -535,8 +535,9 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+ 		}
+ 	}
+ 	lck_mtx_lock(&sweet_gpu_lock);
+-	(void)present_wait_locked(0, "surface remap");
+-	(void)present_wait_locked(1, "surface remap");
++	for (uint32_t pk = 0; pk < 4u; pk++) {
++		(void)present_wait_locked(pk, "surface remap");
++	}
+ 	int rc = a6_map_pages(&gpu, SLOT_IOVA(s), pages, npages, page_size);
+ 	a6_tlb_flush(&gpu);
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+@@ -553,10 +554,11 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+ 	return s;
+ }
+ 
+-#define IB_OFF          A6_OFF_FREE     /* the present IBs in the pool (two, PRESENT_IB) */
++#define IB_OFF          A6_OFF_FREE     /* the present IBs in the pool (four 16 KB slots: 0x400000..0x410000) */
++#define PRESENT_SLOTS   4u
+ #define PRESENT_IB(k)   (IB_OFF + 0x4000ULL * (k))
+ 
+-static uint32_t present_fence[2];      /* of the present last queued from each IB slot */
++static uint32_t present_fence[PRESENT_SLOTS];   /* of the present last queued from each IB slot */
+ static uint32_t present_next;
+ 
+ /* With sweet_gpu_lock: the present from IB slot k has landed (or the GPU was reset). 0, or -1 if reset. */
+@@ -789,7 +791,7 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	 * (a waited present took 15-30 ms with metal2vulkan's frames in the ring, and the vsync notifications
+ 	 * CA paces on came late). Two IB slots: only the one two presents back must have landed.
+ 	 */
+-	uint32_t k = present_next & 1;
++	uint32_t k = present_next & (PRESENT_SLOTS - 1u);
+ 	int rc = present_wait_locked(k, "present");
+ 	if (rc == 0) {
+ 		a6_write(a6_pool_pa(&gpu, PRESENT_IB(k)), ib, 4ULL * n);
+@@ -1054,10 +1056,11 @@ sweet_gpu_pool_try_alloc(uint64_t bytes, uint64_t *pa)
+ 			}
+ 			gpool_used += size;
+ 			if (gpool_used > gpool_peak) {
++				uint64_t prev_peak = gpool_peak;
+ 				gpool_peak = gpool_used;
+-			}
+-			if ((gpool_used >> 25) != ((gpool_used - size) >> 25)) {
+-				a6_log("pool: %llu MB in use (peak %llu)\n", gpool_used >> 20, gpool_peak >> 20);
++				if ((gpool_peak >> 26) != (prev_peak >> 26)) {
++					a6_log("pool: peak %llu MB in use\n", gpool_peak >> 20);
++				}
+ 			}
+ 			rc = 0;
+ 			break;
+@@ -1088,9 +1091,6 @@ sweet_gpu_pool_free(uint64_t pa, uint64_t bytes)
+ 	uint64_t size = (bytes + GPOOL_UNIT - 1) & ~(GPOOL_UNIT - 1);
+ 	lck_mtx_lock(&sweet_gpool_lock);
+ 	gpool_used -= size;
+-	if ((gpool_used >> 25) != ((gpool_used + size) >> 25)) {
+-		a6_log("pool: %llu MB in use (peak %llu)\n", gpool_used >> 20, gpool_peak >> 20);
+-	}
+ 	uint32_t i = 0;
+ 	while (i < gpool_nfree && gpool_free[i].pa < pa) {
+ 		i++;
+@@ -1172,6 +1172,60 @@ sweet_gpu_map_at(uint64_t iova, const uint64_t *pages, uint32_t npages)
+ 	return rc;
+ }
+ 
++int sweet_gpu_map_at_noflush(uint64_t iova, const uint64_t *pages, uint32_t npages);
++int
++sweet_gpu_map_at_noflush(uint64_t iova, const uint64_t *pages, uint32_t npages)
++{
++	if (!gpu_ready || npages == 0 || iova < WIN_BASE) {
++		return -1;
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	int rc = a6_map_pages(&gpu, iova, pages, npages, 0x1000);
++	if (rc) {
++		a6_unmap(&gpu, iova, (uint64_t)npages << 12);
++	}
++	lck_mtx_unlock(&sweet_gpu_lock);
++	return rc;
++}
++
++void sweet_gpu_tlb_flush(void);
++void
++sweet_gpu_tlb_flush(void)
++{
++	lck_mtx_lock(&sweet_gpu_lock);
++	if (gpu_ready) {
++		a6_tlb_flush(&gpu);
++	}
++	lck_mtx_unlock(&sweet_gpu_lock);
++}
++
++int sweet_gpu_map_pa_range(uint64_t iova, uint64_t pa, uint64_t bytes);
++int
++sweet_gpu_map_pa_range(uint64_t iova, uint64_t pa, uint64_t bytes)
++{
++	if (!gpu_ready || bytes == 0 || ((iova | pa | bytes) & 0xfffULL) || iova < WIN_BASE) {
++		return -1;
++	}
++	uint64_t pages[256];
++	lck_mtx_lock(&sweet_gpu_lock);
++	int rc = 0;
++	for (uint64_t off = 0; off < bytes; ) {
++		uint32_t n = 0;
++		uint64_t start = off;
++		for (; n < 256u && off < bytes; n++, off += 0x1000ULL) {
++			pages[n] = pa + off;
++		}
++		rc = a6_map_pages(&gpu, iova + start, pages, n, 0x1000);
++		if (rc) {
++			a6_unmap(&gpu, iova, start + ((uint64_t)n << 12));
++			break;
++		}
++	}
++	a6_tlb_flush(&gpu);
++	lck_mtx_unlock(&sweet_gpu_lock);
++	return rc;
++}
++
+ void
+ sweet_gpu_unmap_at(uint64_t iova, uint64_t len)
+ {
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 7c05343..85b585b 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -53,6 +53,8 @@ static uint32_t rh_db_size;
+ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+ static bool rh_poisoned;
++static bool rh_ready;
++static unsigned rh_logged;
+ 
+ static uint32_t
+ rh_read(vm_offset_t base, uint32_t off)
+@@ -102,6 +104,9 @@ rh_range(uint32_t off, uint32_t size)
+ static int
+ rh_map(void)
+ {
++	if (rh_ready) {
++		return 0;
++	}
+ 	if (!rh_rsc) {
+ 		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
+ 	}
+@@ -157,6 +162,7 @@ rh_map(void)
+ 		printf("SWEET RPMH: unsupported/standalone cmd-db\n");
+ 		return EINVAL;
+ 	}
++	rh_ready = true;
+ 	return 0;
+ }
+ 
+@@ -223,13 +229,19 @@ rh_free(unsigned t)
+ static int
+ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32_t *values)
+ {
++	bool verbose = rh_logged < 4u;
++	if (verbose) {
++		rh_logged++;
++	}
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+ 		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+-		printf("SWEET RPMH: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
+-		    t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
+-		    enabled, rh_read(rh_tcs, b + RH_WAIT));
++		if (verbose) {
++			printf("SWEET RPMH: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
++			    t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
++			    enabled, rh_read(rh_tcs, b + RH_WAIT));
++		}
+ 		if (enabled & ~((1u << rh_ncpt) - 1u)) {
+ 			return EIO;
+ 		}
+@@ -269,8 +281,10 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+ 	uint32_t mask = (1u << n) - 1u;
+-	printf("SWEET RPMH: TCS%u ACTIVE %u commands at %#x (first %#x=%u) irq-enable=%#x\n", t, n, address,
+-	    offsets[0], values[0], irq_en);
++	if (verbose) {
++		printf("SWEET RPMH: TCS%u ACTIVE %u commands at %#x (first %#x=%u) irq-enable=%#x\n", t, n, address,
++		    offsets[0], values[0], irq_en);
++	}
+ 	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+@@ -304,8 +318,10 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+-	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	if (verbose || !done) {
++		printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
++		    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	}
+ 	if (!done) {
+ 		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+ 		return ETIMEDOUT;
+@@ -321,7 +337,9 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	if (verbose) {
++		printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	}
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 08b7cd1..f8c307e 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -58,6 +58,10 @@ void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ int sweet_gpu_window_alloc(uint64_t *base, uint64_t *size);
+ void sweet_gpu_window_free(uint64_t base);
+ int sweet_gpu_map_at(uint64_t iova, const uint64_t *pages, uint32_t npages);
++int sweet_gpu_map_at_noflush(uint64_t iova, const uint64_t *pages, uint32_t npages);
++void sweet_gpu_tlb_flush(void);
++int sweet_gpu_map_pa_range(uint64_t iova, uint64_t pa, uint64_t bytes);
++void sweet_cpufreq_boost(void);
+ void sweet_gpu_unmap_at(uint64_t iova, uint64_t len);
+ void sweet_gpu_unmap_at_batch(const uint64_t *iovas, const uint64_t *lens, unsigned count);
+ uint32_t sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy);
+@@ -995,10 +999,11 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 			fBO[h - 1].pool_pa = pa;
+ 			fPoolBytes += len;
+ 			if (fPoolBytes > fPoolPeak) {
++				uint64_t prevPeak = fPoolPeak;
+ 				fPoolPeak = fPoolBytes;
+-			}
+-			if ((fPoolBytes >> 25) != ((fPoolBytes - len) >> 25)) {
+-				IOLog("SWEET MTL: v2 %s holds %llu MB of GPU pool (%llu MB buffer)\n", fName, fPoolBytes >> 20, len >> 20);
++				if ((fPoolPeak >> 26) != (prevPeak >> 26)) {
++					IOLog("SWEET MTL: v2 %s peak %llu MB of GPU pool\n", fName, fPoolPeak >> 20);
++				}
+ 			}
+ 		}
+ 		IOLockUnlock(fLock);
+@@ -1070,21 +1075,37 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		} else if (bo->iova != 0) {
+ 			r = kIOReturnBusy;
+ 		}
+-		/* the pages in 4K steps (16K VM pages, any 4K-aligned import), mapped in pieces */
+-		for (uint64_t off = 0; r == kIOReturnSuccess && off < bo->bytes;) {
+-			uint32_t n = 0;
+-			uint64_t start = off;
+-			for (; n < SWEET_V2_PAGEBUF && off < bo->bytes; n++, off += 4096) {
+-				IOByteCount seg = 0;
+-				addr64_t pa = bo->md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
+-				if (pa == 0 || (pa & 4095)) {
+-					r = kIOReturnVMError;
+-					break;
++		/* Contiguous pool BO: single lock + single SMMU TLB flush; imported BO: segment runs + single flush. */
++		if (r == kIOReturnSuccess && !bo->imported && bo->pool_pa != 0) {
++			if (sweet_gpu_map_pa_range(rq->iova, bo->pool_pa, bo->bytes)) {
++				r = kIOReturnNoResources;
++			}
++		} else if (r == kIOReturnSuccess) {
++			uint64_t cur_pa = 0, seg_rem = 0;
++			for (uint64_t off = 0; r == kIOReturnSuccess && off < bo->bytes;) {
++				uint32_t n = 0;
++				uint64_t start = off;
++				for (; n < SWEET_V2_PAGEBUF && off < bo->bytes; n++, off += 4096) {
++					if (seg_rem < 4096) {
++						IOByteCount seg = 0;
++						addr64_t pa = bo->md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++						if (pa == 0 || (pa & 4095) || seg < 4096) {
++							r = kIOReturnVMError;
++							break;
++						}
++						cur_pa = pa;
++						seg_rem = seg & ~4095ULL;
++					}
++					fPageBuf[n] = cur_pa;
++					cur_pa += 4096;
++					seg_rem -= 4096;
++				}
++				if (r == kIOReturnSuccess && sweet_gpu_map_at_noflush(rq->iova + start, fPageBuf, n)) {
++					r = kIOReturnNoResources;
+ 				}
+-				fPageBuf[n] = pa;
+ 			}
+-			if (r == kIOReturnSuccess && sweet_gpu_map_at(rq->iova + start, fPageBuf, n)) {
+-				r = kIOReturnNoResources;
++			if (r == kIOReturnSuccess) {
++				sweet_gpu_tlb_flush();
+ 			}
+ 		}
+ 		if (r == kIOReturnSuccess) {
+@@ -1158,6 +1179,9 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		if (fence == 0) {
+ 			return busy ? kIOReturnBusy : kIOReturnNotReady;
+ 		}
++		if (fSystem) {
++			sweet_cpufreq_boost();
++		}
+ 		IOLockLock(fLock);
+ 		if (fLastFence == 0 || (int32_t)(fence - fLastFence) > 0) {
+ 			fLastFence = fence;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index fdc6d68..934ce58 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -601,8 +601,17 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	IOLockUnlock(fLock);
+ 
+ 	if (was != down) {
+-		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
+-		    fEdge[finger] ? " edge" : "");
++		static uint32_t hid_touch_logged;
++		static int hid_log_parsed, hid_log_all;
++		if (!hid_log_parsed) {
++			(void)PE_parse_boot_argn("sweethidlog", &hid_log_all, sizeof(hid_log_all));
++			hid_log_parsed = 1;
++		}
++		if (hid_log_all || hid_touch_logged < 16u) {
++			hid_touch_logged++;
++			IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
++			    fEdge[finger] ? " edge" : "");
++		}
+ 	}
+ 	if (!was && down && sweet_fb_is_blanked()) {
+ 		IOHIDEvent *tap = IOHIDEvent::genericGestureEvent(now, kIOHIDGenericGestureTypeTap);

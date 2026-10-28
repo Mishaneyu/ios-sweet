@@ -145,6 +145,8 @@ static void waitForResource(id resource);
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
 @property(nonatomic) NmbTextureDescriptor descriptor;
+@property(nonatomic) NmbTextureDescriptor requestDescriptor;
+@property(nonatomic) BOOL hasRequestDescriptor,noRecycle;
 @property(nonatomic,strong) NBBuffer *buffer;
 @property(nonatomic) IOSurfaceRef surface;
 @property(nonatomic) NSUInteger surfacePlane;
@@ -232,8 +234,75 @@ static MTLResourceID sweetResourceID(const void *p) {
 - (NSRange)levelRange;
 - (NSRange)sliceRange;
 @end
+struct PooledTexture {
+ NmbTexture *handle;
+ NmbTextureDescriptor req;
+ uint64_t bytes;
+};
+static std::mutex gTexturePoolLock;
+static std::vector<PooledTexture> gTexturePool;
+static uint64_t gTexturePoolBytes;
+static std::atomic<uint64_t> gTexturePoolHits,gTexturePoolMisses;
+static void texturePoolLimits(uint64_t *capBytes,size_t *capCount) {
+ const char *prog=getprogname();
+ if(prog && !strcmp(prog,"backboardd")){*capBytes=192ull<<20;*capCount=24;}
+ else{*capBytes=48ull<<20;*capCount=12;}
+}
+static bool canPoolTextureDesc(const NmbTextureDescriptor &req) {
+ return (req.usage&(MTLTextureUsageRenderTarget|MTLTextureUsageShaderWrite))!=0;
+}
+static NmbTexture *takePooledTexture(const NmbTextureDescriptor &req) {
+ if(!canPoolTextureDesc(req))return nullptr;
+ std::lock_guard<std::mutex> lock(gTexturePoolLock);
+ for(size_t i=gTexturePool.size();i>0;i--) {
+  if(memcmp(&gTexturePool[i-1].req,&req,sizeof(req))==0) {
+   NmbTexture *h=gTexturePool[i-1].handle;
+   gTexturePoolBytes-=gTexturePool[i-1].bytes;
+   gTexturePool.erase(gTexturePool.begin()+(ptrdiff_t)(i-1));
+   gTexturePoolHits.fetch_add(1,std::memory_order_relaxed);
+   return h;
+  }
+ }
+ gTexturePoolMisses.fetch_add(1,std::memory_order_relaxed);
+ return nullptr;
+}
+static void drainTexturePool() {
+ std::vector<PooledTexture> doomed;
+ {
+  std::lock_guard<std::mutex> lock(gTexturePoolLock);
+  doomed.swap(gTexturePool);
+  gTexturePoolBytes=0;
+ }
+ for(const PooledTexture &e:doomed)nmb_texture_release(e.handle);
+}
+static void recycleStandaloneTexture(NmbTexture *handle,const NmbTextureDescriptor &req,uint64_t bytes) {
+ if(!handle)return;
+ uint64_t capBytes=0;size_t capCount=0;
+ texturePoolLimits(&capBytes,&capCount);
+ if(!canPoolTextureDesc(req) || !bytes || bytes>capBytes){nmb_texture_release(handle);return;}
+ std::vector<NmbTexture *> evicted;
+ {
+  std::lock_guard<std::mutex> lock(gTexturePoolLock);
+  while(!gTexturePool.empty() && (gTexturePoolBytes+bytes>capBytes || gTexturePool.size()>=capCount)) {
+   evicted.push_back(gTexturePool.front().handle);
+   gTexturePoolBytes-=gTexturePool.front().bytes;
+   gTexturePool.erase(gTexturePool.begin());
+  }
+  gTexturePool.push_back({handle,req,bytes});
+  gTexturePoolBytes+=bytes;
+ }
+ for(NmbTexture *old:evicted)nmb_texture_release(old);
+}
 @implementation NBTexture
-- (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
+- (void)dealloc {
+ if(_handle) {
+  if(_hasRequestDescriptor && !_surface && !_buffer && !_parent && !_parentHeap && !_noRecycle)
+   recycleStandaloneTexture(_handle,_requestDescriptor,[self allocatedSize]);
+  else
+   nmb_texture_release(_handle);
+ }
+ if(_surface)CFRelease(_surface);
+}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
 - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)_descriptor.format;}
 - (NSUInteger)width {return _descriptor.width;}
@@ -286,13 +355,14 @@ static MTLResourceID sweetResourceID(const void *p) {
  return (NSUInteger)((base*d*a*s+page-1)&~(page-1));
 }
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
+ if(state==MTLPurgeableStateEmpty)_noRecycle=YES;
  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
  return (MTLPurgeableState)answer;
 }
 - (NSUInteger)heapOffset {return nmb_texture_heap_offset(_handle);}
 - (BOOL)isAliasable {return nmb_texture_is_aliasable(_handle);}
-- (void)makeAliasable {if(!nmb_texture_make_aliasable(_handle))NBLOG(@"native-metal: texture makeAliasable refused: %@",lastError());}
+- (void)makeAliasable {_noRecycle=YES;if(!nmb_texture_make_aliasable(_handle))NBLOG(@"native-metal: texture makeAliasable refused: %@",lastError());}
 NB_RESOURCE_SPI
 - (id<MTLTexture>)view:(NmbTexture *)handle {
  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
@@ -1984,6 +2054,19 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg);
 - (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {
  const size_t page=(size_t)getpagesize();
  if(!d || !d.width || !d.height)return nil;
+ if(bytes && !length && !((uintptr_t)bytes&(page-1)) && !deallocator && d.textureType==MTLTextureType2D && d.mipmapLevelCount<=1 && d.arrayLength<=1 && d.sampleCount<=1) {
+  uint32_t bw=0,bh=0,bb=0;
+  const uint64_t rowNeed=sweetBlock(d.pixelFormat,&bw,&bh,&bb)?((d.width+bw-1)/bw*bb):nmb_device_linear_bytes_per_row(gDevice,d.pixelFormat,d.width);
+  const uint64_t rowsNeed=bw?((d.height+bh-1)/bh):d.height;
+  const uint64_t want=rowNeed*rowsNeed?((rowNeed*rowsNeed+page-1)&~(page-1)):0;
+  vm_address_t raddr=(vm_address_t)(uintptr_t)bytes;vm_size_t rsize=0;
+  vm_region_basic_info_data_64_t rinfo={};mach_msg_type_number_t rcnt=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t robj=MACH_PORT_NULL;
+  if(want && vm_region_64(mach_task_self(),&raddr,&rsize,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&rinfo,&rcnt,&robj)==KERN_SUCCESS) {
+   if(robj!=MACH_PORT_NULL)mach_port_deallocate(mach_task_self(),robj);
+   if(raddr<=(uintptr_t)bytes && (rinfo.protection&VM_PROT_READ) && ((uintptr_t)raddr+rsize)>=(uintptr_t)bytes+want)
+    length=(NSUInteger)want;
+  }
+ }
  if(!bytes || !length || ((uintptr_t)bytes&(page-1)) || d.textureType!=MTLTextureType2D || d.mipmapLevelCount>1 || d.arrayLength>1 || d.sampleCount>1){
   NBLOG(@"native-metal: newTextureWithBytesNoCopy refused (%p %lu %lux%lu type %lu levels %lu)",bytes,(unsigned long)length,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.textureType,(unsigned long)d.mipmapLevelCount);
   return nil;
@@ -2043,10 +2126,18 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg);
  return (id<MTLBuffer>)buffer;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
- NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
- NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+ NmbTextureDescriptor req;if(!textureDescriptor(d,&req))return nil;
+ NmbTexture *handle=takePooledTexture(req);
+ if(!handle) {
+  handle=nmb_texture_new(gDevice,&req);
+  if(!handle){drainTexturePool();handle=nmb_texture_new(gDevice,&req);}
+  noteFormat((uint32_t)req.format,handle!=nullptr);
+ }
  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
- NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
+ NBTexture *texture=[NBTexture new];texture.handle=handle;
+ texture.requestDescriptor=req;texture.hasRequestDescriptor=YES;
+ NmbTextureDescriptor actual=req;nmb_texture_describe(handle,&actual);texture.descriptor=actual;
+ return (id<MTLTexture>)texture;
 }
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
@@ -2553,6 +2644,12 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
+ {
+  uint64_t pbytes=0;size_t pcnt=0;
+  {std::lock_guard<std::mutex> lock(gTexturePoolLock);pbytes=gTexturePoolBytes;pcnt=gTexturePool.size();}
+  row("J texpool hit=%llu miss=%llu live=%zu/%lluMB",(unsigned long long)gTexturePoolHits.load(),
+   (unsigned long long)gTexturePoolMisses.load(),pcnt,(unsigned long long)(pbytes>>20));
+ }
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};

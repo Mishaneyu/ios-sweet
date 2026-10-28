@@ -101,6 +101,11 @@ SKIP_LABELS = {
     'com.apple.cameracaptured',
     'com.apple.familycircled',
     'com.apple.factory.NFQRCoded',
+    'com.apple.watchdogd',
+    'com.apple.callintelligenced',
+    'com.apple.localspeechrecognition',
+    'com.apple.siriinferenced',
+    'com.apple.sirittsd',
 }
 
 SKIP_PLISTS = {
@@ -134,6 +139,11 @@ SKIP_PLISTS = {
     'com.apple.cameracaptured.plist',
     'com.apple.familycircled.plist',
     'com.apple.factory.NFQRCoded.plist',
+    'com.apple.watchdogd.plist',
+    'com.apple.callintelligenced.plist',
+    'com.apple.localspeechrecognition.plist',
+    'com.apple.siriinferenced.plist',
+    'com.apple.sirittsd.plist',
 }
 
 SKIP_PREFIXES = (

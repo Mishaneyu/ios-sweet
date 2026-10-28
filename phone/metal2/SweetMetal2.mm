@@ -27,8 +27,10 @@ extern "C" void sm2_logs(const char *s)
 	if (n > (int)sizeof(buf) - 1)
 		n = (int)sizeof(buf) - 1;
 	static int console = -2, file = -2;
-	if (console == -2)
-		console = open("/dev/console", O_WRONLY | O_NOCTTY);
+	if (console == -2) {
+		const char *want_console = getenv("SWEET_MTL2_CONSOLE");
+		console = (want_console && !strcmp(want_console, "1")) ? open("/dev/console", O_WRONLY | O_NOCTTY) : -1;
+	}
 	if (file == -2)
 		file = open("/var/local/mtl2.log", O_WRONLY | O_APPEND);
 	if (console >= 0)
