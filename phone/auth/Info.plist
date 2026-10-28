@@ -5,15 +5,15 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>SweetAuth</string>
+	<string>HotAuth</string>
 	<key>CFBundleExecutable</key>
-	<string>SweetAuth</string>
+	<string>HotAuth</string>
 	<key>CFBundleIdentifier</key>
-	<string>org.iosonpixel.sweetauth</string>
+	<string>com.ios26hot.hotauth</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>SweetAuth</string>
+	<string>HotAuth</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

@@ -1,5 +1,5 @@
 /*
- * Local AF_UNIX QRTR multiplexer (/var/run/sweet-qrtr.sock) inside wland.
+ * Local AF_UNIX QRTR multiplexer (/var/run/hot-qrtr.sock) inside wland.
  * Exposes MPSS (node 0) QMI services (DMS, UIM, NAS, WDS, WDA, DPM, IPA, PDC)
  * to local daemons/tools (cellulard, qmicli) on dedicated QRTR ports 0x40..0x47
  * without disturbing wland's own RMTFS/PDMAPPER/TFTP/WLFW ports or GLINK rings.
@@ -18,9 +18,9 @@
 #include "link.h"
 #include "pmem.h"
 #include "qrtr_mux.h"
-#include "sweet_qrtr.h"
+#include "hot_qrtr.h"
 
-#define MUX_RX_CAP	(sizeof(struct sweet_qrtr_msg) + SWEET_QRTR_MAX_DATA)
+#define MUX_RX_CAP	(sizeof(struct hot_qrtr_msg) + HOT_QRTR_MAX_DATA)
 #define MUX_TX_CAP	65536u
 
 struct qrtr_srv_entry {
@@ -97,7 +97,7 @@ static void client_flush_tx(struct qrtr_mux_client *c)
 	}
 }
 
-static int client_queue_msg(struct qrtr_mux_client *c, const struct sweet_qrtr_msg *hdr,
+static int client_queue_msg(struct qrtr_mux_client *c, const struct hot_qrtr_msg *hdr,
 			    const uint8_t *payload)
 {
 	if (c->fd < 0)
@@ -128,7 +128,7 @@ int qrtr_mux_open(void)
 	if (listen_fd >= 0)
 		return 0;
 	(void)mkdir("/var/run", 0755);
-	(void)unlink(SWEET_QRTR_SOCK);
+	(void)unlink(HOT_QRTR_SOCK);
 
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
@@ -146,26 +146,26 @@ int qrtr_mux_open(void)
 	struct sockaddr_un sun;
 	memset(&sun, 0, sizeof(sun));
 	sun.sun_family = AF_UNIX;
-	snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", SWEET_QRTR_SOCK);
+	snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", HOT_QRTR_SOCK);
 #ifdef __APPLE__
 	sun.sun_len = (uint8_t)sizeof(sun);
 #endif
 
 	if (bind(fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
-		printf("qrtr-mux: bind %s: %s\n", SWEET_QRTR_SOCK, strerror(errno));
+		printf("qrtr-mux: bind %s: %s\n", HOT_QRTR_SOCK, strerror(errno));
 		close(fd);
 		return -1;
 	}
-	(void)chmod(SWEET_QRTR_SOCK, 0660);
+	(void)chmod(HOT_QRTR_SOCK, 0660);
 	if (listen(fd, QRTR_MUX_MAX_CLIENTS) < 0) {
 		printf("qrtr-mux: listen: %s\n", strerror(errno));
 		close(fd);
-		(void)unlink(SWEET_QRTR_SOCK);
+		(void)unlink(HOT_QRTR_SOCK);
 		return -1;
 	}
 	listen_fd = fd;
 	printf("[%6llu] qrtr-mux: listening on %s (ports %#x..%#x)\n",
-	       (unsigned long long)link_ms(), SWEET_QRTR_SOCK,
+	       (unsigned long long)link_ms(), HOT_QRTR_SOCK,
 	       QRTR_MUX_PORT_BASE, QRTR_MUX_PORT_BASE + QRTR_MUX_MAX_CLIENTS - 1);
 	return 0;
 }
@@ -195,8 +195,8 @@ void qrtr_mux_on_ctrl(uint32_t cmd, uint32_t service, uint32_t instance, uint32_
 			srv_cache[slot].node = node;
 			srv_cache[slot].port = port;
 		}
-		struct sweet_qrtr_msg msg = {
-			.type = SWEET_QRTR_TYPE_NEW_SERVER,
+		struct hot_qrtr_msg msg = {
+			.type = HOT_QRTR_TYPE_NEW_SERVER,
 			.node = node,
 			.port = port,
 			.service = service,
@@ -212,8 +212,8 @@ void qrtr_mux_on_ctrl(uint32_t cmd, uint32_t service, uint32_t instance, uint32_
 			if (srv_cache[i].used && srv_cache[i].node == node && srv_cache[i].port == port)
 				srv_cache[i].used = 0;
 		}
-		struct sweet_qrtr_msg msg = {
-			.type = SWEET_QRTR_TYPE_DEL_SERVER,
+		struct hot_qrtr_msg msg = {
+			.type = HOT_QRTR_TYPE_DEL_SERVER,
 			.node = node,
 			.port = port,
 			.service = service,
@@ -234,11 +234,11 @@ int qrtr_mux_deliver_data(uint32_t dst_port, uint32_t src_node, uint32_t src_por
 	if (dst_port < QRTR_MUX_PORT_BASE || dst_port >= QRTR_MUX_PORT_BASE + QRTR_MUX_MAX_CLIENTS)
 		return -1;
 	struct qrtr_mux_client *c = &clients[dst_port - QRTR_MUX_PORT_BASE];
-	if (c->fd < 0 || len > SWEET_QRTR_MAX_DATA)
+	if (c->fd < 0 || len > HOT_QRTR_MAX_DATA)
 		return 0;
 	link_note_activity();
-	struct sweet_qrtr_msg hdr = {
-		.type = SWEET_QRTR_TYPE_DATA,
+	struct hot_qrtr_msg hdr = {
+		.type = HOT_QRTR_TYPE_DATA,
 		.node = src_node,
 		.port = src_port,
 		.service = 0,
@@ -289,8 +289,8 @@ static void accept_clients(void)
 		for (unsigned i = 0; i < QRTR_MUX_MAX_SERVERS; i++) {
 			if (!srv_cache[i].used)
 				continue;
-			struct sweet_qrtr_msg msg = {
-				.type = SWEET_QRTR_TYPE_NEW_SERVER,
+			struct hot_qrtr_msg msg = {
+				.type = HOT_QRTR_TYPE_NEW_SERVER,
 				.node = srv_cache[i].node,
 				.port = srv_cache[i].port,
 				.service = srv_cache[i].service,
@@ -335,10 +335,10 @@ static void client_poll_rx(struct qrtr_mux_client *c)
 		c->rx_len += (size_t)r;
 		link_note_activity();
 
-		while (c->rx_len >= sizeof(struct sweet_qrtr_msg)) {
-			struct sweet_qrtr_msg hdr;
+		while (c->rx_len >= sizeof(struct hot_qrtr_msg)) {
+			struct hot_qrtr_msg hdr;
 			memcpy(&hdr, c->rx_buf, sizeof(hdr));
-			if (hdr.len > SWEET_QRTR_MAX_DATA) {
+			if (hdr.len > HOT_QRTR_MAX_DATA) {
 				client_drop(c, "bad frame len");
 				return;
 			}
@@ -346,7 +346,7 @@ static void client_poll_rx(struct qrtr_mux_client *c)
 			if (c->rx_len < frame_len)
 				break;
 			const uint8_t *payload = c->rx_buf + sizeof(hdr);
-			if (hdr.type == SWEET_QRTR_TYPE_DATA && hdr.len > 0) {
+			if (hdr.type == HOT_QRTR_TYPE_DATA && hdr.len > 0) {
 				(void)qrtr_send(QRTR_TYPE_DATA, c->port, hdr.node, hdr.port,
 						payload, hdr.len);
 			}

@@ -1,18 +1,18 @@
 /*
- * sweetstored v2: Root installer & WebApp packager daemon for SweetStore 2.0 (127.0.0.1:29170).
+ * hotstored v2: Root installer & WebApp packager daemon for HotStore 2.0 (127.0.0.1:29170).
  *
  * Capabilities on iOS 26.5.2 (RMX1931 / SWEET):
  *   1. Unpacks decrypted .ipa archives (streaming ZIP32/ZIP64 via zlib).
  *   2. Thins universal binaries (accepting both arm64 and arm64e slices) and rewrites
  *      non-hint ARMv8.3 PAC opcodes in-place on arm64e Mach-Os (excluding LC_DATA_IN_CODE).
- *   3. Neutralizes __RESTRICT segments (so @userapps libsweet_appfix.dylib always loads)
+ *   3. Neutralizes __RESTRICT segments (so @userapps libhot_appfix.dylib always loads)
  *      and embeds clean 4 KB SHA-256 CodeDirectory + merged XML entitlements with
  *      CodeDirectory.ident == CFBundleIdentifier.
  *   4. Provisions isolated /private/var/mobile/Containers/Data/Application/<bundleId> and
  *      Shared/AppGroup/<group> directories owned by mobile:mobile (501:501).
- *   5. Packages 1-tap standalone native UIKit + WKWebView .app bundles (SweetWebAppStub)
+ *   5. Packages 1-tap standalone native UIKit + WKWebView .app bundles (HotWebAppStub)
  *      with real App Store icons converted to PNG via ImageIO + CoreGraphics.
- *   6. Manages per-app SweetMetal2 GPU / CPU mode (/var/local/mtl2-clients) and an optional
+ *   6. Manages per-app HotMetal2 GPU / CPU mode (/var/local/mtl2-clients) and an optional
  *      toggleable Wi-Fi LAN .ipa dropzone on port 29172.
  */
 #import <Foundation/Foundation.h>
@@ -45,17 +45,17 @@
 
 extern char **environ;
 
-#define SWEETSTORED_PORT        29170
-#define SWEETUPLOAD_PORT        29172
+#define HOTSTORED_PORT        29170
+#define HOTUPLOAD_PORT        29172
 #define STAGE_ROOT              "/private/var/local/store-stage"
 #define LOCAL_IPA_DIR           "/private/var/local/ipa"
 #define STAGED_SYSTEM_APPS_DIR  "/private/var/staged_system_apps"
 #define APP_PLACEHOLDERS_DIR    "/System/Library/AppPlaceholders"
 #define STAGED_PLACEHOLDERS_DIR "/private/var/local/staged-placeholders"
-#define REG_STAMP_PATH          "/private/var/local/.sweetstore-registered-v3"
+#define REG_STAMP_PATH          "/private/var/local/.hotstore-registered-v4"
 #define MTL2_CLIENTS_PATH       "/private/var/local/mtl2-clients"
 #define APPFIX_LOG_PATH         "/private/var/local/appfix.log"
-#define MARKER_FILE             ".sweetstore_installed"
+#define MARKER_FILE             ".hotstore_installed"
 
 #ifndef CPU_SUBTYPE_ARM64E
 #define CPU_SUBTYPE_ARM64E      ((cpu_subtype_t)2)
@@ -107,7 +107,7 @@ static int run_tool_env(const char *prog, char *const argv[], char *const envp[]
 	int status = 0;
 	int rc = posix_spawn(&pid, prog, NULL, NULL, argv, envp ? envp : environ);
 	if (rc != 0) {
-		fprintf(stderr, "sweetstored: posix_spawn %s failed: %d\n", prog, rc);
+		fprintf(stderr, "hotstored: posix_spawn %s failed: %d\n", prog, rc);
 		return -1;
 	}
 	while (waitpid(pid, &status, 0) < 0) {
@@ -656,7 +656,7 @@ static NSData *build_adhoc_superblob(int fd, uint64_t codeLimit, uint64_t execSe
 	uint32_t nCodeSlots = (uint32_t)((codeLimit + pageSize - 1) / pageSize);
 	uint32_t nSpecialSlots = xmlEnts.length > 0 ? 5 : 0;
 
-	const char *identC = (identStr.length > 0 ? identStr.UTF8String : "org.iosonpixel.app");
+	const char *identC = (identStr.length > 0 ? identStr.UTF8String : "com.ios26hot.app");
 	size_t identLen = strlen(identC) + 1;
 
 	NSMutableData *entBlob = nil;
@@ -741,7 +741,7 @@ static NSData *build_adhoc_superblob(int fd, uint64_t codeLimit, uint64_t execSe
 
 static NSData *merged_app_entitlements(NSData *existingXml, NSString *bundleId, NSArray **outGroups)
 {
-	NSString *bid = bundleId.length > 0 ? bundleId : @"org.iosonpixel.app";
+	NSString *bid = bundleId.length > 0 ? bundleId : @"com.ios26hot.app";
 	NSMutableDictionary *dict = [NSMutableDictionary dictionary];
 	if (existingXml.length > 0) {
 		id parsed = [NSPropertyListSerialization propertyListWithData:existingXml
@@ -913,7 +913,7 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 				linkeditCmdOff = (ssize_t)off;
 			} else if (strncmp(seg->segname, "__RESTRICT", 16) == 0) {
 				memset(seg->segname, 0, 16);
-				memcpy(seg->segname, "__SWEETRST", 10);
+				memcpy(seg->segname, "__HOTRSTRT", 10);
 				cmdsModified = YES;
 			}
 			struct section_64 *sects = (struct section_64 *)(seg + 1);
@@ -939,7 +939,7 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 		free(cmds);
 		close(fd);
 		if (errOut) {
-			*errOut = @"Encrypted App Store binary (FairPlay cryptid=1). Tap 'Install Web App' in SweetStore Discover or import an unencrypted (cryptid=0) .ipa.";
+			*errOut = @"Encrypted App Store binary (FairPlay cryptid=1). Tap 'Install Web App' in HotStore Discover or import an unencrypted (cryptid=0) .ipa.";
 		}
 		return NO;
 	}
@@ -987,7 +987,7 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 	if ((mhdr.cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E) {
 		depacCount = depac_macho_fd(rwFd, &mhdr, cmds, fileSize);
 		if (depacCount > 0) {
-			fprintf(stderr, "sweetstored: de-PAC %s -> %llu instructions rewritten\n",
+			fprintf(stderr, "hotstored: de-PAC %s -> %llu instructions rewritten\n",
 			    filePath.lastPathComponent.UTF8String, (unsigned long long)depacCount);
 		}
 	}
@@ -1048,7 +1048,7 @@ static BOOL prepare_macho_file(NSString *filePath, BOOL isMainExec, NSString *bu
 
 	uint32_t nCodeSlots = (uint32_t)((codeLimit + 4095ULL) / 4096ULL);
 	uint32_t nSpecial = xmlEnts.length > 0 ? 5 : 0;
-	const char *identC = ident.length > 0 ? ident.UTF8String : "org.iosonpixel.app";
+	const char *identC = ident.length > 0 ? ident.UTF8String : "com.ios26hot.app";
 	uint32_t cdLen = 88 + (uint32_t)strlen(identC) + 1 + (nSpecial + nCodeSlots) * 32;
 	uint32_t entBlobLen = xmlEnts.length > 0 ? (uint32_t)(8 + xmlEnts.length) : 0;
 	uint32_t blobCount = entBlobLen > 0 ? 2 : 1;
@@ -1286,8 +1286,8 @@ static void install_ipa_worker(NSString *ipaPath, BOOL deleteAfter, NSString *hi
 		NSString *destApp = [@"/Applications" stringByAppendingPathComponent:destDirName];
 		if ([fm fileExistsAtPath:destApp] &&
 		    ![fm fileExistsAtPath:[destApp stringByAppendingPathComponent:@MARKER_FILE]] &&
-		    ![bundleId isEqualToString:@"org.iosonpixel.sweetstore"] &&
-		    ![bundleId isEqualToString:@"org.iosonpixel.sweetauth"]) {
+		    ![bundleId isEqualToString:@"com.ios26hot.hotstore"] &&
+		    ![bundleId isEqualToString:@"com.ios26hot.hotauth"]) {
 			destDirName = [NSString stringWithFormat:@"%@.app", sanitize_slug(bundleId)];
 			destApp = [@"/Applications" stringByAppendingPathComponent:destDirName];
 		}
@@ -1330,7 +1330,7 @@ static void install_ipa_worker(NSString *ipaPath, BOOL deleteAfter, NSString *hi
 		(void)run_lsreg_rebuild();
 
 		set_job(@"done", 1.0, [NSString stringWithFormat:@"Installed %@ (%@)", dispName, version], dispName, bundleId, @"");
-		fprintf(stderr, "sweetstored: installed native %s (%s) -> %s\n",
+		fprintf(stderr, "hotstored: installed native %s (%s) -> %s\n",
 		    dispName.UTF8String, bundleId.UTF8String, destApp.UTF8String);
 		pthread_mutex_lock(&g_job_lock); g_busy = NO; pthread_mutex_unlock(&g_job_lock);
 	}
@@ -1340,12 +1340,12 @@ static void create_webapp_worker(NSString *dispName, NSString *startURL, NSStrin
 {
 	@autoreleasepool {
 		NSFileManager *fm = [NSFileManager defaultManager];
-		NSString *stubPath = @"/Applications/SweetStore.app/SweetWebAppStub";
+		NSString *stubPath = @"/Applications/HotStore.app/HotWebAppStub";
 		if (![fm fileExistsAtPath:stubPath]) {
-			stubPath = @"/var/local/bin/SweetWebAppStub";
+			stubPath = @"/var/local/bin/HotWebAppStub";
 		}
 		if (![fm fileExistsAtPath:stubPath]) {
-			set_job(@"error", 0.0, @"WebApp stub missing", dispName, @"", @"SweetWebAppStub binary not found");
+			set_job(@"error", 0.0, @"WebApp stub missing", dispName, @"", @"HotWebAppStub binary not found");
 			pthread_mutex_lock(&g_job_lock); g_busy = NO; pthread_mutex_unlock(&g_job_lock);
 			return;
 		}
@@ -1353,9 +1353,9 @@ static void create_webapp_worker(NSString *dispName, NSString *startURL, NSStrin
 		NSString *slugBase = origBid.length > 0 ? origBid : dispName;
 		NSString *slug = [sanitize_slug(slugBase) lowercaseString];
 		if (slug.length > 48) slug = [slug substringToIndex:48];
-		NSString *bundleId = [NSString stringWithFormat:@"org.iosonpixel.webapp.%@", slug];
-		NSString *execName = [NSString stringWithFormat:@"SW_%@", slug];
-		NSString *destDirName = [NSString stringWithFormat:@"SW_%@.app", slug];
+		NSString *bundleId = [NSString stringWithFormat:@"com.ios26hot.webapp.%@", slug];
+		NSString *execName = [NSString stringWithFormat:@"HW_%@", slug];
+		NSString *destDirName = [NSString stringWithFormat:@"HW_%@.app", slug];
 		NSString *destApp = [@"/Applications" stringByAppendingPathComponent:destDirName];
 
 		NSString *stageDir = [NSString stringWithFormat:@"%s/web-%llu",
@@ -1447,7 +1447,7 @@ static void create_webapp_worker(NSString *dispName, NSString *startURL, NSStrin
 		(void)run_lsreg_rebuild();
 
 		set_job(@"done", 1.0, [NSString stringWithFormat:@"Installed %@ Web App", dispName], dispName, bundleId, @"");
-		fprintf(stderr, "sweetstored: installed webapp %s (%s -> %s) at %s\n",
+		fprintf(stderr, "hotstored: installed webapp %s (%s -> %s) at %s\n",
 		    dispName.UTF8String, bundleId.UTF8String, startURL.UTF8String, destApp.UTF8String);
 		pthread_mutex_lock(&g_job_lock); g_busy = NO; pthread_mutex_unlock(&g_job_lock);
 	}
@@ -1556,20 +1556,20 @@ static void handle_lan_upload_client(int cfd)
 			static const char *html =
 				"<!doctype html><html><head><meta charset='utf-8'>"
 				"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-				"<title>SweetStore Wi-Fi IPA Dropzone</title>"
+				"<title>HotStore Wi-Fi IPA Dropzone</title>"
 				"<style>body{font-family:-apple-system,sans-serif;background:#0f1117;color:#f5f7ff;margin:0;padding:32px;text-align:center}"
 				".card{max-width:520px;margin:24px auto;background:#1a1e29;border:2px dashed #3b82f6;border-radius:20px;padding:36px 24px}"
 				"h1{font-size:22px;margin:0 0 8px}p{color:#9ca3af;font-size:14px;line-height:1.5}"
 				"input[type=file]{margin:18px 0;color:#e5e7eb}#st{margin-top:16px;font-weight:600;color:#60a5fa}"
 				"progress{width:100%;height:14px;display:none;margin-top:12px}</style></head><body>"
-				"<div class='card'><h1>SweetStore 2.0 Wi-Fi Uploader</h1>"
+				"<div class='card'><h1>HotStore 2.0 Wi-Fi Uploader</h1>"
 				"<p>Select or drop any unencrypted <code>.ipa</code> (<code>cryptid=0</code>) to stream &amp; install directly onto iOS 26.5.2.</p>"
 				"<input type='file' id='f' accept='.ipa'><progress id='p' max='100' value='0'></progress><div id='st'>Ready</div></div>"
 				"<script>const f=document.getElementById('f'),p=document.getElementById('p'),st=document.getElementById('st');"
 				"f.onchange=()=>{const file=f.files[0];if(!file)return;p.style.display='block';st.textContent='Uploading '+file.name+'...';"
 				"const x=new XMLHttpRequest();x.open('POST','/upload?name='+encodeURIComponent(file.name));"
 				"x.upload.onprogress=e=>{if(e.lengthComputable)p.value=Math.round(e.loaded*100/e.total);};"
-				"x.onload=()=>{st.textContent=x.status===200?'Uploaded! Installing on iPhone now — check SweetStore.':'Error: '+x.responseText;};"
+				"x.onload=()=>{st.textContent=x.status===200?'Uploaded! Installing on iPhone now — check HotStore.':'Error: '+x.responseText;};"
 				"x.onerror=()=>{st.textContent='Upload network error';};x.send(file);};</script></body></html>";
 			size_t hlen = strlen(html);
 			char hdr[256];
@@ -1675,7 +1675,7 @@ static BOOL set_lan_upload_enabled(BOOL enable)
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_len = sizeof(addr);
 	addr.sin_family = AF_INET;
-	addr.sin_port = htons(SWEETUPLOAD_PORT);
+	addr.sin_port = htons(HOTUPLOAD_PORT);
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(srv, 8) != 0) {
 		close(srv);
@@ -1761,7 +1761,7 @@ static NSArray *scan_local_ipas(void)
 		NSArray<NSString *> *files = [fm contentsOfDirectoryAtPath:d error:nil];
 		for (NSString *f in files) {
 			if (![f.pathExtension.lowercaseString isEqualToString:@"ipa"]) continue;
-			if ([f hasPrefix:@".sweetdl-"]) continue;
+			if ([f hasPrefix:@".hotdl-"]) continue;
 			NSString *full = [d stringByAppendingPathComponent:f];
 			if ([seen containsObject:full]) continue;
 			[seen addObject:full];
@@ -1797,7 +1797,7 @@ static NSDictionary *build_status_dict(void)
 	pthread_mutex_unlock(&g_lan_lock);
 	NSString *wifiIP = current_wifi_ipv4();
 	NSString *lanURL = (lanOn && wifiIP.length > 0)
-	                 ? [NSString stringWithFormat:@"http://%@:%d", wifiIP, SWEETUPLOAD_PORT]
+	                 ? [NSString stringWithFormat:@"http://%@:%d", wifiIP, HOTUPLOAD_PORT]
 	                 : @"";
 
 	return @{
@@ -2064,7 +2064,7 @@ static int promote_staged_system_apps(void)
 			}
 		}
 		if (moved > 0) {
-			fprintf(stderr, "sweetstored: promoted %d staged system apps into /Applications\n", moved);
+			fprintf(stderr, "hotstored: promoted %d staged system apps into /Applications\n", moved);
 		}
 	}
 	return moved;
@@ -2077,8 +2077,8 @@ static void ensure_first_boot_registration(int moved)
 		NSArray<NSString *> *promoted = [fm contentsOfDirectoryAtPath:@STAGED_PLACEHOLDERS_DIR error:nil];
 		struct stat st;
 		long long sw_sz = 0, sa_sz = 0;
-		if (stat("/Applications/SweetStore.app/SweetStore", &st) == 0) sw_sz = (long long)st.st_size;
-		if (stat("/Applications/SweetAuth.app/SweetAuth", &st) == 0) sa_sz = (long long)st.st_size;
+		if (stat("/Applications/HotStore.app/HotStore", &st) == 0) sw_sz = (long long)st.st_size;
+		if (stat("/Applications/HotAuth.app/HotAuth", &st) == 0) sa_sz = (long long)st.st_size;
 
 		NSString *want = [NSString stringWithFormat:@"v3:%lld:%lld:%lu\n",
 		    sw_sz, sa_sz, (unsigned long)promoted.count];
@@ -2086,8 +2086,8 @@ static void ensure_first_boot_registration(int moved)
 		if (moved == 0 && [have isEqualToString:want]) return;
 
 		NSMutableArray<NSString *> *toReg = [NSMutableArray array];
-		if (sw_sz > 0) [toReg addObject:@"/Applications/SweetStore.app"];
-		if (sa_sz > 0) [toReg addObject:@"/Applications/SweetAuth.app"];
+		if (sw_sz > 0) [toReg addObject:@"/Applications/HotStore.app"];
+		if (sa_sz > 0) [toReg addObject:@"/Applications/HotAuth.app"];
 		for (NSString *item in promoted) {
 			if (![item.pathExtension.lowercaseString isEqualToString:@"app"]) continue;
 			NSString *appPath = [@"/Applications" stringByAppendingPathComponent:item];
@@ -2100,7 +2100,7 @@ static void ensure_first_boot_registration(int moved)
 			sleep(attempt == 0 ? 15 : 6);
 			int rc_reg = toReg.count > 0 ? run_lsreg_mobile_args(toReg) : 0;
 			int rc_reb = moved > 0 ? run_lsreg_rebuild() : 0;
-			fprintf(stderr, "sweetstored: auto-register (%lu apps, moved=%d) attempt %d -> reg=%d rebuild=%d\n",
+			fprintf(stderr, "hotstored: auto-register (%lu apps, moved=%d) attempt %d -> reg=%d rebuild=%d\n",
 			    (unsigned long)toReg.count, moved, attempt + 1, rc_reg, rc_reb);
 			if (rc_reg == 0 && rc_reb == 0) {
 				[want writeToFile:@REG_STAMP_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -2132,7 +2132,7 @@ int main(int argc, char **argv)
 
 		int srv = socket(AF_INET, SOCK_STREAM, 0);
 		if (srv < 0) {
-			perror("sweetstored: socket");
+			perror("hotstored: socket");
 			return 1;
 		}
 		int one = 1;
@@ -2142,15 +2142,15 @@ int main(int argc, char **argv)
 		memset(&addr, 0, sizeof(addr));
 		addr.sin_len = sizeof(addr);
 		addr.sin_family = AF_INET;
-		addr.sin_port = htons(SWEETSTORED_PORT);
+		addr.sin_port = htons(HOTSTORED_PORT);
 		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
 		if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(srv, 16) != 0) {
-			perror("sweetstored: bind/listen");
+			perror("hotstored: bind/listen");
 			close(srv);
 			return 1;
 		}
-		fprintf(stderr, "sweetstored v2: listening on 127.0.0.1:%d\n", SWEETSTORED_PORT);
+		fprintf(stderr, "hotstored v2: listening on 127.0.0.1:%d\n", HOTSTORED_PORT);
 
 		for (;;) {
 			int cfd = accept(srv, NULL, NULL);

@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>application-identifier</key>
-	<string>org.iosonpixel.sweetauthd</string>
+	<string>com.ios26hot.hotauthd</string>
 	<key>platform-application</key>
 	<true/>
 	<key>com.apple.private.security.no-container</key>
@@ -20,7 +20,7 @@
 	<true/>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>org.iosonpixel.sweetauthd</string>
+		<string>com.ios26hot.hotauthd</string>
 		<string>apple</string>
 		<string>appleaccount</string>
 		<string>com.apple.cfnetwork</string>

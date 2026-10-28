@@ -1,6 +1,6 @@
 # Credits and Licences
 
-`IOS-26-Hot` builds on [ios-sweet](https://github.com/dipa-studio/ios-sweet) and retains its [MIT License](LICENSE). Original additions in this repository (`SweetStore 2.0`, `SweetWebApp`, `libsweet_appfix`, `SweetAuth`, `cellulard`, `adspd`, `RMX1931` platform drivers, and iOS 26 host tooling) are under the MIT License (Copyright (c) 2026 the IOS-26-Hot & ios-flame contributors), with these file-level exceptions:
+`IOS-26-Hot` builds on [ios-sweet](https://github.com/dipa-studio/ios-sweet) and retains its [MIT License](LICENSE). Original additions in this repository (`HotStore 2.0`, `HotWebApp`, `libhot_appfix`, `HotAuth`, `HotAudio.driver`, `HotMetal2` iOS 26 extensions, `cellulard`, `adspd`, `RMX1931` platform drivers, and `IOS-26-Hot` host tooling) are under the MIT License (Copyright (c) 2026 the IOS-26-Hot & ios-flame contributors), with these file-level exceptions:
 
 - `xnu/patches/` and `xnu/patches-26/` modify Apple's XNU kernel, which is licensed under the **Apple Public Source License 2.0 (`APSL-2.0`)**. All patched XNU files remain under `APSL-2.0`.
 - Files adapted from third-party open-source projects retain their upstream licences, listed below.

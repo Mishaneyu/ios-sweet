@@ -4,8 +4,8 @@
 Reads /System/Library/xpc/launchd.plist strictly read-only from an HFS+/HFSX
 root image (default ~/ios26-root-rmx1931.img) or an extracted plist,
 strips crash-looping / hardware-absent LaunchDaemons via sweet-root-tweaks.py,
-configures dropbear/wland/sweetstored, and optionally stages de-PAC'd DSC stub
-subcaches, SweetMetal2.bundle, and iOS 26 userland binaries/apps/drivers into a
+configures dropbear/wland/hotstored/hotauthd, and optionally stages de-PAC'd DSC stub
+subcaches, HotMetal2.bundle, and IOS-26-Hot userland binaries/apps/drivers into a
 deterministic POSIX ustar archive for mkpayload.py --overlay.
 """
 import argparse
@@ -31,8 +31,8 @@ KEEP_DAEMON_KEYS = (
     '/System/Library/LaunchDaemons/com.apple.mobileactivationd.plist',
     '/System/Library/LaunchDaemons/org.iosonpixel.dropbear.plist',
     '/System/Library/LaunchDaemons/org.iosonpixel.wland.plist',
-    '/System/Library/LaunchDaemons/org.iosonpixel.sweetstored.plist',
-    '/System/Library/LaunchDaemons/org.iosonpixel.sweetauthd.plist',
+    '/System/Library/LaunchDaemons/com.ios26hot.hotstored.plist',
+    '/System/Library/LaunchDaemons/com.ios26hot.hotauthd.plist',
 )
 
 SKIP_USERLAND_BINS = {'m2vtest'}
@@ -471,7 +471,8 @@ def main():
     ap.add_argument('--root-img', default=os.path.expanduser('~/ios26-root-rmx1931.img'),
                     help='read-only HFS+/HFSX rootfs image to extract launchd.plist from')
     ap.add_argument('--launchd-plist', help='optional pre-extracted launchd.plist (overrides --root-img)')
-    ap.add_argument('--sweetmetal2', help='optional path to SweetMetal2.bundle to stage under /System/Library/Extensions')
+    ap.add_argument('--hotmetal2', '--sweetmetal2', dest='hotmetal2',
+                    help='optional path to HotMetal2.bundle to stage under /System/Library/Extensions')
     ap.add_argument('--userland-dir', help='optional extracted userland dir (Applications/, HAL/, bin/, lib/)')
     ap.add_argument('--dsc-stubs-dir', help='optional dir of de-PACd dyld_shared_cache_arm64e.* stub subcaches')
     ap.add_argument('--mtl2-clients',
@@ -505,7 +506,10 @@ def main():
     tu_ff_plist = None
     va_disabled_files = []
     has_idle_xpc = bool(
-        args.userland_dir and os.path.isfile(os.path.join(args.userland_dir, 'bin', 'sweet-idle-xpc'))
+        args.userland_dir and (
+            os.path.isfile(os.path.join(args.userland_dir, 'bin', 'hot-idle-xpc'))
+            or os.path.isfile(os.path.join(args.userland_dir, 'bin', 'sweet-idle-xpc'))
+        )
     )
 
     if args.launchd_plist:
@@ -548,11 +552,13 @@ def main():
                 except FileNotFoundError:
                     pass
             if not has_idle_xpc:
-                try:
-                    hfs.read_file('/private/var/local/bin/sweet-idle-xpc')
-                    has_idle_xpc = True
-                except FileNotFoundError:
-                    pass
+                for idle_rel in ('/private/var/local/bin/hot-idle-xpc', '/private/var/local/bin/sweet-idle-xpc'):
+                    try:
+                        hfs.read_file(idle_rel)
+                        has_idle_xpc = True
+                        break
+                    except FileNotFoundError:
+                        pass
             if tz_name:
                 tz_rel = f'/usr/share/zoneinfo.default/{tz_name}'
                 raw_tz, _, _, _ = hfs.read_file(tz_rel)
@@ -637,29 +643,33 @@ def main():
     if diag_key in jobs:
         jobs[diag_key]['ProcessType'] = 'Interactive'
 
-    # Ensure sweetstored root helper is registered for SweetStore.app (127.0.0.1:29170).
-    jobs['/System/Library/LaunchDaemons/org.iosonpixel.sweetstored.plist'] = {
+    # Remove legacy Sweet* LaunchDaemon keys when upgrading an existing root image.
+    jobs.pop('/System/Library/LaunchDaemons/org.iosonpixel.sweetstored.plist', None)
+    jobs.pop('/System/Library/LaunchDaemons/org.iosonpixel.sweetauthd.plist', None)
+
+    # Ensure hotstored root helper is registered for HotStore.app (127.0.0.1:29170).
+    jobs['/System/Library/LaunchDaemons/com.ios26hot.hotstored.plist'] = {
         'EnvironmentVariables': {'PATH': '/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'},
         'KeepAlive': True,
-        'Label': 'org.iosonpixel.sweetstored',
+        'Label': 'com.ios26hot.hotstored',
         'ProcessType': 'Interactive',
-        'ProgramArguments': ['/var/local/bin/sweetstored'],
+        'ProgramArguments': ['/var/local/bin/hotstored'],
         'RunAtLoad': True,
-        'StandardErrorPath': '/var/local/sweetstored.log',
-        'StandardOutPath': '/var/local/sweetstored.log',
+        'StandardErrorPath': '/var/local/hotstored.log',
+        'StandardOutPath': '/var/local/hotstored.log',
         'UserName': 'root',
     }
 
-    # Ensure sweetauthd Apple Account / iCloud helper is registered for SweetAuth.app & akd (127.0.0.1:29171).
-    jobs['/System/Library/LaunchDaemons/org.iosonpixel.sweetauthd.plist'] = {
+    # Ensure hotauthd Apple Account / iCloud helper is registered for HotAuth.app & akd (127.0.0.1:29171).
+    jobs['/System/Library/LaunchDaemons/com.ios26hot.hotauthd.plist'] = {
         'EnvironmentVariables': {'PATH': '/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'},
         'KeepAlive': True,
-        'Label': 'org.iosonpixel.sweetauthd',
+        'Label': 'com.ios26hot.hotauthd',
         'ProcessType': 'Interactive',
-        'ProgramArguments': ['/var/local/bin/sweetauthd'],
+        'ProgramArguments': ['/var/local/bin/hotauthd'],
         'RunAtLoad': True,
-        'StandardErrorPath': '/var/local/sweetauth.log',
-        'StandardOutPath': '/var/local/sweetauth.log',
+        'StandardErrorPath': '/var/local/hotauth.log',
+        'StandardOutPath': '/var/local/hotauth.log',
         'UserName': 'root',
     }
 
@@ -1016,28 +1026,28 @@ def main():
                     add_ustar_bytes(tf, sys_dst, f.read(), mode=0o644)
                 add_ustar_symlink(tf, crypt_dst, '/' + sys_dst)
 
-        if args.sweetmetal2:
-            for req in ('SweetMetal2', 'libvulkan_freedreno.dylib', 'Info.plist'):
-                p = os.path.join(args.sweetmetal2, req)
+        if args.hotmetal2:
+            for req in ('HotMetal2', 'libvulkan_freedreno.dylib', 'Info.plist'):
+                p = os.path.join(args.hotmetal2, req)
                 if not os.path.isfile(p):
-                    raise FileNotFoundError(f'incomplete SweetMetal2.bundle, missing {p}')
-            add_tree(tf, args.sweetmetal2, 'System/Library/Extensions/SweetMetal2.bundle',
-                     force_exec_names=('SweetMetal2', 'libvulkan_freedreno.dylib'))
+                    raise FileNotFoundError(f'incomplete HotMetal2.bundle, missing {p}')
+            add_tree(tf, args.hotmetal2, 'System/Library/Extensions/HotMetal2.bundle',
+                     force_exec_names=('HotMetal2', 'libvulkan_freedreno.dylib'))
 
         if args.userland_dir:
-            app_dir = os.path.join(args.userland_dir, 'Applications', 'SweetStore.app')
+            app_dir = os.path.join(args.userland_dir, 'Applications', 'HotStore.app')
             if os.path.isdir(app_dir):
-                add_tree(tf, app_dir, 'Applications/SweetStore.app',
-                         force_exec_names=('SweetStore', 'SweetWebAppStub'))
-            auth_app_dir = os.path.join(args.userland_dir, 'Applications', 'SweetAuth.app')
+                add_tree(tf, app_dir, 'Applications/HotStore.app',
+                         force_exec_names=('HotStore', 'HotWebAppStub'))
+            auth_app_dir = os.path.join(args.userland_dir, 'Applications', 'HotAuth.app')
             if os.path.isdir(auth_app_dir):
-                add_tree(tf, auth_app_dir, 'Applications/SweetAuth.app',
-                         force_exec_names=('SweetAuth',))
-            hal_dir = os.path.join(args.userland_dir, 'HAL', 'HakiosAudio.driver')
+                add_tree(tf, auth_app_dir, 'Applications/HotAuth.app',
+                         force_exec_names=('HotAuth',))
+            hal_dir = os.path.join(args.userland_dir, 'HAL', 'HotAudio.driver')
             if os.path.isdir(hal_dir):
                 add_ustar_dir(tf, 'System/Library/Audio/Plug-Ins/HAL', 0o755)
-                add_tree(tf, hal_dir, 'System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver',
-                         force_exec_names=('HakiosAudio',))
+                add_tree(tf, hal_dir, 'System/Library/Audio/Plug-Ins/HAL/HotAudio.driver',
+                         force_exec_names=('HotAudio',))
                 if va_disabled_files:
                     va_dst = 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin'
                     add_ustar_dir(tf, 'Library/Audio/Plug-Ins/HAL', 0o755)
@@ -1069,7 +1079,17 @@ def main():
                 if os.path.isfile(os.path.join(bin_dir, 'dropbearmulti')):
                     for link in ('dropbear', 'dbclient', 'dropbearkey', 'scp'):
                         add_ustar_symlink(tf, f'private/var/local/bin/{link}', 'dropbearmulti')
-                idle_xpc_path = os.path.join(bin_dir, 'sweet-idle-xpc')
+                for legacy_bin, hot_bin in (
+                    ('sweetdiag', 'hotdiag'),
+                    ('sweet-bootprep', 'hot-bootprep'),
+                    ('sweet-idle-xpc', 'hot-idle-xpc'),
+                    ('sweet-audiotest', 'hot-audiotest'),
+                ):
+                    if os.path.isfile(os.path.join(bin_dir, hot_bin)):
+                        add_ustar_symlink(tf, f'private/var/local/bin/{legacy_bin}', hot_bin)
+                idle_xpc_path = os.path.join(bin_dir, 'hot-idle-xpc')
+                if not os.path.isfile(idle_xpc_path):
+                    idle_xpc_path = os.path.join(bin_dir, 'sweet-idle-xpc')
                 if os.path.isfile(idle_xpc_path):
                     with open(idle_xpc_path, 'rb') as f:
                         idle_xpc_bytes = f.read()
@@ -1086,27 +1106,35 @@ def main():
             add_ustar_bytes(tf, 'private/var/local/mtl2-clients',
                             (args.mtl2_clients.strip() + '\n').encode(), mode=0o644)
         add_ustar_dir(tf, 'private/var/local/ipa', mode=0o777, uid=MOBILE_UID, gid=MOBILE_UID)
-        add_ustar_dir(tf, 'private/var/local/sweetauth', mode=0o700, uid=0, gid=0)
+        add_ustar_dir(tf, 'private/var/local/hotauth', mode=0o700, uid=0, gid=0)
         add_ustar_bytes(tf, 'private/var/local/mtl2.log', b'', mode=0o666)
         add_ustar_bytes(tf, 'private/var/local/appfix.log', b'', mode=0o666)
-        add_ustar_bytes(tf, 'private/var/local/sweetauth.log', b'', mode=0o666)
+        add_ustar_bytes(tf, 'private/var/local/hotauth.log', b'', mode=0o666)
         add_ustar_bytes(
             tf,
             'private/var/local/inject.conf',
-            b'/usr/local/lib/libsweet_media.dylib mediaserverd\n'
-            b'/usr/local/lib/libsweet_sysfix.dylib containermanagerd\n'
-            b'/usr/local/lib/libsweet_sysfix.dylib containermanagerd_system\n'
-            b'/usr/local/lib/libsweet_sysfix.dylib backboardd\n'
-            b'/usr/local/lib/libsweet_sysfix.dylib SpringBoard\n'
-            b'/usr/local/lib/libsweet_sysfix.dylib akd\n'
-            b'/usr/local/lib/libsweet_sysfix.dylib cdpd\n'
-            b'/usr/local/lib/libsweet_appfix.dylib @userapps\n',
+            b'/usr/local/lib/libhot_media.dylib mediaserverd\n'
+            b'/usr/local/lib/libhot_sysfix.dylib containermanagerd\n'
+            b'/usr/local/lib/libhot_sysfix.dylib containermanagerd_system\n'
+            b'/usr/local/lib/libhot_sysfix.dylib backboardd\n'
+            b'/usr/local/lib/libhot_sysfix.dylib SpringBoard\n'
+            b'/usr/local/lib/libhot_sysfix.dylib akd\n'
+            b'/usr/local/lib/libhot_sysfix.dylib cdpd\n'
+            b'/usr/local/lib/libhot_appfix.dylib @userapps\n',
             mode=0o644,
         )
 
         rm_paths = [
             'Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/Info.plist',
             'Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/HakiosAudio',
+            'System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/Info.plist',
+            'System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/HakiosAudio',
+            'System/Library/Extensions/SweetMetal2.bundle/Info.plist',
+            'System/Library/Extensions/SweetMetal2.bundle/SweetMetal2',
+            'Applications/SweetStore.app/Info.plist',
+            'Applications/SweetStore.app/SweetStore',
+            'Applications/SweetAuth.app/Info.plist',
+            'Applications/SweetAuth.app/SweetAuth',
         ]
         if wp_assets is not None:
             rm_paths.extend([

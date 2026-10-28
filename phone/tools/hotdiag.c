@@ -1,15 +1,15 @@
 /*
- * sweetdiag: live OS & hardware observability CLI for a booted iOS device.
+ * hotdiag: live OS & hardware observability CLI for a booted iOS device.
  *
  * Reads /dev/sweet-diag and /dev/sweet-log exposed by bsd/dev/sweet_diag.c
  * (Kernel 0132+), with a sysctl/getifaddrs fallback on older kernels.
  *
  * Usage:
- *   sweetdiag [status]              colorized health & telemetry report
- *   sweetdiag watch [INTERVAL_MS]   live-refreshing terminal dashboard (alias: top)
- *   sweetdiag json                  raw JSON from /dev/sweet-diag
- *   sweetdiag crashes               recent userland fatal signals + unslid PCs/BTs
- *   sweetdiag klog [-f] [-n BYTES] [-g SUBSTR]
+ *   hotdiag [status]              colorized health & telemetry report
+ *   hotdiag watch [INTERVAL_MS]   live-refreshing terminal dashboard (alias: top)
+ *   hotdiag json                  raw JSON from /dev/sweet-diag
+ *   hotdiag crashes               recent userland fatal signals + unslid PCs/BTs
+ *   hotdiag klog [-f] [-n BYTES] [-g SUBSTR]
  *                                   read or tail (-f) XNU's 1 MiB sweet_log_ring
  */
 #include <arpa/inet.h>
@@ -51,13 +51,15 @@ static const char *c_cyn(void)  { return g_color ? "\033[36m" : ""; }
 
 static const char *diag_path(void)
 {
-	const char *p = getenv("SWEETDIAG_PATH");
+	const char *p = getenv("HOTDIAG_PATH");
+	if (!p || !*p) p = getenv("SWEETDIAG_PATH");
 	return (p && *p) ? p : "/dev/sweet-diag";
 }
 
 static const char *klog_path(void)
 {
-	const char *p = getenv("SWEETKLOG_PATH");
+	const char *p = getenv("HOTKLOG_PATH");
+	if (!p || !*p) p = getenv("SWEETKLOG_PATH");
 	return (p && *p) ? p : "/dev/sweet-log";
 }
 
@@ -288,7 +290,7 @@ static const char *j_arr_next(const char *elem)
 
 static void fallback_status(void)
 {
-	printf("%sSWEET DIAG (fallback mode: /dev/sweet-diag not present — boot Kernel 0132+ for full live telemetry)%s\n",
+	printf("%sHOT DIAG (fallback mode: /dev/sweet-diag not present — boot Kernel 0132+ for full live telemetry)%s\n",
 	       c_ylw(), c_rst());
 #ifdef __APPLE__
 	char inj[512] = "";
@@ -404,7 +406,7 @@ static void render_status(const char *root)
 	if (ce) { c1 = strtoull(ce, NULL, 10); ce = j_arr_next(ce); }
 	if (ce) { c2 = strtoull(ce, NULL, 10); }
 
-	printf("%s=== SWEET LIVE DIAGNOSTICS ===%s  uptime %lluh %llum %llus  cpus=%lld (%llu/%llu/%llu MHz)",
+	printf("%s=== HOT LIVE DIAGNOSTICS ===%s  uptime %lluh %llum %llus  cpus=%lld (%llu/%llu/%llu MHz)",
 	       c_bold(), c_rst(), up_ms / 3600000ULL, (up_ms / 60000ULL) % 60ULL, (up_ms / 1000ULL) % 60ULL,
 	       cpus, c0, c1, c2);
 	if (wdt && rem_s >= 0) {
@@ -615,7 +617,7 @@ static int cmd_klog(int argc, char **argv, char *diag_buf)
 
 	int fd = open(klog_path(), O_RDONLY);
 	if (fd < 0) {
-		fprintf(stderr, "sweetdiag: open %s: %s\n", klog_path(), strerror(errno));
+		fprintf(stderr, "hotdiag: open %s: %s\n", klog_path(), strerror(errno));
 		return 1;
 	}
 	uint64_t end = query_klog_pos(diag_buf);
@@ -657,11 +659,11 @@ int main(int argc, char **argv)
 
 	if (strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0 || strcmp(cmd, "help") == 0) {
 		printf("Usage:\n"
-		       "  sweetdiag [status]              live OS & hardware health report\n"
-		       "  sweetdiag watch [INTERVAL_MS]   auto-refreshing dashboard (alias: top)\n"
-		       "  sweetdiag json                  raw JSON from /dev/sweet-diag\n"
-		       "  sweetdiag crashes               detailed userland crash ring + unslid BTs\n"
-		       "  sweetdiag klog [-f] [-n BYTES] [-g SUBSTR]\n"
+		       "  hotdiag [status]              live OS & hardware health report\n"
+		       "  hotdiag watch [INTERVAL_MS]   auto-refreshing dashboard (alias: top)\n"
+		       "  hotdiag json                  raw JSON from /dev/sweet-diag\n"
+		       "  hotdiag crashes               detailed userland crash ring + unslid BTs\n"
+		       "  hotdiag klog [-f] [-n BYTES] [-g SUBSTR]\n"
 		       "                                  read or follow XNU sweet_log_ring\n");
 		return 0;
 	}
@@ -698,7 +700,7 @@ int main(int argc, char **argv)
 	ssize_t n = read_whole_file(diag_path(), buf, DIAG_CAP);
 	if (n <= 0) {
 		if (strcmp(cmd, "json") == 0) {
-			fprintf(stderr, "sweetdiag: cannot read %s: %s\n", diag_path(), strerror(errno));
+			fprintf(stderr, "hotdiag: cannot read %s: %s\n", diag_path(), strerror(errno));
 			free(buf);
 			return 1;
 		}

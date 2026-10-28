@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build adspd (/var/local/bin/adspd) and sweet-audiotest (/var/local/bin/sweet-audiotest)
+# Build adspd (/var/local/bin/adspd) and hot-audiotest (/var/local/bin/hot-audiotest)
 # for iOS arm64 into phone/adsp/out (ad-hoc signed with platform entitlements).
 set -e
 cd "$(dirname "$0")"
@@ -20,11 +20,11 @@ codesign -f -s - --entitlements adspd-ents.plist out/adspd
 "$CC" -O2 -Wall -Wextra -Wno-unused-parameter -fobjc-arc \
 	-framework Foundation -framework AudioToolbox -lobjc \
 	-Wl,-dead_strip \
-	-o out/sweet-audiotest sweet-audiotest.m
-strip -x out/sweet-audiotest
-codesign -f -s - --entitlements adspd-ents.plist out/sweet-audiotest
+	-o out/hot-audiotest hot-audiotest.m
+strip -x out/hot-audiotest
+codesign -f -s - --entitlements adspd-ents.plist out/hot-audiotest
 
-for bin in out/adspd out/sweet-audiotest; do
+for bin in out/adspd out/hot-audiotest; do
 	WEAK=$(nm -m "$bin" | grep "weak external" | grep -v "dynamically looked up" || true)
 	if [ -n "$WEAK" ]; then
 		echo "ERROR: unexpected weak external symbols in $bin:" >&2
@@ -33,4 +33,4 @@ for bin in out/adspd out/sweet-audiotest; do
 	fi
 done
 
-ls -la out/adspd out/sweet-audiotest
+ls -la out/adspd out/hot-audiotest

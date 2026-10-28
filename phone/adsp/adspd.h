@@ -5,22 +5,22 @@
  * QRTR pd-mapper/tftp, APR v2 (Q6Core/Q6AFE/Q6ADM/Q6ASM + MVM/CVS/CVP voice),
  * and Maxim MAX98927L/R stereo speaker amplifier driver for RMX1931.
  */
-#ifndef SWEET_ADSPD_H
-#define SWEET_ADSPD_H
+#ifndef HOT_ADSPD_H
+#define HOT_ADSPD_H
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#include "../audio/hakios.audio.h"
+#include "../audio/hot_audio.h"
 
 /* ---- File paths ---- */
 #define ADSP_FW_DIR                 "/var/local/fw/modem"
 #define ADSP_LOG_PATH               "/var/local/adspd.log"
 #define ADSP_STATUS_PATH            "/var/local/adsp-status.json"
 #define ADSP_OFF_PATH               "/var/local/adspd.off"
-#define QRTR_MUX_SOCK_PATH          "/var/run/sweet-qrtr.sock"
-#define VOICE_CALL_STATE_PATH       "/tmp/sweet-voice-call.state"
+#define QRTR_MUX_SOCK_PATH          "/var/run/hot-qrtr.sock"
+#define VOICE_CALL_STATE_PATH       "/tmp/hot-voice-call.state"
 
 /* ---- SM8150 LPASS / ADSP hardware constants ---- */
 #define PAS_ADSP                    1u
@@ -150,7 +150,7 @@ struct adsp_status {
 
 extern struct adsp_status g_status;
 extern volatile int g_stop_requested;
-extern struct sweet_audio_shm *g_shm;
+extern struct hot_audio_shm *g_shm;
 
 /* ---- Logging & status helpers (adspd.c) ---- */
 void adsp_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -207,4 +207,4 @@ void     adsp_q6_play_tone_Start(unsigned duration_ms);
 bool     adsp_q6_tone_active(void);
 void     adsp_q6_teardown(void);
 
-#endif /* SWEET_ADSPD_H */
+#endif /* HOT_ADSPD_H */

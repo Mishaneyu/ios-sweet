@@ -1,11 +1,11 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * sweet-audiotest.m: End-to-end CoreAudio -> mediaserverd -> HakiosAudio.driver
- * -> /tmp/sweet-audio.shm -> adspd -> Q6ASM -> MAX98927 stereo verification CLI.
+ * hot-audiotest.m: End-to-end CoreAudio -> mediaserverd -> HotAudio.driver
+ * -> /tmp/hot-audio.shm -> adspd -> Q6ASM -> MAX98927 stereo verification CLI.
  *
  * Usage:
- *   sweet-audiotest [duration_ms] [freq_left_hz] [freq_right_hz]
+ *   hot-audiotest [duration_ms] [freq_left_hz] [freq_right_hz]
  */
 #import <AudioToolbox/AudioToolbox.h>
 #import <Foundation/Foundation.h>
@@ -18,7 +18,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "../audio/hakios.audio.h"
+#include "../audio/hot_audio.h"
 
 #define NUM_AQ_BUFFERS  4
 #define CHUNK_FRAMES    2048u
@@ -114,19 +114,19 @@ activate_playback_session_if_present(void)
 static void
 read_shm_snapshot(uint32_t *out_w, uint32_t *out_r, uint32_t *out_vol, bool *out_ok)
 {
-	int fd = open(SWEET_AUDIO_SHM_PATH, O_RDONLY | O_CLOEXEC);
+	int fd = open(HOT_AUDIO_SHM_PATH, O_RDONLY | O_CLOEXEC);
 
 	*out_w = *out_r = *out_vol = 0;
 	*out_ok = false;
 	if (fd < 0) {
 		return;
 	}
-	struct sweet_audio_shm *s = mmap(NULL, sizeof(*s), PROT_READ, MAP_SHARED, fd, 0);
+	struct hot_audio_shm *s = mmap(NULL, sizeof(*s), PROT_READ, MAP_SHARED, fd, 0);
 	close(fd);
 	if (s == MAP_FAILED) {
 		return;
 	}
-	if (s->magic == SWEET_AUDIO_SHM_MAGIC) {
+	if (s->magic == HOT_AUDIO_SHM_MAGIC) {
 		*out_w = __atomic_load_n(&s->write_frames, __ATOMIC_ACQUIRE);
 		*out_r = __atomic_load_n(&s->read_frames, __ATOMIC_ACQUIRE);
 		*out_vol = __atomic_load_n(&s->volume_q16, __ATOMIC_ACQUIRE);
@@ -151,7 +151,7 @@ run_ringtone_test(unsigned duration_ms)
 	Class clsCfg = NSClassFromString(@"TLAlertConfiguration");
 	Class clsAlert = NSClassFromString(@"TLAlert");
 	if (tl == NULL || clsCfg == nil || clsAlert == nil) {
-		fprintf(stderr, "sweet-audiotest ring: ToneLibrary unavailable (tl=%p cfg=%p alert=%p)\n",
+		fprintf(stderr, "hot-audiotest ring: ToneLibrary unavailable (tl=%p cfg=%p alert=%p)\n",
 		    tl, (__bridge void *)clsCfg, (__bridge void *)clsAlert);
 		return 1;
 	}
@@ -159,7 +159,7 @@ run_ringtone_test(unsigned duration_ms)
 	uint32_t w0 = 0, r0 = 0, vol0 = 0;
 	bool shm_ok0 = false;
 	read_shm_snapshot(&w0, &r0, &vol0, &shm_ok0);
-	printf("sweet-audiotest ring: %u ms TLAlertTypeIncomingCall (BKSHIDServicesGetRingerState=%llu)\n",
+	printf("hot-audiotest ring: %u ms TLAlertTypeIncomingCall (BKSHIDServicesGetRingerState=%llu)\n",
 	    duration_ms, (unsigned long long)ringer_state);
 	printf("  before: shm=%s write_frames=%u read_frames=%u vol_q16=%u\n",
 	    shm_ok0 ? "attached" : "missing", w0, r0, vol0);
@@ -170,7 +170,7 @@ run_ringtone_test(unsigned duration_ms)
 	id alert = ((id (*)(id, SEL, id))objc_msgSend)((id)clsAlert,
 	    NSSelectorFromString(@"alertWithConfiguration:"), cfg);
 	if (alert == nil) {
-		fprintf(stderr, "sweet-audiotest ring: alertWithConfiguration: returned nil\n");
+		fprintf(stderr, "hot-audiotest ring: alertWithConfiguration: returned nil\n");
 		return 1;
 	}
 
@@ -212,7 +212,7 @@ main(int argc, const char *argv[])
 		uint32_t w0 = 0, r0 = 0, vol0 = 0;
 		bool shm_ok0 = false;
 		read_shm_snapshot(&w0, &r0, &vol0, &shm_ok0);
-		printf("sweet-audiotest: %u ms stereo (L=%.2f Hz, R=%.2f Hz) @ 48 kHz S16_LE\n",
+		printf("hot-audiotest: %u ms stereo (L=%.2f Hz, R=%.2f Hz) @ 48 kHz S16_LE\n",
 		    duration_ms, freq_l, freq_r);
 		printf("  before: shm=%s write_frames=%u read_frames=%u vol_q16=%u\n",
 		    shm_ok0 ? "attached" : "missing", w0, r0, vol0);
@@ -239,7 +239,7 @@ main(int argc, const char *argv[])
 		OSStatus st = AudioQueueNewOutput(&fmt, aq_output_cb, &ctx,
 		    CFRunLoopGetCurrent(), kCFRunLoopCommonModes, 0, &aq);
 		if (st != noErr || aq == NULL) {
-			fprintf(stderr, "sweet-audiotest: AudioQueueNewOutput failed (OSStatus=%d)\n", (int)st);
+			fprintf(stderr, "hot-audiotest: AudioQueueNewOutput failed (OSStatus=%d)\n", (int)st);
 			return 1;
 		}
 		(void)AudioQueueSetParameter(aq, kAudioQueueParam_Volume, 1.0f);
@@ -248,7 +248,7 @@ main(int argc, const char *argv[])
 		for (int i = 0; i < NUM_AQ_BUFFERS; i++) {
 			st = AudioQueueAllocateBuffer(aq, CHUNK_FRAMES * HAKIOS_AUDIO_FRAME, &bufs[i]);
 			if (st != noErr) {
-				fprintf(stderr, "sweet-audiotest: AudioQueueAllocateBuffer failed (%d)\n", (int)st);
+				fprintf(stderr, "hot-audiotest: AudioQueueAllocateBuffer failed (%d)\n", (int)st);
 				AudioQueueDispose(aq, true);
 				return 1;
 			}

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build SweetAuth.app (/Applications/SweetAuth.app) and sweetauthd (/var/local/bin/sweetauthd)
+# Build HotAuth.app (/Applications/HotAuth.app) and hotauthd (/var/local/bin/hotauthd)
 # for iOS arm64 into phone/auth/out (ad-hoc signed with entitlements).
 set -e
 cd "$(dirname "$0")"
@@ -7,21 +7,21 @@ ROOT=$(cd ../.. && pwd)
 CC="$ROOT/work/userland/bin/ios-cc"
 
 rm -rf out
-mkdir -p out/SweetAuth.app
+mkdir -p out/HotAuth.app
 
 # 1. Local Apple ID / iCloud compatibility daemon (127.0.0.1:29171)
 "$CC" -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
 	-framework Foundation -framework Security -framework Accounts \
-	-o out/sweetauthd sweetauthd.m
-strip -x out/sweetauthd
-codesign -f -s - --entitlements sweetauthd-ents.plist out/sweetauthd
+	-o out/hotauthd hotauthd.m
+strip -x out/hotauthd
+codesign -f -s - --entitlements hotauthd-ents.plist out/hotauthd
 
 # 2. Native UIKit + WebKit "microG Settings" app for iCloud & Apple ID
 "$CC" -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
 	-framework UIKit -framework QuartzCore -framework CoreGraphics -framework WebKit -framework Foundation \
-	-o out/SweetAuth.app/SweetAuth SweetAuth.m
-strip -x out/SweetAuth.app/SweetAuth
-cp Info.plist out/SweetAuth.app/Info.plist
+	-o out/HotAuth.app/HotAuth HotAuth.m
+strip -x out/HotAuth.app/HotAuth
+cp Info.plist out/HotAuth.app/Info.plist
 
 # 3. Generate crisp PNG app icons (emerald/teal shield + key glyph, pure Python stdlib)
 python3 - <<'PY'
@@ -92,13 +92,13 @@ def write_icon(path, size):
     with open(path, "wb") as f:
         f.write(png)
 
-write_icon("out/SweetAuth.app/AppIcon60x60@2x.png", 120)
-write_icon("out/SweetAuth.app/AppIcon60x60@3x.png", 180)
+write_icon("out/HotAuth.app/AppIcon60x60@2x.png", 120)
+write_icon("out/HotAuth.app/AppIcon60x60@3x.png", 180)
 PY
 
-codesign -f -s - --entitlements SweetAuth-ents.plist out/SweetAuth.app
+codesign -f -s - --entitlements HotAuth-ents.plist out/HotAuth.app
 
-for bin in out/sweetauthd out/SweetAuth.app/SweetAuth; do
+for bin in out/hotauthd out/HotAuth.app/HotAuth; do
 	WEAK=$(nm -m "$bin" | grep "weak external" | grep -v "dynamically looked up" || true)
 	if [ -n "$WEAK" ]; then
 		echo "ERROR: unexpected weak external symbols in $bin:" >&2
@@ -107,4 +107,4 @@ for bin in out/sweetauthd out/SweetAuth.app/SweetAuth; do
 	fi
 done
 
-ls -la out out/SweetAuth.app
+ls -la out out/HotAuth.app

@@ -2,7 +2,7 @@
  * cellulard: iOS 26.5.2 cellular & SIM bring-up daemon for SM8150 (RMX1931).
  *
  * Bridges Qualcomm MPSS QMI services (DMS, UIM, NAS, WDA, WDS) over wland's
- * /var/run/sweet-qrtr.sock multiplexer into iOS 26:
+ * /var/run/hot-qrtr.sock multiplexer into iOS 26:
  *   1. SystemStatus (STTelephonyStatusDomainPublisher) -> Lock/Home status bar
  *   2. com.apple.commcenter.coretelephony.xpc (NSXPCListener, CTXPCServiceInterface)
  *      -> Settings -> Cellular, Settings -> General -> About, systemstatusd
@@ -46,13 +46,13 @@
 
 /* ---- Typed SPI interfaces (resolved dynamically via NSClassFromString) ---- */
 
-@interface SweetXPCInterfaceSPI : NSObject
+@interface HotXPCInterfaceSPI : NSObject
 + (instancetype)interfaceWithProtocol:(Protocol *)protocol;
 - (void)setClasses:(NSSet<Class> *)classes forSelector:(SEL)sel
      argumentIndex:(NSUInteger)arg ofReply:(BOOL)ofReply;
 @end
 
-@interface SweetXPCConnectionSPI : NSObject
+@interface HotXPCConnectionSPI : NSObject
 @property (nonatomic, strong) id exportedInterface;
 @property (nonatomic, strong) id exportedObject;
 @property (nonatomic, strong) id remoteObjectInterface;
@@ -64,14 +64,14 @@
 - (void)invalidate;
 @end
 
-@interface SweetXPCListenerSPI : NSObject
+@interface HotXPCListenerSPI : NSObject
 @property (nonatomic, weak) id delegate;
 - (instancetype)initWithMachServiceName:(NSString *)name;
 - (void)resume;
 @end
 
 /* SystemStatus private classes */
-@interface SweetSTMutableSIMInfo : NSObject
+@interface HotSTMutableSIMInfo : NSObject
 - (void)setSIMPresent:(BOOL)v;
 - (void)setBootstrap:(BOOL)v;
 - (void)setLabel:(NSString *)v;
@@ -89,233 +89,233 @@
 - (void)setCallForwardingEnabled:(BOOL)v;
 @end
 
-@interface SweetSTMutableTelephonyData : NSObject
+@interface HotSTMutableTelephonyData : NSObject
 - (void)setCellularRadioCapabilityEnabled:(BOOL)v;
 - (void)setDualSIMEnabled:(BOOL)v;
 - (void)setRadioModuleDead:(BOOL)v;
 - (void)setInactiveSOSEnabled:(BOOL)v;
 - (void)setUsingStewieForSOS:(BOOL)v;
 - (void)setUsingStewieConnection:(BOOL)v;
-- (void)updateSIMOneInfoWithBlock:(void (^)(SweetSTMutableSIMInfo *sim))block;
-- (void)updateSIMTwoInfoWithBlock:(void (^)(SweetSTMutableSIMInfo *sim))block;
+- (void)updateSIMOneInfoWithBlock:(void (^)(HotSTMutableSIMInfo *sim))block;
+- (void)updateSIMTwoInfoWithBlock:(void (^)(HotSTMutableSIMInfo *sim))block;
 @end
 
-@interface SweetSTTelephonyPublisher : NSObject
-- (void)updateDataWithBlock:(void (^)(SweetSTMutableTelephonyData *data))block;
+@interface HotSTTelephonyPublisher : NSObject
+- (void)updateDataWithBlock:(void (^)(HotSTMutableTelephonyData *data))block;
 @end
 
 /* CoreTelephony private constructors & delegate notification methods */
-@interface SweetCTContextInfo : NSObject
+@interface HotCTContextInfo : NSObject
 + (instancetype)contextWithUUID:(NSUUID *)uuid andAccountID:(NSString *)acct andSlot:(NSInteger)slot;
 @end
 
-@interface SweetCTServiceDescriptor : NSObject
+@interface HotCTServiceDescriptor : NSObject
 + (instancetype)telephonyDescriptorWithInstance:(NSNumber *)inst;
 @end
 
-@interface SweetCTServiceDescriptorContainer : NSObject
+@interface HotCTServiceDescriptorContainer : NSObject
 - (instancetype)initWithDescriptors:(NSArray *)descs;
 @end
 
-@interface SweetCTSimLabel : NSObject
+@interface HotCTSimLabel : NSObject
 - (instancetype)initWithId:(NSString *)uid andText:(NSString *)text andDidSetup:(BOOL)setup;
 @end
 
-@interface SweetCTSimHardwareInfo : NSObject
+@interface HotCTSimHardwareInfo : NSObject
 - (instancetype)initWithHardwareInfo:(NSInteger)hwType simLocation:(NSInteger)loc;
 @end
 
-@interface SweetCTDisplayPlanList : NSObject
+@interface HotCTDisplayPlanList : NSObject
 - (instancetype)initWithDisplayPlans:(NSArray *)plans;
 @end
 
-@interface SweetCTSupportedMaxDataRates : NSObject
+@interface HotCTSupportedMaxDataRates : NSObject
 - (instancetype)initWithRates:(NSArray *)rates;
 @end
 
-@interface SweetCTEncryptionStatusInfo : NSObject
+@interface HotCTEncryptionStatusInfo : NSObject
 - (instancetype)initWithStatus:(NSInteger)st;
 @end
 
 /* Distinct typed response wrappers so ARC never sees ambiguous initWithResult: */
-@interface SweetCTBoolResp : NSObject
+@interface HotCTBoolResp : NSObject
 - (instancetype)initWithResult:(BOOL)r;
 @end
 
-@interface SweetCTObjResp : NSObject
+@interface HotCTObjResp : NSObject
 - (instancetype)initWithResult:(id)r;
 @end
 
-@interface SweetCTEnabledResp : NSObject
+@interface HotCTEnabledResp : NSObject
 - (instancetype)initWithIsEnabled:(BOOL)en;
 @end
 
-@interface SweetCTInfoResp : NSObject
+@interface HotCTInfoResp : NSObject
 - (instancetype)initWithInfo:(id)info;
 @end
 
-@interface SweetCTStatusResp : NSObject
+@interface HotCTStatusResp : NSObject
 - (instancetype)initWithStatus:(id)st;
 @end
 
-@interface SweetCTSigInfoResp : NSObject
+@interface HotCTSigInfoResp : NSObject
 - (instancetype)initWithSignalStrengthInfo:(id)info;
 @end
 
-@interface SweetCTSigMeasResp : NSObject
+@interface HotCTSigMeasResp : NSObject
 - (instancetype)initWithSignalStrengthMeasurements:(id)m;
 @end
 
-@interface SweetCTOpNameResp : NSObject
+@interface HotCTOpNameResp : NSObject
 - (instancetype)initWithOperatorName:(NSString *)name;
 @end
 
-@interface SweetCTRoamingResp : NSObject
+@interface HotCTRoamingResp : NSObject
 - (instancetype)initWithRoamingStatus:(id)st;
 @end
 
-@interface SweetCTCurRatResp : NSObject
+@interface HotCTCurRatResp : NSObject
 - (instancetype)initWithRat:(NSString *)rat;
 @end
 
-@interface SweetCTRegRatResp : NSObject
+@interface HotCTRegRatResp : NSObject
 - (instancetype)initWithRAT:(NSString *)rat;
 @end
 
-@interface SweetCTTechResp : NSObject
+@interface HotCTTechResp : NSObject
 - (instancetype)initWithTechnology:(NSString *)tech;
 @end
 
-@interface SweetCTRatSelResp : NSObject
+@interface HotCTRatSelResp : NSObject
 - (instancetype)initWithRATSelection:(id)sel;
 @end
 
-@interface SweetCTDataAttResp : NSObject
+@interface HotCTDataAttResp : NSObject
 - (instancetype)initWithIsDataAttached:(BOOL)att;
 @end
 
-@interface SweetCTHomeResp : NSObject
+@interface HotCTHomeResp : NSObject
 - (instancetype)initWithIsHome:(BOOL)home;
 @end
 
-@interface SweetCTAvailResp : NSObject
+@interface HotCTAvailResp : NSObject
 - (instancetype)initWithIsAvailable:(BOOL)avail;
 @end
 
-@interface SweetCTReselResp : NSObject
+@interface HotCTReselResp : NSObject
 - (instancetype)initWithNeedsReselection:(BOOL)need;
 @end
 
-@interface SweetCTMccResp : NSObject
+@interface HotCTMccResp : NSObject
 - (instancetype)initWithMcc:(NSString *)mcc;
 @end
 
-@interface SweetCTLastMccResp : NSObject
+@interface HotCTLastMccResp : NSObject
 - (instancetype)initWithLastMcc:(NSString *)mcc;
 @end
 
-@interface SweetCTMncResp : NSObject
+@interface HotCTMncResp : NSObject
 - (instancetype)initWithMnc:(NSString *)mnc;
 @end
 
-@interface SweetCTPlmnResp : NSObject
+@interface HotCTPlmnResp : NSObject
 - (instancetype)initWithPlmn:(NSString *)plmn;
 @end
 
-@interface SweetCTLabelResp : NSObject
+@interface HotCTLabelResp : NSObject
 - (instancetype)initWithLabel:(id)lbl;
 @end
 
-@interface SweetCTHwResp : NSObject
+@interface HotCTHwResp : NSObject
 - (instancetype)initWithHardwareInfo:(id)hw;
 @end
 
-@interface SweetCTNRResp : NSObject
+@interface HotCTNRResp : NSObject
 - (instancetype)initWithNRStatus:(id)nr;
 @end
 
-@interface SweetCTSupportResp : NSObject
+@interface HotCTSupportResp : NSObject
 - (instancetype)initWithSupport:(BOOL)sup;
 @end
 
-@interface SweetCTDataRateResp : NSObject
+@interface HotCTDataRateResp : NSObject
 - (instancetype)initWithDataRate:(NSInteger)rate;
 @end
 
-@interface SweetCTSupRatesResp : NSObject
+@interface HotCTSupRatesResp : NSObject
 - (instancetype)initWithSupportedRates:(id)rates;
 @end
 
-@interface SweetCTBandResp : NSObject
+@interface HotCTBandResp : NSObject
 - (instancetype)initWithBandInfo:(id)bi;
 @end
 
-@interface SweetCTCtxResp : NSObject
+@interface HotCTCtxResp : NSObject
 - (instancetype)initWithContext:(id)ctx;
 @end
 
-@interface SweetCTNetSelInfoResp : NSObject
+@interface HotCTNetSelInfoResp : NSObject
 - (instancetype)initWithNetworkSelectionInfo:(id)info;
 @end
 
-@interface SweetCTNetResp : NSObject
+@interface HotCTNetResp : NSObject
 - (instancetype)initWithNetwork:(id)net;
 @end
 
-@interface SweetCTNetListResp : NSObject
+@interface HotCTNetListResp : NSObject
 - (instancetype)initWithNetworkList:(id)list;
 @end
 
-@interface SweetCTIMSResp : NSObject
+@interface HotCTIMSResp : NSObject
 - (instancetype)initWithIMSRegistrationStatus:(id)ims;
 @end
 
-@interface SweetCTIMSTransResp : NSObject
+@interface HotCTIMSTransResp : NSObject
 - (instancetype)initWithIMSRegistrationInfo:(id)ims;
 @end
 
-@interface SweetCTEncResp : NSObject
+@interface HotCTEncResp : NSObject
 - (instancetype)initWithEncryptionStatusInfo:(id)enc;
 @end
 
-@interface SweetCTCauseResp : NSObject
+@interface HotCTCauseResp : NSObject
 - (instancetype)initWithCauseCode:(NSNumber *)cc;
 @end
 
-@interface SweetCTPlanListResp : NSObject
+@interface HotCTPlanListResp : NSObject
 - (instancetype)initWithPlanList:(id)list;
 @end
 
-@interface SweetCTListResp : NSObject
+@interface HotCTListResp : NSObject
 - (instancetype)initWithList:(id)list;
 @end
 
-@interface SweetCTDevsResp : NSObject
+@interface HotCTDevsResp : NSObject
 - (instancetype)initWithDevices:(id)devs;
 @end
 
-@interface SweetCTTransferPlansResp : NSObject
+@interface HotCTTransferPlansResp : NSObject
 - (instancetype)initWithRemtoeDevices:(id)devs isFlexPolicyOn:(BOOL)flex;
 @end
 
-@interface SweetCTMeInfoResp : NSObject
+@interface HotCTMeInfoResp : NSObject
 - (instancetype)initWithEquipmentInfoList:(id)list;
 @end
 
-@interface SweetCTFwInfoResp : NSObject
+@interface HotCTFwInfoResp : NSObject
 - (instancetype)initWithFimwareUpdateInfo:(id)dict;
 @end
 
-@interface SweetCTCallCapResp : NSObject
+@interface HotCTCallCapResp : NSObject
 - (instancetype)initWithCapabilities:(id)caps;
 @end
 
 /* CallKit dynamic SPI interfaces (loaded via dlopen, zero build-time framework link needed) */
-@interface SweetCXHandleSPI : NSObject
+@interface HotCXHandleSPI : NSObject
 - (instancetype)initWithType:(NSInteger)type value:(NSString *)value;
 @end
 
-@interface SweetCXAccountSPI : NSObject
+@interface HotCXAccountSPI : NSObject
 - (instancetype)initWithUUID:(NSUUID *)UUID
 		 description:(NSString *)description
 		 serviceName:(NSString *)serviceName
@@ -324,12 +324,12 @@
 		  shortLabel:(NSString *)shortLabel;
 @end
 
-@interface SweetCXSenderIdentitySPI : NSObject
+@interface HotCXSenderIdentitySPI : NSObject
 - (instancetype)initWithUUID:(NSUUID *)UUID account:(id)account;
 - (instancetype)initWithUUID:(NSUUID *)UUID handle:(id)handle localizedName:(NSString *)localizedName;
 @end
 
-@interface SweetCXProviderConfigSPI : NSObject
+@interface HotCXProviderConfigSPI : NSObject
 - (instancetype)initWithLocalizedName:(NSString *)localizedName;
 - (void)setLocalizedName:(NSString *)localizedName;
 - (void)setSupportedHandleTypes:(NSSet *)types;
@@ -349,7 +349,7 @@
 - (void)setEmergencyHandles:(NSArray *)handles;
 @end
 
-@interface SweetCXProviderSPI : NSObject
+@interface HotCXProviderSPI : NSObject
 - (instancetype)initWithConfiguration:(id)configuration;
 - (id)configuration;
 - (void)setConfiguration:(id)configuration;
@@ -365,14 +365,14 @@
 - (void)reportCallWithUUID:(NSUUID *)UUID endedAtDate:(NSDate *)dateEnded privateReason:(NSInteger)privateReason;
 @end
 
-@interface SweetCXActionSPI : NSObject
+@interface HotCXActionSPI : NSObject
 - (NSUUID *)callUUID;
 - (void)fulfill;
 - (void)fail;
 @end
 
 /* Client delegate push interface */
-@interface SweetCTDelegateProxy : NSObject
+@interface HotCTDelegateProxy : NSObject
 - (void)subscriptionInfoDidChange;
 - (void)activeSubscriptionsDidChange;
 - (void)simStatusDidChange:(id)ctx status:(NSString *)status;
@@ -395,23 +395,23 @@ static bool g_publish_system_status = true;
 static uint16_t g_rat_mode_pref = 0x001cu; /* GSM|WCDMA|LTE */
 static char g_configured_apn[64] = "";
 
-typedef void *sweet_xpc_t;
-static sweet_xpc_t (*fn_xpc_conn_create_mach)(const char *, dispatch_queue_t, uint64_t);
-static void (*fn_xpc_conn_set_target_queue)(sweet_xpc_t, dispatch_queue_t);
-static void (*fn_xpc_conn_set_handler)(sweet_xpc_t, void (^)(sweet_xpc_t));
-static void (*fn_xpc_conn_resume)(sweet_xpc_t);
-static void (*fn_xpc_conn_send)(sweet_xpc_t, sweet_xpc_t);
-static sweet_xpc_t (*fn_xpc_dict_create)(const char * const *, const sweet_xpc_t *, size_t);
-static sweet_xpc_t (*fn_xpc_dict_create_reply)(sweet_xpc_t);
-static void (*fn_xpc_dict_set_int64)(sweet_xpc_t, const char *, int64_t);
-static void (*fn_xpc_dict_set_string)(sweet_xpc_t, const char *, const char *);
-static void (*fn_xpc_dict_set_bool)(sweet_xpc_t, const char *, bool);
-static void (*fn_xpc_dict_set_value)(sweet_xpc_t, const char *, sweet_xpc_t);
-static const char *(*fn_xpc_dict_get_string)(sweet_xpc_t, const char *);
-static sweet_xpc_t (*fn_xpc_dict_get_value)(sweet_xpc_t, const char *);
-static const void *(*fn_xpc_get_type)(sweet_xpc_t);
-static sweet_xpc_t (*fn_xpc_retain)(sweet_xpc_t);
-static void (*fn_xpc_release)(sweet_xpc_t);
+typedef void *hot_xpc_t;
+static hot_xpc_t (*fn_xpc_conn_create_mach)(const char *, dispatch_queue_t, uint64_t);
+static void (*fn_xpc_conn_set_target_queue)(hot_xpc_t, dispatch_queue_t);
+static void (*fn_xpc_conn_set_handler)(hot_xpc_t, void (^)(hot_xpc_t));
+static void (*fn_xpc_conn_resume)(hot_xpc_t);
+static void (*fn_xpc_conn_send)(hot_xpc_t, hot_xpc_t);
+static hot_xpc_t (*fn_xpc_dict_create)(const char * const *, const hot_xpc_t *, size_t);
+static hot_xpc_t (*fn_xpc_dict_create_reply)(hot_xpc_t);
+static void (*fn_xpc_dict_set_int64)(hot_xpc_t, const char *, int64_t);
+static void (*fn_xpc_dict_set_string)(hot_xpc_t, const char *, const char *);
+static void (*fn_xpc_dict_set_bool)(hot_xpc_t, const char *, bool);
+static void (*fn_xpc_dict_set_value)(hot_xpc_t, const char *, hot_xpc_t);
+static const char *(*fn_xpc_dict_get_string)(hot_xpc_t, const char *);
+static hot_xpc_t (*fn_xpc_dict_get_value)(hot_xpc_t, const char *);
+static const void *(*fn_xpc_get_type)(hot_xpc_t);
+static hot_xpc_t (*fn_xpc_retain)(hot_xpc_t);
+static void (*fn_xpc_release)(hot_xpc_t);
 static const void *sym_xpc_type_connection;
 static const void *sym_xpc_type_dictionary;
 static const void *sym_xpc_error_conn_invalid;
@@ -792,7 +792,7 @@ static id build_data_status_basic(const struct cellular_state *st)
 
 /* ---- SystemStatus Publisher (Status Bar Bars + Carrier + LTE) ---- */
 
-static SweetSTTelephonyPublisher *g_st_publisher;
+static HotSTTelephonyPublisher *g_st_publisher;
 
 static void init_system_status_publisher(void)
 {
@@ -848,7 +848,7 @@ static void publish_system_status(const struct cellular_state *st)
 		BOOL qrtrAlive = st->qrtr_connected;
 		BOOL psUp = (svcState == 2 && st->ps_attached && g_cellular_data_enabled);
 
-		[g_st_publisher updateDataWithBlock:^(SweetSTMutableTelephonyData *data) {
+		[g_st_publisher updateDataWithBlock:^(HotSTMutableTelephonyData *data) {
 			if (!data)
 				return;
 			[data setCellularRadioCapabilityEnabled:!radioOff];
@@ -857,7 +857,7 @@ static void publish_system_status(const struct cellular_state *st)
 			[data setInactiveSOSEnabled:NO];
 			[data setUsingStewieForSOS:NO];
 			[data setUsingStewieConnection:NO];
-			[data updateSIMOneInfoWithBlock:^(SweetSTMutableSIMInfo *sim) {
+			[data updateSIMOneInfoWithBlock:^(HotSTMutableSIMInfo *sim) {
 				if (!sim)
 					return;
 				[sim setSIMPresent:simPresent];
@@ -948,17 +948,17 @@ static NSSet<Class> *build_allowed_ct_classes(void)
 
 /* ---- CoreTelephony XPC Exported Object & Listener ---- */
 
-@interface SweetCellularXPCService : NSObject
-@property (nonatomic, weak) SweetXPCConnectionSPI *connection;
+@interface HotCellularXPCService : NSObject
+@property (nonatomic, weak) HotXPCConnectionSPI *connection;
 @property (nonatomic, assign) BOOL registeredNotifications;
 @end
 
 static os_unfair_lock g_clients_lock = OS_UNFAIR_LOCK_INIT;
-static NSMutableArray<SweetCellularXPCService *> *g_xpc_clients;
+static NSMutableArray<HotCellularXPCService *> *g_xpc_clients;
 static NSMutableSet<NSString *> *g_logged_unhandled;
 static void trigger_qmi_radio_power(bool online);
 
-@implementation SweetCellularXPCService
+@implementation HotCellularXPCService
 
 /* -- Base Interface -- */
 
@@ -995,7 +995,7 @@ static void trigger_qmi_radio_power(bool online);
 	(void)domain;
 	Class ccls = NSClassFromString(@"CTServiceDescriptorContainer");
 	id d = build_slot1_descriptor();
-	id cont = ccls ? [(SweetCTServiceDescriptorContainer *)[ccls alloc]
+	id cont = ccls ? [(HotCTServiceDescriptorContainer *)[ccls alloc]
 			  initWithDescriptors:(d ? @[d] : @[])] : nil;
 	if (completion)
 		completion(cont, nil);
@@ -1052,7 +1052,7 @@ static void trigger_qmi_radio_power(bool online);
 {
 	(void)ctx;
 	Class cls = NSClassFromString(@"CTSimHardwareInfo");
-	id hw = cls ? [(SweetCTSimHardwareInfo *)[cls alloc] initWithHardwareInfo:1 simLocation:1] : nil;
+	id hw = cls ? [(HotCTSimHardwareInfo *)[cls alloc] initWithHardwareInfo:1 simLocation:1] : nil;
 	if (completion)
 		completion(hw, nil);
 }
@@ -1494,121 +1494,121 @@ static id resolve_carrier_bundle_val(const struct cellular_state *st, id keyHier
 
 		if ([cname isEqualToString:@"CTXPCGetSignalStrengthInfoRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetSignalStrengthInfoResponse");
-			resp = rcls ? [(SweetCTSigInfoResp *)[rcls alloc]
+			resp = rcls ? [(HotCTSigInfoResp *)[rcls alloc]
 				       initWithSignalStrengthInfo:build_signal_info(&st)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetSignalStrengthMeasurementsRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetSignalStrengthMeasurementsResponse");
-			resp = rcls ? [(SweetCTSigMeasResp *)[rcls alloc]
+			resp = rcls ? [(HotCTSigMeasResp *)[rcls alloc]
 				       initWithSignalStrengthMeasurements:build_signal_measurements(&st)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetOperatorNameRequest"] ||
 			   [cname isEqualToString:@"CTXPCSubscriptionNameRequest"]) {
 			NSString *op = st.operator_name[0] ? [NSString stringWithUTF8String:st.operator_name] : @"";
 			if ([cname isEqualToString:@"CTXPCGetOperatorNameRequest"]) {
 				Class rcls = NSClassFromString(@"CTXPCGetOperatorNameResponse");
-				resp = rcls ? [(SweetCTOpNameResp *)[rcls alloc] initWithOperatorName:op] : nil;
+				resp = rcls ? [(HotCTOpNameResp *)[rcls alloc] initWithOperatorName:op] : nil;
 			} else {
 				Class rcls = NSClassFromString(@"CTXPCSimCommonResultResponse");
-				resp = rcls ? [(SweetCTObjResp *)[rcls alloc] initWithResult:(op.length ? op : @"Primary")] : nil;
+				resp = rcls ? [(HotCTObjResp *)[rcls alloc] initWithResult:(op.length ? op : @"Primary")] : nil;
 			}
 		} else if ([cname isEqualToString:@"CTXPCGetRegistrationStatusRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetRegistrationStatusResponse");
-			resp = rcls ? [(SweetCTStatusResp *)[rcls alloc] initWithStatus:reg_status_string(&st)] : nil;
+			resp = rcls ? [(HotCTStatusResp *)[rcls alloc] initWithStatus:reg_status_string(&st)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetRegistrationDisplayStatusRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetRegistrationDisplayStatusResponse");
-			resp = rcls ? [(SweetCTStatusResp *)[rcls alloc] initWithStatus:build_display_status(&st)] : nil;
+			resp = rcls ? [(HotCTStatusResp *)[rcls alloc] initWithStatus:build_display_status(&st)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetRoamingStatusRequest"]) {
 			Class mcls = NSClassFromString(@"CTRoamingStatus");
 			id rm = mcls ? [[mcls alloc] init] : nil;
 			ct_set(rm, @"isVoiceRoaming", @(st.roaming));
 			ct_set(rm, @"isDataRoaming", @(st.roaming));
 			Class rcls = NSClassFromString(@"CTXPCGetRoamingStatusResponse");
-			resp = rcls ? [(SweetCTRoamingResp *)[rcls alloc] initWithRoamingStatus:rm] : nil;
+			resp = rcls ? [(HotCTRoamingResp *)[rcls alloc] initWithRoamingStatus:rm] : nil;
 		} else if ([cname isEqualToString:@"CTXPCSimStatusRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCSimCommonResultResponse");
-			resp = rcls ? [(SweetCTObjResp *)[rcls alloc] initWithResult:sim_status_string(&st)] : nil;
+			resp = rcls ? [(HotCTObjResp *)[rcls alloc] initWithResult:sim_status_string(&st)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCSimTrayStatusRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCSimCommonResultResponse");
 			NSString *tray = st.sim_present ? @"kCTSIMSupportSIMTrayInsertedWithSIM"
 							: @"kCTSIMSupportSIMTrayInsertedNoSIM";
-			resp = rcls ? [(SweetCTObjResp *)[rcls alloc] initWithResult:tray] : nil;
+			resp = rcls ? [(HotCTObjResp *)[rcls alloc] initWithResult:tray] : nil;
 		} else if ([cname isEqualToString:@"CTXPCSimHardwareInfoRequest"]) {
 			Class hcls = NSClassFromString(@"CTSimHardwareInfo");
-			id hw = hcls ? [(SweetCTSimHardwareInfo *)[hcls alloc] initWithHardwareInfo:1 simLocation:1] : nil;
+			id hw = hcls ? [(HotCTSimHardwareInfo *)[hcls alloc] initWithHardwareInfo:1 simLocation:1] : nil;
 			Class rcls = NSClassFromString(@"CTXPCSimHardwareInfoResponse");
-			resp = rcls ? [(SweetCTHwResp *)[rcls alloc] initWithHardwareInfo:hw] : nil;
+			resp = rcls ? [(HotCTHwResp *)[rcls alloc] initWithHardwareInfo:hw] : nil;
 		} else if ([cname isEqualToString:@"CTXPCSimLockStateRequest"]) {
 			/* 0 = unlocked, 1 = PIN locked, 2 = PUK locked */
 			int lstate = 0;
 			if (!strcmp(st.sim_state, "pin_locked")) lstate = 1;
 			else if (!strcmp(st.sim_state, "puk_locked")) lstate = 2;
 			Class rcls = NSClassFromString(@"CTXPCSimCommonNumberResultResponse");
-			resp = rcls ? [(SweetCTObjResp *)[rcls alloc] initWithResult:@(lstate)] : nil;
+			resp = rcls ? [(HotCTObjResp *)[rcls alloc] initWithResult:@(lstate)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCRemainingPINRetriesRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCSimCommonNumberResultResponse");
-			resp = rcls ? [(SweetCTObjResp *)[rcls alloc] initWithResult:@(st.pin1_retries)] : nil;
+			resp = rcls ? [(HotCTObjResp *)[rcls alloc] initWithResult:@(st.pin1_retries)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCRemainingPUKRetriesRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCSimCommonNumberResultResponse");
-			resp = rcls ? [(SweetCTObjResp *)[rcls alloc] initWithResult:@(st.puk1_retries)] : nil;
+			resp = rcls ? [(HotCTObjResp *)[rcls alloc] initWithResult:@(st.puk1_retries)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetSimLabelRequest"]) {
 			Class lcls = NSClassFromString(@"CTSimLabel");
-			id lbl = lcls ? [(SweetCTSimLabel *)[lcls alloc]
+			id lbl = lcls ? [(HotCTSimLabel *)[lcls alloc]
 					 initWithId:@SLOT1_UUID_STR andText:@"Primary" andDidSetup:YES] : nil;
 			Class rcls = NSClassFromString(@"CTXPCGetSimLabelResponse");
-			resp = rcls ? [(SweetCTLabelResp *)[rcls alloc] initWithLabel:lbl] : nil;
+			resp = rcls ? [(HotCTLabelResp *)[rcls alloc] initWithLabel:lbl] : nil;
 		} else if ([cname isEqualToString:@"CTXPCShortLabelRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCSimCommonResultResponse");
-			resp = rcls ? [(SweetCTObjResp *)[rcls alloc] initWithResult:@"P"] : nil;
+			resp = rcls ? [(HotCTObjResp *)[rcls alloc] initWithResult:@"P"] : nil;
 		} else if ([cname isEqualToString:@"CTXPCIsAnySimReadyRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCBooleanResponseMessage");
 			BOOL rdy = st.sim_present &&
 				   (!strcmp(st.app_state, "ready") || !strcmp(st.app_state, "subscription_ready"));
-			resp = rcls ? [(SweetCTBoolResp *)[rcls alloc] initWithResult:rdy] : nil;
+			resp = rcls ? [(HotCTBoolResp *)[rcls alloc] initWithResult:rdy] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetIsDataAttachedRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetIsDataAttachedResponse");
 			BOOL att = st.sim_present && st.reg_state_raw == 1 && st.ps_attached;
-			resp = rcls ? [(SweetCTDataAttResp *)[rcls alloc] initWithIsDataAttached:att] : nil;
+			resp = rcls ? [(HotCTDataAttResp *)[rcls alloc] initWithIsDataAttached:att] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetIsInHomeCountryRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetIsInHomeCountryResponse");
-			resp = rcls ? [(SweetCTHomeResp *)[rcls alloc] initWithIsHome:!st.roaming] : nil;
+			resp = rcls ? [(HotCTHomeResp *)[rcls alloc] initWithIsHome:!st.roaming] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetMobileCountryCodeRequest"] ||
 			   [cname isEqualToString:@"CTXPCMobileSubscriberCountryCodeRequest"] ||
 			   [cname isEqualToString:@"CTXPCLastKnownMobileSubscriberCountryCodeRequest"]) {
 			NSString *mcc = st.mcc[0] ? [NSString stringWithUTF8String:st.mcc] : @"";
 			if ([cname isEqualToString:@"CTXPCGetMobileCountryCodeRequest"]) {
 				Class rcls = NSClassFromString(@"CTXPCGetMobileCountryCodeResponse");
-				resp = rcls ? [(SweetCTMccResp *)[rcls alloc] initWithMcc:mcc] : nil;
+				resp = rcls ? [(HotCTMccResp *)[rcls alloc] initWithMcc:mcc] : nil;
 			} else {
 				Class rcls = NSClassFromString(@"CTXPCSimCommonResultResponse");
-				resp = rcls ? [(SweetCTObjResp *)[rcls alloc] initWithResult:mcc] : nil;
+				resp = rcls ? [(HotCTObjResp *)[rcls alloc] initWithResult:mcc] : nil;
 			}
 		} else if ([cname isEqualToString:@"CTXPCGetLastKnownMobileCountryCodeRequest"]) {
 			NSString *mcc = st.mcc[0] ? [NSString stringWithUTF8String:st.mcc] : @"";
 			Class rcls = NSClassFromString(@"CTXPCGetLastKnownMobileCountryCodeResponse");
-			resp = rcls ? [(SweetCTLastMccResp *)[rcls alloc] initWithLastMcc:mcc] : nil;
+			resp = rcls ? [(HotCTLastMccResp *)[rcls alloc] initWithLastMcc:mcc] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetMobileNetworkCodeRequest"] ||
 			   [cname isEqualToString:@"CTXPCMobileSubscriberNetworkCodeRequest"]) {
 			NSString *mnc = st.mnc[0] ? [NSString stringWithUTF8String:st.mnc] : @"";
 			if ([cname isEqualToString:@"CTXPCGetMobileNetworkCodeRequest"]) {
 				Class rcls = NSClassFromString(@"CTXPCGetMobileNetworkCodeResponse");
-				resp = rcls ? [(SweetCTMncResp *)[rcls alloc] initWithMnc:mnc] : nil;
+				resp = rcls ? [(HotCTMncResp *)[rcls alloc] initWithMnc:mnc] : nil;
 			} else {
 				Class rcls = NSClassFromString(@"CTXPCSimCommonResultResponse");
-				resp = rcls ? [(SweetCTObjResp *)[rcls alloc] initWithResult:mnc] : nil;
+				resp = rcls ? [(HotCTObjResp *)[rcls alloc] initWithResult:mnc] : nil;
 			}
 		} else if ([cname isEqualToString:@"CTXPCGetServingPlmnRequest"]) {
 			NSString *plmn = (st.mcc[0] && st.mnc[0])
 					 ? [NSString stringWithFormat:@"%s%s", st.mcc, st.mnc] : @"";
 			Class rcls = NSClassFromString(@"CTXPCGetServingPlmnResponse");
-			resp = rcls ? [(SweetCTPlmnResp *)[rcls alloc] initWithPlmn:plmn] : nil;
+			resp = rcls ? [(HotCTPlmnResp *)[rcls alloc] initWithPlmn:plmn] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetCurrentRatRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetCurrentRatResponse");
-			resp = rcls ? [(SweetCTCurRatResp *)[rcls alloc] initWithRat:public_rat_string(&st)] : nil;
+			resp = rcls ? [(HotCTCurRatResp *)[rcls alloc] initWithRat:public_rat_string(&st)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetRadioAccessTechnologyRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetRadioAccessTechnologyResponse");
-			resp = rcls ? [(SweetCTRegRatResp *)[rcls alloc] initWithRAT:reg_rat_string(&st)] : nil;
+			resp = rcls ? [(HotCTRegRatResp *)[rcls alloc] initWithRAT:reg_rat_string(&st)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetWirelessTechnologyRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetWirelessTechnologyResponse");
-			resp = rcls ? [(SweetCTTechResp *)[rcls alloc] initWithTechnology:@"UMTS"] : nil;
+			resp = rcls ? [(HotCTTechResp *)[rcls alloc] initWithTechnology:@"UMTS"] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetRatSelectionRequest"]) {
 			Class scls = NSClassFromString(@"CTRatSelection");
 			id rs = scls ? [[scls alloc] init] : nil;
@@ -1616,16 +1616,16 @@ static id resolve_carrier_bundle_val(const struct cellular_state *st, id keyHier
 			ct_set(rs, @"selection", @"kCTRegistrationRATSelectionLTE");
 			ct_set(rs, @"preferred", @"kCTRegistrationRATSelectionLTE");
 			Class rcls = NSClassFromString(@"CTXPCGetRatSelectionResponse");
-			resp = rcls ? [(SweetCTRatSelResp *)[rcls alloc] initWithRATSelection:rs] : nil;
+			resp = rcls ? [(HotCTRatSelResp *)[rcls alloc] initWithRATSelection:rs] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetMaxDataRateRequest"]) {
 			/* 3 = kCTRegistrationDataRate4G / LTE */
 			Class rcls = NSClassFromString(@"CTXPCGetMaxDataRateResponse");
-			resp = rcls ? [(SweetCTDataRateResp *)[rcls alloc] initWithDataRate:3] : nil;
+			resp = rcls ? [(HotCTDataRateResp *)[rcls alloc] initWithDataRate:3] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetSupportedDataRatesRequest"]) {
 			Class scls = NSClassFromString(@"CTSupportedMaxDataRates");
-			id sr = scls ? [(SweetCTSupportedMaxDataRates *)[scls alloc] initWithRates:@[@2, @3]] : nil;
+			id sr = scls ? [(HotCTSupportedMaxDataRates *)[scls alloc] initWithRates:@[@2, @3]] : nil;
 			Class rcls = NSClassFromString(@"CTXPCGetSupportedDataRatesResponse");
-			resp = rcls ? [(SweetCTSupRatesResp *)[rcls alloc] initWithSupportedRates:sr] : nil;
+			resp = rcls ? [(HotCTSupRatesResp *)[rcls alloc] initWithSupportedRates:sr] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetNRStatusRequest"]) {
 			Class ncls = NSClassFromString(@"CTNRStatus");
 			id nr = ncls ? [[ncls alloc] init] : nil;
@@ -1634,39 +1634,39 @@ static id resolve_carrier_bundle_val(const struct cellular_state *st, id keyHier
 			ct_set(nr, @"saDisabled", @(YES));
 			ct_set(nr, @"nsaDisabled", @(YES));
 			Class rcls = NSClassFromString(@"CTXPCGetNRStatusResponse");
-			resp = rcls ? [(SweetCTNRResp *)[rcls alloc] initWithNRStatus:nr] : nil;
+			resp = rcls ? [(HotCTNRResp *)[rcls alloc] initWithNRStatus:nr] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetSupports5GStandaloneRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetSupports5GStandaloneResponse");
-			resp = rcls ? [(SweetCTSupportResp *)[rcls alloc] initWithSupport:NO] : nil;
+			resp = rcls ? [(HotCTSupportResp *)[rcls alloc] initWithSupport:NO] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetBandInfoRequest"]) {
 			Class bcls = NSClassFromString(@"CTBandInfo");
 			id bi = bcls ? [[bcls alloc] init] : nil;
 			Class rcls = NSClassFromString(@"CTXPCGetBandInfoResponse");
-			resp = rcls ? [(SweetCTBandResp *)[rcls alloc] initWithBandInfo:bi] : nil;
+			resp = rcls ? [(HotCTBandResp *)[rcls alloc] initWithBandInfo:bi] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetDefaultVoiceRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetDefaultVoiceResponse");
-			resp = rcls ? [(SweetCTCtxResp *)[rcls alloc]
+			resp = rcls ? [(HotCTCtxResp *)[rcls alloc]
 				       initWithContext:(st.sim_present ? build_slot1_context(&st) : nil)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetIsNetworkSelectionMenuAvailableRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetIsNetworkSelectionMenuAvailableResponse");
-			resp = rcls ? [(SweetCTAvailResp *)[rcls alloc] initWithIsAvailable:st.sim_present] : nil;
+			resp = rcls ? [(HotCTAvailResp *)[rcls alloc] initWithIsAvailable:st.sim_present] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetIsNetworkReselectionNeededRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetIsNetworkReselectionNeededResponse");
-			resp = rcls ? [(SweetCTReselResp *)[rcls alloc] initWithNeedsReselection:NO] : nil;
+			resp = rcls ? [(HotCTReselResp *)[rcls alloc] initWithNeedsReselection:NO] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetNetworkSelectionInfoRequest"]) {
 			Class icls = NSClassFromString(@"CTNetworkSelectionInfo");
 			id info = icls ? [[icls alloc] init] : nil;
 			ct_set(info, @"selectionState", @(1));
 			ct_set(info, @"selectionMode", @(0));
 			Class rcls = NSClassFromString(@"CTXPCGetNetworkSelectionInfoResponse");
-			resp = rcls ? [(SweetCTNetSelInfoResp *)[rcls alloc] initWithNetworkSelectionInfo:info] : nil;
+			resp = rcls ? [(HotCTNetSelInfoResp *)[rcls alloc] initWithNetworkSelectionInfo:info] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetNetworkSelectionRequest"]) {
 			Class ncls = NSClassFromString(@"CTNetwork");
 			id net = ncls ? [[ncls alloc] init] : nil;
 			if (st.operator_name[0])
 				ct_set(net, @"name", [NSString stringWithUTF8String:st.operator_name]);
 			Class rcls = NSClassFromString(@"CTXPCGetNetworkSelectionResponse");
-			resp = rcls ? [(SweetCTNetResp *)[rcls alloc] initWithNetwork:net] : nil;
+			resp = rcls ? [(HotCTNetResp *)[rcls alloc] initWithNetwork:net] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetNetworkListRequest"] ||
 			   [cname isEqualToString:@"CTXPCFetchNetworkListRequest"]) {
 			Class lcls = NSClassFromString(@"CTNetworkList");
@@ -1674,31 +1674,31 @@ static id resolve_carrier_bundle_val(const struct cellular_state *st, id keyHier
 			ct_set(nl, @"networks", [NSMutableArray array]);
 			ct_set(nl, @"moreComing", @(NO));
 			Class rcls = NSClassFromString(@"CTXPCGetNetworkListResponse");
-			resp = rcls ? [(SweetCTNetListResp *)[rcls alloc] initWithNetworkList:nl] : nil;
+			resp = rcls ? [(HotCTNetListResp *)[rcls alloc] initWithNetworkList:nl] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetIMSRegistrationStatusRequest"]) {
 			Class icls = NSClassFromString(@"CTIMSRegistrationStatus");
 			id ims = icls ? [[icls alloc] init] : nil;
 			Class rcls = NSClassFromString(@"CTXPCGetIMSRegistrationStatusResponse");
-			resp = rcls ? [(SweetCTIMSResp *)[rcls alloc] initWithIMSRegistrationStatus:ims] : nil;
+			resp = rcls ? [(HotCTIMSResp *)[rcls alloc] initWithIMSRegistrationStatus:ims] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetRegistrationIMSTransportInfoRequest"]) {
 			Class icls = NSClassFromString(@"CTIMSRegistrationTransportInfo");
 			id ims = icls ? [[icls alloc] init] : nil;
 			Class rcls = NSClassFromString(@"CTXPCGetRegistrationIMSTransportInfoResponse");
-			resp = rcls ? [(SweetCTIMSTransResp *)[rcls alloc] initWithIMSRegistrationInfo:ims] : nil;
+			resp = rcls ? [(HotCTIMSTransResp *)[rcls alloc] initWithIMSRegistrationInfo:ims] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetEncryptionStatusRequest"]) {
 			Class ecls = NSClassFromString(@"CTEncryptionStatusInfo");
-			id enc = ecls ? [(SweetCTEncryptionStatusInfo *)[ecls alloc] initWithStatus:0] : nil;
+			id enc = ecls ? [(HotCTEncryptionStatusInfo *)[ecls alloc] initWithStatus:0] : nil;
 			Class rcls = NSClassFromString(@"CTXPCGetEncryptionStatusResponse");
-			resp = rcls ? [(SweetCTEncResp *)[rcls alloc] initWithEncryptionStatusInfo:enc] : nil;
+			resp = rcls ? [(HotCTEncResp *)[rcls alloc] initWithEncryptionStatusInfo:enc] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetRejectCauseCodeRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetRejectCauseCodeResponse");
-			resp = rcls ? [(SweetCTCauseResp *)[rcls alloc] initWithCauseCode:@(st.last_reject_cause)] : nil;
+			resp = rcls ? [(HotCTCauseResp *)[rcls alloc] initWithCauseCode:@(st.last_reject_cause)] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetCallCapabilitiesRequest"]) {
 			id caps = build_call_capabilities_obj();
 			Class rcls = NSClassFromString(@"CTXPCGetCallCapabilitiesResponse");
 			if (rcls) {
 				if ([rcls instancesRespondToSelector:@selector(initWithCapabilities:)])
-					resp = [(SweetCTCallCapResp *)[rcls alloc] initWithCapabilities:caps];
+					resp = [(HotCTCallCapResp *)[rcls alloc] initWithCapabilities:caps];
 				else {
 					resp = [[rcls alloc] init];
 					ct_set(resp, @"capabilities", caps);
@@ -1713,41 +1713,41 @@ static id resolve_carrier_bundle_val(const struct cellular_state *st, id keyHier
 			   [cname isEqualToString:@"CTXPCShouldShoweSIMTravelTipRequest"] ||
 			   [cname isEqualToString:@"CTXPCIsMemoryConstrainedRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCBooleanResponseMessage");
-			resp = rcls ? [(SweetCTBoolResp *)[rcls alloc] initWithResult:NO] : nil;
+			resp = rcls ? [(HotCTBoolResp *)[rcls alloc] initWithResult:NO] : nil;
 		} else if ([cname isEqualToString:@"CTXPCEmbeddedSIMHealthRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCBooleanResponseMessage");
-			resp = rcls ? [(SweetCTBoolResp *)[rcls alloc] initWithResult:YES] : nil;
+			resp = rcls ? [(HotCTBoolResp *)[rcls alloc] initWithResult:YES] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetPendingInstallPlansRequest"]) {
 			Class dcls = NSClassFromString(@"CTDisplayPlanList");
-			id empty = dcls ? [(SweetCTDisplayPlanList *)[dcls alloc] initWithDisplayPlans:@[]] : nil;
+			id empty = dcls ? [(HotCTDisplayPlanList *)[dcls alloc] initWithDisplayPlans:@[]] : nil;
 			Class rcls = NSClassFromString(@"CTXPCGetPendingInstallPlansResponse");
-			resp = rcls ? [(SweetCTPlanListResp *)[rcls alloc] initWithPlanList:empty] : nil;
+			resp = rcls ? [(HotCTPlanListResp *)[rcls alloc] initWithPlanList:empty] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetCarrierSetupItemsRequest"] ||
 			   [cname isEqualToString:@"CTXPCGetHiddenTransferPlansRequest"] ||
 			   [cname isEqualToString:@"CTXPCGetPlansPendingCrossPlatformTransferRequest"]) {
 			Class dcls = NSClassFromString(@"CTDisplayPlanList");
-			id empty = dcls ? [(SweetCTDisplayPlanList *)[dcls alloc] initWithDisplayPlans:@[]] : nil;
+			id empty = dcls ? [(HotCTDisplayPlanList *)[dcls alloc] initWithDisplayPlans:@[]] : nil;
 			Class rcls = NSClassFromString([cname stringByReplacingOccurrencesOfString:@"Request"
 											withString:@"Response"]);
-			resp = rcls ? [(SweetCTListResp *)[rcls alloc] initWithList:empty] : nil;
+			resp = rcls ? [(HotCTListResp *)[rcls alloc] initWithList:empty] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetRemoteDevicesRequest"]) {
 			Class lcls = NSClassFromString(@"CTRemoteDeviceList");
 			id empty = lcls ? [[lcls alloc] init] : nil;
 			ct_set(empty, @"devices", [NSMutableArray array]);
 			Class rcls = NSClassFromString(@"CTXPCGetRemoteDevicesResponse");
-			resp = rcls ? [(SweetCTListResp *)[rcls alloc] initWithList:empty] : nil;
+			resp = rcls ? [(HotCTListResp *)[rcls alloc] initWithList:empty] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetRemoteDevicesForTransferRequest"]) {
 			Class lcls = NSClassFromString(@"CTRemoteDeviceList");
 			id empty = lcls ? [[lcls alloc] init] : nil;
 			ct_set(empty, @"devices", [NSMutableArray array]);
 			Class rcls = NSClassFromString(@"CTXPCGetRemoteDevicesForTransferResponse");
-			resp = rcls ? [(SweetCTDevsResp *)[rcls alloc] initWithDevices:empty] : nil;
+			resp = rcls ? [(HotCTDevsResp *)[rcls alloc] initWithDevices:empty] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetTransferPlansRequest"]) {
 			Class lcls = NSClassFromString(@"CTRemoteDeviceList");
 			id empty = lcls ? [[lcls alloc] init] : nil;
 			ct_set(empty, @"devices", [NSMutableArray array]);
 			Class rcls = NSClassFromString(@"CTXPCGetTransferPlansResponse");
-			resp = rcls ? [(SweetCTTransferPlansResp *)[rcls alloc]
+			resp = rcls ? [(HotCTTransferPlansResp *)[rcls alloc]
 				       initWithRemtoeDevices:empty isFlexPolicyOn:NO] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGet2GSwitchEnabledRequest"] ||
 			   [cname isEqualToString:@"CTXPCGet2GUserPreferenceRequest"] ||
@@ -1755,7 +1755,7 @@ static id resolve_carrier_bundle_val(const struct cellular_state *st, id keyHier
 			   [cname isEqualToString:@"CTXPCGetRegulatedRATsUserPreferenceRequest"]) {
 			Class rcls = NSClassFromString([cname stringByReplacingOccurrencesOfString:@"Request"
 											withString:@"Response"]);
-			resp = rcls ? [(SweetCTEnabledResp *)[rcls alloc] initWithIsEnabled:NO] : nil;
+			resp = rcls ? [(HotCTEnabledResp *)[rcls alloc] initWithIsEnabled:NO] : nil;
 		} else if ([cname isEqualToString:@"CTXPCMobileEquipmentInfoRequest"]) {
 			/* Privacy-safe equipment info: firmware baseVersion only, NO IMEI/ICCID/IMSI */
 			Class mcls = NSClassFromString(@"CTMobileEquipmentInfo");
@@ -1767,14 +1767,14 @@ static id resolve_carrier_bundle_val(const struct cellular_state *st, id keyHier
 			id list = lcls ? [[lcls alloc] init] : nil;
 			ct_set(list, @"meInfoList", me ? @[me] : @[]);
 			Class rcls = NSClassFromString(@"CTXPCMobileEquipmentInfoResponse");
-			resp = rcls ? [(SweetCTMeInfoResp *)[rcls alloc] initWithEquipmentInfoList:list] : nil;
+			resp = rcls ? [(HotCTMeInfoResp *)[rcls alloc] initWithEquipmentInfoList:list] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetDeviceInfoRequest"]) {
 			NSString *fw = st.modem_rev[0] ? [NSString stringWithUTF8String:st.modem_rev] : @"SM8150-MPSS";
 			Class rcls = NSClassFromString(@"CTXPCGetDeviceInfoResponse");
-			resp = rcls ? [(SweetCTInfoResp *)[rcls alloc] initWithInfo:@{ @"ModemFirmware": fw }] : nil;
+			resp = rcls ? [(HotCTInfoResp *)[rcls alloc] initWithInfo:@{ @"ModemFirmware": fw }] : nil;
 		} else if ([cname isEqualToString:@"CTXPCFirmwareUpdateInfoRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCFirmwareUpdateInfoResponse");
-			resp = rcls ? [(SweetCTFwInfoResp *)[rcls alloc] initWithFimwareUpdateInfo:@{}] : nil;
+			resp = rcls ? [(HotCTFwInfoResp *)[rcls alloc] initWithFimwareUpdateInfo:@{}] : nil;
 		} else if ([cname isEqualToString:@"CTXPCSetDefaultDataRequest"] ||
 			   [cname isEqualToString:@"CTXPCSetDefaultVoiceRequest"] ||
 			   [cname isEqualToString:@"CTXPCSetRatSelectionRequest"] ||
@@ -2061,12 +2061,12 @@ static void invoke_ct_reply_block(id replyBlock, BOOL setterOnly,
 
 /* ---- NSXPCListener Delegate for com.apple.commcenter.coretelephony.xpc ---- */
 
-@interface SweetCellularListenerDelegate : NSObject
+@interface HotCellularListenerDelegate : NSObject
 @end
 
-@implementation SweetCellularListenerDelegate
+@implementation HotCellularListenerDelegate
 
-- (BOOL)listener:(id)listener shouldAcceptNewConnection:(SweetXPCConnectionSPI *)newConnection
+- (BOOL)listener:(id)listener shouldAcceptNewConnection:(HotXPCConnectionSPI *)newConnection
 {
 	(void)listener;
 	@try {
@@ -2077,7 +2077,7 @@ static void invoke_ct_reply_block(id replyBlock, BOOL setterOnly,
 			clog("CTXPCServiceInterface protocol missing in runtime!");
 			return NO;
 		}
-		SweetXPCInterfaceSPI *expIfc = [(id)ifcCls interfaceWithProtocol:expProto];
+		HotXPCInterfaceSPI *expIfc = [(id)ifcCls interfaceWithProtocol:expProto];
 		NSSet<Class> *allowed = build_allowed_ct_classes();
 		[expIfc setClasses:allowed
 		       forSelector:@selector(sendRequest:completionHandler:)
@@ -2106,9 +2106,9 @@ static void invoke_ct_reply_block(id replyBlock, BOOL setterOnly,
 			}
 		}
 
-		SweetXPCInterfaceSPI *remIfc = remProto ? [(id)ifcCls interfaceWithProtocol:remProto] : nil;
+		HotXPCInterfaceSPI *remIfc = remProto ? [(id)ifcCls interfaceWithProtocol:remProto] : nil;
 
-		SweetCellularXPCService *svc = [[SweetCellularXPCService alloc] init];
+		HotCellularXPCService *svc = [[HotCellularXPCService alloc] init];
 		svc.connection = newConnection;
 		newConnection.exportedInterface = expIfc;
 		newConnection.exportedObject = svc;
@@ -2119,10 +2119,10 @@ static void invoke_ct_reply_block(id replyBlock, BOOL setterOnly,
 		[g_xpc_clients addObject:svc];
 		os_unfair_lock_unlock(&g_clients_lock);
 
-		__weak SweetCellularXPCService *weakSvc = svc;
+		__weak HotCellularXPCService *weakSvc = svc;
 		int pid = newConnection.processIdentifier;
 		newConnection.invalidationHandler = ^{
-			SweetCellularXPCService *strongSvc = weakSvc;
+			HotCellularXPCService *strongSvc = weakSvc;
 			if (strongSvc) {
 				os_unfair_lock_lock(&g_clients_lock);
 				[g_xpc_clients removeObjectIdenticalTo:strongSvc];
@@ -2143,7 +2143,7 @@ static void invoke_ct_reply_block(id replyBlock, BOOL setterOnly,
 /* Push live delegate callbacks to all connected CoreTelephonyClient processes */
 static void broadcast_ct_notifications(const struct cellular_state *st, bool sim_changed)
 {
-	NSArray<SweetCellularXPCService *> *clients = nil;
+	NSArray<HotCellularXPCService *> *clients = nil;
 	os_unfair_lock_lock(&g_clients_lock);
 	clients = [g_xpc_clients copy];
 	os_unfair_lock_unlock(&g_clients_lock);
@@ -2155,11 +2155,11 @@ static void broadcast_ct_notifications(const struct cellular_state *st, bool sim
 	NSString *simSt = sim_status_string(st);
 	NSString *opName = st->operator_name[0] ? [NSString stringWithUTF8String:st->operator_name] : @"";
 
-	for (SweetCellularXPCService *svc in clients) {
+	for (HotCellularXPCService *svc in clients) {
 		if (!svc.registeredNotifications || !svc.connection)
 			continue;
 		@try {
-			SweetCTDelegateProxy *proxy = [svc.connection remoteObjectProxyWithErrorHandler:^(NSError *e) {
+			HotCTDelegateProxy *proxy = [svc.connection remoteObjectProxyWithErrorHandler:^(NSError *e) {
 				(void)e;
 			}];
 			if (!proxy)
@@ -2194,9 +2194,9 @@ static void broadcast_ct_notifications(const struct cellular_state *st, bool sim
 
 /* ---- Legacy com.apple.commcenter.xpc (CTServerConnection) Listener ---- */
 
-static sweet_xpc_t g_legacy_listener;
+static hot_xpc_t g_legacy_listener;
 
-static void handle_legacy_xpc_dict(sweet_xpc_t peer, sweet_xpc_t msg)
+static void handle_legacy_xpc_dict(hot_xpc_t peer, hot_xpc_t msg)
 {
 	if (fn_xpc_dict_get_string) {
 		const char *prog = fn_xpc_dict_get_string(msg, "kProgName");
@@ -2205,7 +2205,7 @@ static void handle_legacy_xpc_dict(sweet_xpc_t peer, sweet_xpc_t msg)
 	}
 	if (!fn_xpc_dict_create_reply || !fn_xpc_conn_send)
 		return;
-	sweet_xpc_t reply = fn_xpc_dict_create_reply(msg);
+	hot_xpc_t reply = fn_xpc_dict_create_reply(msg);
 	if (!reply)
 		return; /* One-way notification/registration message without reply port */
 
@@ -2221,8 +2221,8 @@ static void handle_legacy_xpc_dict(sweet_xpc_t peer, sweet_xpc_t msg)
 
 	/* Populate kCTCopySystemCapabilities / kCTCapabilityPhoneServices */
 	if (fn_xpc_dict_create && fn_xpc_dict_set_value) {
-		sweet_xpc_t phone_caps = fn_xpc_dict_create(NULL, NULL, 0);
-		sweet_xpc_t sys_caps = fn_xpc_dict_create(NULL, NULL, 0);
+		hot_xpc_t phone_caps = fn_xpc_dict_create(NULL, NULL, 0);
+		hot_xpc_t sys_caps = fn_xpc_dict_create(NULL, NULL, 0);
 		if (phone_caps && sys_caps) {
 			fn_xpc_dict_set_bool(phone_caps, "kCTCapabilityAgent", true);
 			fn_xpc_dict_set_bool(phone_caps, "kCTCapabilityAgent2", true);
@@ -2280,23 +2280,23 @@ static void start_legacy_commcenter_xpc(dispatch_queue_t q)
 		return;
 	}
 	/* XPC_CONNECTION_MACH_SERVICE_LISTENER = (1ULL << 0) */
-	sweet_xpc_t listener = fn_xpc_conn_create_mach("com.apple.commcenter.xpc", q, 1ULL);
+	hot_xpc_t listener = fn_xpc_conn_create_mach("com.apple.commcenter.xpc", q, 1ULL);
 	if (!listener) {
 		clog("failed to create com.apple.commcenter.xpc listener");
 		return;
 	}
 	g_legacy_listener = listener;
-	fn_xpc_conn_set_handler(listener, ^(sweet_xpc_t event) {
+	fn_xpc_conn_set_handler(listener, ^(hot_xpc_t event) {
 		if (!event || !fn_xpc_get_type)
 			return;
 		const void *t = fn_xpc_get_type(event);
 		if (t == sym_xpc_type_connection) {
-			sweet_xpc_t peer = event;
+			hot_xpc_t peer = event;
 			if (fn_xpc_retain)
 				fn_xpc_retain(peer);
 			if (fn_xpc_conn_set_target_queue)
 				fn_xpc_conn_set_target_queue(peer, q);
-			fn_xpc_conn_set_handler(peer, ^(sweet_xpc_t msg) {
+			fn_xpc_conn_set_handler(peer, ^(hot_xpc_t msg) {
 				if (!msg)
 					return;
 				const void *mt = fn_xpc_get_type(msg);
@@ -2349,7 +2349,7 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 
 /* ---- CallKit CXXPCProvider + Voice Call Bridge + Local CLI Control Socket ---- */
 
-@interface SweetTrackedCall : NSObject
+@interface HotTrackedCall : NSObject
 @property (nonatomic, strong) NSUUID *uuid;
 @property (nonatomic, assign) uint8_t callId;
 @property (nonatomic, assign) uint8_t lastState;
@@ -2361,15 +2361,15 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 @property (nonatomic, assign) BOOL reportedRemoteHandle;
 @end
 
-@implementation SweetTrackedCall
+@implementation HotTrackedCall
 @end
 
-@interface SweetCXProviderDelegate : NSObject
+@interface HotCXProviderDelegate : NSObject
 @end
 
-static SweetCXProviderSPI *g_cx_provider;
-static SweetCXProviderDelegate *g_cx_delegate;
-static NSMutableArray<SweetTrackedCall *> *g_tracked_calls;
+static HotCXProviderSPI *g_cx_provider;
+static HotCXProviderDelegate *g_cx_delegate;
+static NSMutableArray<HotTrackedCall *> *g_tracked_calls;
 static dispatch_source_t g_ctrl_sock_src;
 static int g_ctrl_listen_fd = -1;
 
@@ -2401,29 +2401,29 @@ static NSString *iso_country_for_mcc(const char *mcc)
 static id build_cx_call_update(const struct qmi_voice_call *c, const struct cellular_state *st);
 static void refresh_callkit_configuration(const struct cellular_state *st);
 
-static SweetTrackedCall *find_tracked_by_uuid(NSUUID *uuid)
+static HotTrackedCall *find_tracked_by_uuid(NSUUID *uuid)
 {
 	if (!uuid)
 		return nil;
-	for (SweetTrackedCall *tc in g_tracked_calls) {
+	for (HotTrackedCall *tc in g_tracked_calls) {
 		if ([tc.uuid isEqual:uuid])
 			return tc;
 	}
 	return nil;
 }
 
-static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
+static HotTrackedCall *find_tracked_by_id(uint8_t cid)
 {
 	if (!cid)
 		return nil;
-	for (SweetTrackedCall *tc in g_tracked_calls) {
+	for (HotTrackedCall *tc in g_tracked_calls) {
 		if (tc.callId == cid)
 			return tc;
 	}
 	return nil;
 }
 
-@implementation SweetCXProviderDelegate
+@implementation HotCXProviderDelegate
 
 - (void)providerDidReset:(id)provider
 {
@@ -2432,7 +2432,7 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 	if (g_tracked_calls.count > 0 && g_qmi.fd >= 0)
 		(void)qmi_voice_manage(&g_qmi, 0x08u, 0);
 	[g_tracked_calls removeAllObjects];
-	sweet_voice_write_shm(0, 0, 0);
+	hot_voice_write_shm(0, 0, 0);
 }
 
 - (void)providerDidBegin:(id)provider
@@ -2443,7 +2443,7 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 	refresh_callkit_configuration(&st);
 }
 
-- (void)provider:(SweetCXProviderSPI *)provider performStartCallAction:(SweetCXActionSPI *)action
+- (void)provider:(HotCXProviderSPI *)provider performStartCallAction:(HotCXActionSPI *)action
 {
 	@try {
 		NSUUID *uuid = [action callUUID];
@@ -2462,7 +2462,7 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 		clog("CallKit performStartCallAction uuid=%s num_len=%lu emergency=%d",
 		     [[uuid UUIDString] UTF8String], (unsigned long)numStr.length, isEmerg ? 1 : 0);
 
-		SweetTrackedCall *tc = [[SweetTrackedCall alloc] init];
+		HotTrackedCall *tc = [[HotTrackedCall alloc] init];
 		tc.uuid = uuid;
 		tc.callId = 0;
 		tc.lastState = QMI_VOICE_CALL_STATE_ORIGINATING;
@@ -2510,12 +2510,12 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 	}
 }
 
-- (void)provider:(SweetCXProviderSPI *)provider performAnswerCallAction:(SweetCXActionSPI *)action
+- (void)provider:(HotCXProviderSPI *)provider performAnswerCallAction:(HotCXActionSPI *)action
 {
 	(void)provider;
 	@try {
 		NSUUID *uuid = [action callUUID];
-		SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+		HotTrackedCall *tc = find_tracked_by_uuid(uuid);
 		uint8_t cid = tc ? tc.callId : 0;
 		int rc = qmi_voice_answer(&g_qmi, cid);
 		clog("CallKit performAnswerCallAction uuid=%s call_id=%u -> rc=%d",
@@ -2530,12 +2530,12 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 	}
 }
 
-- (void)provider:(SweetCXProviderSPI *)provider performEndCallAction:(SweetCXActionSPI *)action
+- (void)provider:(HotCXProviderSPI *)provider performEndCallAction:(HotCXActionSPI *)action
 {
 	(void)provider;
 	@try {
 		NSUUID *uuid = [action callUUID];
-		SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+		HotTrackedCall *tc = find_tracked_by_uuid(uuid);
 		uint8_t cid = tc ? tc.callId : 0;
 		int rc = (cid != 0) ? qmi_voice_end(&g_qmi, cid) : qmi_voice_manage(&g_qmi, 0x08u, 0);
 		clog("CallKit performEndCallAction uuid=%s call_id=%u -> rc=%d",
@@ -2543,7 +2543,7 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 		if (tc)
 			[g_tracked_calls removeObjectIdenticalTo:tc];
 		if (g_tracked_calls.count == 0)
-			sweet_voice_write_shm(0, QMI_VOICE_CALL_STATE_END, 0);
+			hot_voice_write_shm(0, QMI_VOICE_CALL_STATE_END, 0);
 		[action fulfill];
 	} @catch (id exc) {
 		clog("performEndCallAction exception: %s", [[exc description] UTF8String]);
@@ -2551,12 +2551,12 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 	}
 }
 
-- (void)provider:(SweetCXProviderSPI *)provider performSetHeldCallAction:(SweetCXActionSPI *)action
+- (void)provider:(HotCXProviderSPI *)provider performSetHeldCallAction:(HotCXActionSPI *)action
 {
 	(void)provider;
 	@try {
 		NSUUID *uuid = [action callUUID];
-		SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+		HotTrackedCall *tc = find_tracked_by_uuid(uuid);
 		uint8_t cid = tc ? tc.callId : 0;
 		BOOL onHold = [ct_get(action, @"isOnHold") respondsToSelector:@selector(boolValue)]
 			      ? [ct_get(action, @"isOnHold") boolValue] : NO;
@@ -2569,7 +2569,7 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 	}
 }
 
-- (void)provider:(SweetCXProviderSPI *)provider performSetMutedCallAction:(SweetCXActionSPI *)action
+- (void)provider:(HotCXProviderSPI *)provider performSetMutedCallAction:(HotCXActionSPI *)action
 {
 	(void)provider;
 	@try {
@@ -2583,12 +2583,12 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 	}
 }
 
-- (void)provider:(SweetCXProviderSPI *)provider performPlayDTMFCallAction:(SweetCXActionSPI *)action
+- (void)provider:(HotCXProviderSPI *)provider performPlayDTMFCallAction:(HotCXActionSPI *)action
 {
 	(void)provider;
 	@try {
 		NSUUID *uuid = [action callUUID];
-		SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+		HotTrackedCall *tc = find_tracked_by_uuid(uuid);
 		uint8_t cid = tc ? tc.callId : 0;
 		NSString *digits = [ct_get(action, @"digits") isKindOfClass:[NSString class]]
 				   ? (NSString *)ct_get(action, @"digits") : @"";
@@ -2611,7 +2611,7 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 	}
 }
 
-- (void)provider:(SweetCXProviderSPI *)provider performSendMMIOrUSSDCodeAction:(SweetCXActionSPI *)action
+- (void)provider:(HotCXProviderSPI *)provider performSendMMIOrUSSDCodeAction:(HotCXActionSPI *)action
 {
 	(void)provider;
 	@try {
@@ -2624,13 +2624,13 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 	}
 }
 
-- (void)provider:(SweetCXProviderSPI *)provider didActivateAudioSession:(id)audioSession
+- (void)provider:(HotCXProviderSPI *)provider didActivateAudioSession:(id)audioSession
 {
 	(void)provider; (void)audioSession;
 	clog("CallKit didActivateAudioSession");
 }
 
-- (void)provider:(SweetCXProviderSPI *)provider didDeactivateAudioSession:(id)audioSession
+- (void)provider:(HotCXProviderSPI *)provider didDeactivateAudioSession:(id)audioSession
 {
 	(void)provider; (void)audioSession;
 	clog("CallKit didDeactivateAudioSession");
@@ -2648,7 +2648,7 @@ static id build_cx_call_update(const struct qmi_voice_call *c, const struct cell
 	if (c && c->number[0] && clsHnd) {
 		NSString *numStr = [NSString stringWithUTF8String:c->number];
 		if (numStr.length > 0) {
-			id h = [(SweetCXHandleSPI *)[clsHnd alloc] initWithType:2 value:numStr];
+			id h = [(HotCXHandleSPI *)[clsHnd alloc] initWithType:2 value:numStr];
 			ct_set(upd, @"remoteHandle", h);
 		}
 	}
@@ -2704,10 +2704,10 @@ static void on_qmi_voice_calls_changed(struct qmi_ctx *ctx, const struct qmi_voi
 			if (!c->present || c->call_id == 0)
 				continue;
 
-			SweetTrackedCall *tc = find_tracked_by_id(c->call_id);
+			HotTrackedCall *tc = find_tracked_by_id(c->call_id);
 			if (!tc && c->direction == 0x01) {
 				/* Bind pending CallKit/CLI MO call whose QMI call_id just arrived */
-				for (SweetTrackedCall *cand in g_tracked_calls) {
+				for (HotTrackedCall *cand in g_tracked_calls) {
 					if (cand.callId == 0 && cand.outgoing) {
 						cand.callId = c->call_id;
 						tc = cand;
@@ -2732,7 +2732,7 @@ static void on_qmi_voice_calls_changed(struct qmi_ctx *ctx, const struct qmi_voi
 			[seenIds addObject:@(c->call_id)];
 
 			if (!tc) {
-				tc = [[SweetTrackedCall alloc] init];
+				tc = [[HotTrackedCall alloc] init];
 				tc.uuid = [NSUUID UUID];
 				tc.callId = c->call_id;
 				tc.lastState = c->state;
@@ -2816,7 +2816,7 @@ static void on_qmi_voice_calls_changed(struct qmi_ctx *ctx, const struct qmi_voi
 
 		/* Reconcile any tracked calls that vanished from GET_ALL_CALL_INFO / ALL_CALL_STATUS_IND */
 		for (NSInteger idx = (NSInteger)g_tracked_calls.count - 1; idx >= 0; idx--) {
-			SweetTrackedCall *tc = g_tracked_calls[(NSUInteger)idx];
+			HotTrackedCall *tc = g_tracked_calls[(NSUInteger)idx];
 			if (tc.callId != 0 && ![seenIds containsObject:@(tc.callId)]) {
 				clog("voice call_id=%u disappeared from active list -> reporting ended", tc.callId);
 				report_cx_call_ended_safe(tc.uuid, tc.reportedConnected ? 2 : 1);
@@ -2828,7 +2828,7 @@ static void on_qmi_voice_calls_changed(struct qmi_ctx *ctx, const struct qmi_voi
 	}
 }
 
-static SweetCXProviderConfigSPI *build_callkit_configuration(const struct cellular_state *st)
+static HotCXProviderConfigSPI *build_callkit_configuration(const struct cellular_state *st)
 {
 	Class clsCfg    = NSClassFromString(@"CXProviderConfiguration");
 	Class clsAcct   = NSClassFromString(@"CXAccount");
@@ -2837,7 +2837,7 @@ static SweetCXProviderConfigSPI *build_callkit_configuration(const struct cellul
 	if (!clsCfg)
 		return nil;
 
-	SweetCXProviderConfigSPI *cfg = [[clsCfg alloc] init];
+	HotCXProviderConfigSPI *cfg = [[clsCfg alloc] init];
 	if ([cfg respondsToSelector:@selector(setLocalizedName:)])
 		[cfg setLocalizedName:@"Phone"];
 	if ([cfg respondsToSelector:@selector(setSupportedHandleTypes:)])
@@ -2875,7 +2875,7 @@ static SweetCXProviderConfigSPI *build_callkit_configuration(const struct cellul
 		    [clsAcct instancesRespondToSelector:
 		     @selector(initWithUUID:description:serviceName:isoCountryCode:handle:shortLabel:)] &&
 		    [clsSender instancesRespondToSelector:@selector(initWithUUID:account:)]) {
-			id acct = [(SweetCXAccountSPI *)[clsAcct alloc]
+			id acct = [(HotCXAccountSPI *)[clsAcct alloc]
 				   initWithUUID:slot1_uuid()
 				    description:@"Primary"
 				    serviceName:svcName
@@ -2883,13 +2883,13 @@ static SweetCXProviderConfigSPI *build_callkit_configuration(const struct cellul
 					 handle:nil
 				     shortLabel:@"P"];
 			if (acct)
-				sender = [(SweetCXSenderIdentitySPI *)[clsSender alloc]
+				sender = [(HotCXSenderIdentitySPI *)[clsSender alloc]
 					  initWithUUID:slot1_uuid() account:acct];
 		}
 		if (!sender && clsHandle &&
 		    [clsSender instancesRespondToSelector:@selector(initWithUUID:handle:localizedName:)]) {
-			id senderH = [(SweetCXHandleSPI *)[clsHandle alloc] initWithType:1 value:@"Primary"];
-			sender = [(SweetCXSenderIdentitySPI *)[clsSender alloc]
+			id senderH = [(HotCXHandleSPI *)[clsHandle alloc] initWithType:1 value:@"Primary"];
+			sender = [(HotCXSenderIdentitySPI *)[clsSender alloc]
 				  initWithUUID:slot1_uuid() handle:senderH localizedName:@"Primary"];
 		}
 		if (sender) {
@@ -2904,7 +2904,7 @@ static SweetCXProviderConfigSPI *build_callkit_configuration(const struct cellul
 		static NSString * const emergNums[] = { @"112", @"911", @"100", @"101", @"102", @"108" };
 		NSMutableArray *ehs = [NSMutableArray arrayWithCapacity:6];
 		for (size_t i = 0; i < sizeof(emergNums) / sizeof(emergNums[0]); i++) {
-			id eh = [(SweetCXHandleSPI *)[clsHandle alloc] initWithType:2 value:emergNums[i]];
+			id eh = [(HotCXHandleSPI *)[clsHandle alloc] initWithType:2 value:emergNums[i]];
 			if (eh)
 				[ehs addObject:eh];
 		}
@@ -2918,7 +2918,7 @@ static void refresh_callkit_configuration(const struct cellular_state *st)
 	if (!g_cx_provider || ![g_cx_provider respondsToSelector:@selector(setConfiguration:)])
 		return;
 	@try {
-		SweetCXProviderConfigSPI *cfg = build_callkit_configuration(st);
+		HotCXProviderConfigSPI *cfg = build_callkit_configuration(st);
 		if (cfg)
 			[g_cx_provider setConfiguration:cfg];
 	} @catch (id exc) {
@@ -2936,10 +2936,10 @@ static void init_callkit_provider(void)
 	}
 	Protocol *delProto = objc_getProtocol("CXProviderDelegate");
 	if (delProto)
-		(void)class_addProtocol([SweetCXProviderDelegate class], delProto);
+		(void)class_addProtocol([HotCXProviderDelegate class], delProto);
 	Protocol *privDelProto = objc_getProtocol("CXProviderDelegatePrivate");
 	if (privDelProto)
-		(void)class_addProtocol([SweetCXProviderDelegate class], privDelProto);
+		(void)class_addProtocol([HotCXProviderDelegate class], privDelProto);
 
 	Class clsXPCProv = NSClassFromString(@"CXXPCProvider");
 	Class clsProv    = NSClassFromString(@"CXProvider");
@@ -2950,22 +2950,22 @@ static void init_callkit_provider(void)
 
 	@try {
 		struct cellular_state st = snapshot_state();
-		SweetCXProviderConfigSPI *cfg = build_callkit_configuration(&st);
+		HotCXProviderConfigSPI *cfg = build_callkit_configuration(&st);
 		if (!cfg) {
 			clog("failed to build CXProviderConfiguration");
 			return;
 		}
 		Class chosenCls = clsXPCProv ? clsXPCProv : clsProv;
-		SweetCXProviderSPI *prov = [(SweetCXProviderSPI *)[chosenCls alloc] initWithConfiguration:cfg];
+		HotCXProviderSPI *prov = [(HotCXProviderSPI *)[chosenCls alloc] initWithConfiguration:cfg];
 		if (!prov && clsXPCProv && clsProv) {
 			chosenCls = clsProv;
-			prov = [(SweetCXProviderSPI *)[clsProv alloc] initWithConfiguration:cfg];
+			prov = [(HotCXProviderSPI *)[clsProv alloc] initWithConfiguration:cfg];
 		}
 		if (!prov) {
 			clog("failed to instantiate CallKit provider");
 			return;
 		}
-		g_cx_delegate = [[SweetCXProviderDelegate alloc] init];
+		g_cx_delegate = [[HotCXProviderDelegate alloc] init];
 		[prov setDelegate:g_cx_delegate queue:g_qmi_queue];
 		g_cx_provider = prov;
 		clog("initialized CallKit %s (prioritizedSender=%s, delegate on g_qmi_queue)",
@@ -3019,7 +3019,7 @@ static void handle_ctrl_client_on_qmi_queue(int cfd)
 		uint8_t cid = (req[6] == ' ') ? (uint8_t)atoi(req + 7) : 0;
 		int rc = qmi_voice_end(&g_qmi, cid);
 		if (rc == 0 && cid == 0)
-			sweet_voice_write_shm(0, QMI_VOICE_CALL_STATE_END, 0);
+			hot_voice_write_shm(0, QMI_VOICE_CALL_STATE_END, 0);
 		clog("ctrl HANGUP (call_id=%u) -> rc=%d", cid, rc);
 		rlen = snprintf(rsp, sizeof(rsp),
 				"{\"ok\": %s, \"action\": \"hangup\", \"call_id\": %u, \"rc\": %d}\n",
@@ -3077,14 +3077,14 @@ static void handle_ctrl_client_on_qmi_queue(int cfd)
 
 static void start_ctrl_socket(void)
 {
-	(void)unlink(SWEET_CELLULARD_CTRL_SOCK);
+	(void)unlink(HOT_CELLULARD_CTRL_SOCK);
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
 		return;
 	struct sockaddr_un sun;
 	memset(&sun, 0, sizeof(sun));
 	sun.sun_family = AF_UNIX;
-	snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", SWEET_CELLULARD_CTRL_SOCK);
+	snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", HOT_CELLULARD_CTRL_SOCK);
 #ifdef __APPLE__
 	sun.sun_len = (uint8_t)sizeof(sun);
 #endif
@@ -3092,7 +3092,7 @@ static void start_ctrl_socket(void)
 		close(fd);
 		return;
 	}
-	(void)chmod(SWEET_CELLULARD_CTRL_SOCK, 0600);
+	(void)chmod(HOT_CELLULARD_CTRL_SOCK, 0600);
 	int fl = fcntl(fd, F_GETFL, 0);
 	if (fl >= 0)
 		(void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
@@ -3113,7 +3113,7 @@ static void start_ctrl_socket(void)
 		}
 	});
 	dispatch_resume(g_ctrl_sock_src);
-	clog("listening on %s (0600)", SWEET_CELLULARD_CTRL_SOCK);
+	clog("listening on %s (0600)", HOT_CELLULARD_CTRL_SOCK);
 }
 
 static void commit_and_publish(const struct cellular_state *next, bool force_broadcast)
@@ -3254,13 +3254,13 @@ static void try_connect_and_sync(void)
 	if (g_qmi.fd < 0) {
 		g_qmi.ind_cb = on_qmi_indication;
 		g_qmi.on_voice_calls_changed = on_qmi_voice_calls_changed;
-		if (qmi_open(&g_qmi, SWEET_QRTR_SOCK) < 0)
+		if (qmi_open(&g_qmi, HOT_QRTR_SOCK) < 0)
 			return;
 		just_connected = true;
 		g_last_online_try_ms = 0;
 		g_online_attempts = 0;
 		g_last_logged_dms_mode = 0xfe;
-		clog("connected to %s (fd %d)", SWEET_QRTR_SOCK, g_qmi.fd);
+		clog("connected to %s (fd %d)", HOT_QRTR_SOCK, g_qmi.fd);
 
 		int fd_copy = g_qmi.fd;
 		dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,
@@ -3355,8 +3355,8 @@ static void trigger_qmi_radio_power(bool online)
 
 /* ---- Entry Point ---- */
 
-static SweetXPCListenerSPI *g_ct_listener;
-static SweetCellularListenerDelegate *g_ct_delegate;
+static HotXPCListenerSPI *g_ct_listener;
+static HotCellularListenerDelegate *g_ct_delegate;
 
 int main(int argc, char **argv)
 {
@@ -3420,8 +3420,8 @@ int main(int argc, char **argv)
 		/* 2. Start com.apple.commcenter.coretelephony.xpc NSXPCListener */
 		Class listenerCls = NSClassFromString(@"NSXPCListener");
 		if (listenerCls) {
-			g_ct_delegate = [[SweetCellularListenerDelegate alloc] init];
-			g_ct_listener = [(SweetXPCListenerSPI *)[listenerCls alloc]
+			g_ct_delegate = [[HotCellularListenerDelegate alloc] init];
+			g_ct_listener = [(HotXPCListenerSPI *)[listenerCls alloc]
 					 initWithMachServiceName:@"com.apple.commcenter.coretelephony.xpc"];
 			g_ct_listener.delegate = g_ct_delegate;
 			[g_ct_listener resume];
@@ -3431,14 +3431,14 @@ int main(int argc, char **argv)
 		}
 
 		/* 3. Start com.apple.commcenter.xpc legacy CTServerConnection listener */
-		dispatch_queue_t legacy_q = dispatch_queue_create("org.iosonpixel.cellulard.legacyxpc",
+		dispatch_queue_t legacy_q = dispatch_queue_create("com.ios26hot.cellulard.legacyxpc",
 								  DISPATCH_QUEUE_SERIAL);
 		start_legacy_commcenter_xpc(legacy_q);
 
 		/* 4. Start QMI/QRTR queue, CallKit CXXPCProvider, CLI control socket & poll loop */
-		g_qmi_queue = dispatch_queue_create("org.iosonpixel.cellulard.qmi", DISPATCH_QUEUE_SERIAL);
+		g_qmi_queue = dispatch_queue_create("com.ios26hot.cellulard.qmi", DISPATCH_QUEUE_SERIAL);
 		g_qmi.on_voice_calls_changed = on_qmi_voice_calls_changed;
-		sweet_voice_write_shm(0, 0, 0);
+		hot_voice_write_shm(0, 0, 0);
 		init_callkit_provider();
 		start_ctrl_socket();
 		dispatch_async(g_qmi_queue, ^{

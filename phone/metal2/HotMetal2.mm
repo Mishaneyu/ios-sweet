@@ -1,6 +1,6 @@
 /*
- * SweetMetal2.bundle: the Metal driver for the Adreno 640 on metal2vulkan + Turnip (boot-arg sweetmtl=2: the kernel's
- * SweetAccelerator names this bundle and class SweetMTL2Device). Metal.framework loads it in every process that asks
+ * HotMetal2.bundle: the Metal driver for the Adreno 640 on metal2vulkan + Turnip (boot-arg hotmtl=2 / sweetmtl=2:
+ * SweetAccelerator names this bundle and class HotMTL2Device). Metal.framework loads it in every process that asks
  * for a device; -initWithAcceleratorPort: hands back the frontend's device (NativeBridgeMetalFrontend.mm, UniXNU's,
  * over the bridge in bridge/, which drives Turnip, the libvulkan_freedreno.dylib inside this bundle, through the
  * kernel's v2 user client). Which processes get one: backboardd always, others when /var/local/mtl2-clients lists
@@ -28,7 +28,9 @@ extern "C" void sm2_logs(const char *s)
 		n = (int)sizeof(buf) - 1;
 	static int console = -2, file = -2;
 	if (console == -2) {
-		const char *want_console = getenv("SWEET_MTL2_CONSOLE");
+		const char *want_console = getenv("HOT_MTL2_CONSOLE");
+		if (!want_console)
+			want_console = getenv("SWEET_MTL2_CONSOLE");
 		console = (want_console && !strcmp(want_console, "1")) ? open("/dev/console", O_WRONLY | O_NOCTTY) : -1;
 	}
 	if (file == -2)
@@ -92,13 +94,13 @@ static void missing(const char *cls, const char *sel)
 @end
 
 /* iOS 16's QuartzCore asks for its precompiled pipeline archive (Apple GPU code): none, it builds its pipelines itself. */
-@interface NBDeviceMethods (SweetMetal2)
+@interface NBDeviceMethods (HotMetal2)
 @end
-@implementation NBDeviceMethods (SweetMetal2)
+@implementation NBDeviceMethods (HotMetal2)
 - (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error
 {
 	if (error)
-		*error = [NSError errorWithDomain:@"SweetMetal2" code:1 userInfo:@{ NSLocalizedDescriptionKey : @"no pipeline libraries" }];
+		*error = [NSError errorWithDomain:@"HotMetal2" code:1 userInfo:@{ NSLocalizedDescriptionKey : @"no pipeline libraries" }];
 	return nil;
 }
 @end
@@ -129,11 +131,11 @@ static bool listed(void)
 @interface _MTLDevice : NSObject
 @end
 
-@interface SweetMTL2Device : _MTLDevice
+@interface HotMTL2Device : _MTLDevice
 - (id)initWithAcceleratorPort:(mach_port_t)port;
 @end
 
-@implementation SweetMTL2Device
+@implementation HotMTL2Device
 - (id)initWithAcceleratorPort:(mach_port_t)port
 {
 	/* this object is dropped for the frontend's device: initialised, so its -[_MTLDevice dealloc] has queues to release */
@@ -146,7 +148,7 @@ static bool listed(void)
 			sm2_log("not listed (/var/local/mtl2-clients): no Metal device");
 			return;
 		}
-		NSString *bundle = [[NSBundle bundleForClass:[SweetMTL2Device class]] bundlePath];
+		NSString *bundle = [[NSBundle bundleForClass:[HotMTL2Device class]] bundlePath];
 		NSString *turnip = [bundle stringByAppendingPathComponent:@"libvulkan_freedreno.dylib"];
 		char cache[256];
 		mkdir("/var/local/m2v-cache", 0777);
@@ -180,9 +182,11 @@ static bool listed(void)
 			}
 			fclose(ef);
 		}
-		/* opt-in via SWEET_MTL2_LOG_PIPELINES=1: the runtime's VkPipeline makings count into the telemetry (V row) */
+		/* opt-in via HOT_MTL2_LOG_PIPELINES=1: the runtime's VkPipeline makings count into the telemetry (V row) */
 		{
-			const char *lp = getenv("SWEET_MTL2_LOG_PIPELINES");
+			const char *lp = getenv("HOT_MTL2_LOG_PIPELINES");
+			if (!lp)
+				lp = getenv("SWEET_MTL2_LOG_PIPELINES");
 			if (lp && !strcmp(lp, "1"))
 				setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
 		}
@@ -221,14 +225,14 @@ static bool listed(void)
 		if (device && strcmp(getprogname(), "backboardd") != 0)
 			class_replaceMethod(object_getClass(device), sel_registerName("supportsExtendedXR10Formats"),
 					    imp_implementationWithBlock(^BOOL(id me) { (void)me; return YES; }), "B16@0:8");
-		/* image bases, for symbolicating pstack samples (atos -o out/SweetMetal2.dSYM -l BASE ADDR) */
+		/* image bases, for symbolicating pstack samples (atos -o out/HotMetal2.dSYM -l BASE ADDR) */
 		Dl_info self = { 0 }, tu = { 0 };
 		dladdr((void *)sm2_logs, &self);
 		void *th = dlopen(turnip.UTF8String, RTLD_NOW | RTLD_NOLOAD);
 		void *vk = th ? dlsym(th, "vk_icdGetInstanceProcAddr") : NULL;
 		if (vk)
 			dladdr(vk, &tu);
-		sm2_log("images: SweetMetal2 %p, libvulkan_freedreno %p", self.dli_fbase, tu.dli_fbase);
+		sm2_log("images: HotMetal2 %p, libvulkan_freedreno %p", self.dli_fbase, tu.dli_fbase);
 		/* backboardd: the frontend's counters every 10 s, into /var/local/mtl2.log only (with /var/local/mtl2-telemetry) */
 		if (device && !strcmp(getprogname(), "backboardd"))
 			dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
@@ -248,4 +252,9 @@ static bool listed(void)
 	});
 	return device;
 }
+@end
+
+@interface SweetMTL2Device : HotMTL2Device
+@end
+@implementation SweetMTL2Device
 @end

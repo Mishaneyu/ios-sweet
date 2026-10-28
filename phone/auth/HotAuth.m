@@ -1,9 +1,9 @@
 /*
- * SweetAuth.m — "microG Settings" Apple Account & iCloud Compatibility App
- * for iOS 26.5.2 on RMX1931 / SWEET (/Applications/SweetAuth.app).
+ * HotAuth.m — "microG Settings" Apple Account & iCloud Compatibility App
+ * for iOS 26.5.2 on RMX1931 / SWEET (/Applications/HotAuth.app).
  *
- * 4 Tabs talking to local sweetauthd (http://127.0.0.1:29171):
- *   1. Self-Check      — Live subsystem health checklist & sweetauth.log viewer
+ * 4 Tabs talking to local hotauthd (http://127.0.0.1:29171):
+ *   1. Self-Check      — Live subsystem health checklist & hotauth.log viewer
  *   2. iCloud Sync     — Native Contacts, Calendar, Mail & Notes via App-Specific Password
  *   3. iCloud Web      — Persistent full-screen iCloud.com WebKit container (Drive, Photos, Notes)
  *   4. Settings Bridge — Optional Anisette v1/v3 configuration & akd Settings Sign-In tester
@@ -152,9 +152,9 @@ static void SAOpenBundleID(NSString *bundleID)
 {
 	SAHttpJSON(@"GET", @"/v1/logs", nil, ^(NSDictionary *json, __unused NSError *err) {
 		NSString *logText = [json[@"log"] isKindOfClass:[NSString class]] ? json[@"log"] : @"";
-		if (logText.length == 0) logText = @"(No entries in /var/local/sweetauth.log yet)";
+		if (logText.length == 0) logText = @"(No entries in /var/local/hotauth.log yet)";
 		UIViewController *vc = [[UIViewController alloc] init];
-		vc.title = @"sweetauth.log";
+		vc.title = @"hotauth.log";
 		vc.view.backgroundColor = [UIColor systemBackgroundColor];
 		UITextView *tv = [[UITextView alloc] initWithFrame:CGRectZero];
 		tv.translatesAutoresizingMaskIntoConstraints = NO;
@@ -219,7 +219,7 @@ static void SAOpenBundleID(NSString *bundleID)
 		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
 		cell.textLabel.text = self.loading ? @"Running Self-Check..." : @"Re-Run Self-Check Now";
 		cell.textLabel.textColor = [UIColor systemBlueColor];
-		cell.detailTextLabel.text = @"Queries sweetauthd on 127.0.0.1:29171";
+		cell.detailTextLabel.text = @"Queries hotauthd on 127.0.0.1:29171";
 		return cell;
 	}
 
@@ -229,7 +229,7 @@ static void SAOpenBundleID(NSString *bundleID)
 	BOOL amber = NO;
 
 	if (!hasDaemon) {
-		title = @"sweetauthd Daemon";
+		title = @"hotauthd Daemon";
 		sub = self.loading ? @"Querying 127.0.0.1:29171..." : @"Daemon unreachable on 127.0.0.1:29171";
 	} else if (indexPath.section == 0) {
 		if (indexPath.row == 0) {
@@ -247,11 +247,11 @@ static void SAOpenBundleID(NSString *bundleID)
 		} else if (indexPath.row == 3) {
 			title = @"SysFix (akd + cdpd Hooks)";
 			ok = [s[@"sysfix_akd_cdpd_ok"] boolValue];
-			sub = ok ? @"libsweet_sysfix.dylib active in inject.conf" : @"Missing akd/cdpd in /var/local/inject.conf";
+			sub = ok ? @"libhot_sysfix.dylib active in inject.conf" : @"Missing akd/cdpd in /var/local/inject.conf";
 		} else {
 			title = @"AppFix (@userapps Container & Keychain)";
 			ok = [s[@"appfix_userapps_ok"] boolValue];
-			sub = ok ? @"libsweet_appfix.dylib active for 3rd-party apps" : @"Missing @userapps in /var/local/inject.conf";
+			sub = ok ? @"libhot_appfix.dylib active for 3rd-party apps" : @"Missing @userapps in /var/local/inject.conf";
 		}
 	} else {
 		if (indexPath.row == 0) {
@@ -638,7 +638,7 @@ static void SAOpenBundleID(NSString *bundleID)
 		}];
 	} else {
 		[self saveConfigErase:YES done:^{
-			self.lastTestResult = @"Cleared cached ADI state (/var/local/sweetauth/adi_state.plist).";
+			self.lastTestResult = @"Cleared cached ADI state (/var/local/hotauth/adi_state.plist).";
 			[self.tableView reloadData];
 		}];
 	}

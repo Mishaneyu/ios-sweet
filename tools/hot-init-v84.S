@@ -4,8 +4,8 @@
  * virt (-cpu cortex-a76).
  *
  * Assemble & wrap:
- *   clang --target=arm64e-apple-ios26.0 -mcpu=apple-a13 -c tools/sweet-init-v84.S -o sweet-init-v84.o
- *   python3 tools/mkinit.py sweet-init-v84.o sweet-init-v84.macho
+ *   clang --target=arm64e-apple-ios26.0 -mcpu=apple-a13 -c tools/hot-init-v84.S -o hot-init-v84.o
+ *   python3 tools/mkinit.py hot-init-v84.o hot-init-v84.macho
  *
  * Exercises:
  *   1. CPU_SUBTYPE_ARM64E (0x80000002) exec grading in XNU

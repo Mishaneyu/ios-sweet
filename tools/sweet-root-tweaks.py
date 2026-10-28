@@ -159,7 +159,7 @@ IDLE_XPC_MACH_SERVICES = (
 
 
 def ensure_idle_xpc_daemon(jobs):
-    """Claim absent Bluetooth/DeviceAccess XPC MachServices via sweet-idle-xpc to prevent lookup storms."""
+    """Claim absent Bluetooth/DeviceAccess XPC MachServices via hot-idle-xpc to prevent lookup storms."""
     claimed = {
         svc
         for k, j in jobs.items()
@@ -173,7 +173,7 @@ def ensure_idle_xpc_daemon(jobs):
             'Label': 'org.iosonpixel.idlexpc',
             'MachServices': mach_svcs,
             'ProcessType': 'Background',
-            'ProgramArguments': ['/var/local/bin/sweet-idle-xpc'],
+            'ProgramArguments': ['/var/local/bin/hot-idle-xpc'],
             'RunAtLoad': False,
             'UserName': 'root',
         }
@@ -209,7 +209,7 @@ def launchd(root):
     st = os.stat(path)
     plist = load(path)
     renamed, removed = clean_launchd_plist(plist)
-    if os.path.isfile(os.path.join(root, 'private/var/local/bin/sweet-idle-xpc')):
+    if os.path.isfile(os.path.join(root, 'private/var/local/bin/hot-idle-xpc')):
         ensure_idle_xpc_daemon(plist['LaunchDaemons'])
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} unsupported hw/ANE/Nano jobs removed')

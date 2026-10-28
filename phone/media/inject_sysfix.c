@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: APSL-2.0
  *
- * libsweet_sysfix.dylib: non-intrusive boot & UI responsiveness fixes for
+ * libhot_sysfix.dylib: non-intrusive boot & UI responsiveness fixes for
  * containermanagerd and SpringBoard on RMX1931 / SWEET (iOS 16 & iOS 26).
  * Adapted from HackiOS userland/src/inject.c & userland/src/inject_sb.c
  * (https://github.com/oosexgang/hackios-xnu-kernel).
@@ -543,7 +543,7 @@ cm_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 	m = class_getClassMethod(cls, sel_registerName("personasAreSupported"));
 	if (m != NULL) {
 		method_setImplementation(m, (IMP)personas_are_supported);
-		say("sweet: %s: +[MCMUserIdentityCache personasAreSupported] -> NO\n",
+		say("hot: %s: +[MCMUserIdentityCache personasAreSupported] -> NO\n",
 		    getprogname());
 	}
 	if (dmaj < 25) {
@@ -687,9 +687,9 @@ cm_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 			    (IMP)cm26_error_init_cat);
 		}
 	}
-	mcm_logf("sweet: %s[%d]: hooked MCMUserIdentityCache + HFS+ protection + ACLs (darwin=%d uid=%u)\n",
+	mcm_logf("hot: %s[%d]: hooked MCMUserIdentityCache + HFS+ protection + ACLs (darwin=%d uid=%u)\n",
 	    getprogname(), (int)getpid(), dmaj, (unsigned)geteuid());
-	say("sweet: %s: MCMUserIdentityCache + HFS+ protection & ACL hooks installed\n",
+	say("hot: %s: MCMUserIdentityCache + HFS+ protection & ACL hooks installed\n",
 	    getprogname());
 }
 
@@ -734,7 +734,7 @@ sb_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 		    sel_registerName("_outputFormatForSnapshot:"));
 		if (method != NULL) {
 			method_setImplementation(method, (IMP)snapshot_output_format);
-			say("sweet: SpringBoard: +[XBApplicationSnapshotManifestImpl _outputFormatForSnapshot:] -> JPEG/PNG\n");
+			say("hot: SpringBoard: +[XBApplicationSnapshotManifestImpl _outputFormatForSnapshot:] -> JPEG/PNG\n");
 		}
 	}
 	if (!sb_mc_hooked && darwin_major() >= 25 &&
@@ -750,7 +750,7 @@ sb_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 		if (method != NULL) {
 			method_setImplementation(method, (IMP)sb26_return_no);
 		}
-		say("sweet: SpringBoard: -[MCProfileConnection shouldShowSetupAssistant/CloudConfigurationUI] -> NO\n");
+		say("hot: SpringBoard: -[MCProfileConnection shouldShowSetupAssistant/CloudConfigurationUI] -> NO\n");
 	}
 	if (!sb_rc_hooked &&
 	    (cls = objc_getClass("SBRingerControl")) != NULL) {
@@ -761,7 +761,7 @@ sb_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 			const char *enc = method_getTypeEncoding(method);
 			if (enc != NULL && (enc[0] == 'B' || enc[0] == 'c')) {
 				method_setImplementation(method, (IMP)sb26_return_no);
-				say("sweet: SpringBoard: -[SBRingerControl isRingerMuted] -> NO\n");
+				say("hot: SpringBoard: -[SBRingerControl isRingerMuted] -> NO\n");
 			}
 		}
 	}
@@ -780,14 +780,14 @@ sb_ringer_unmute_thread(__unused void *arg)
 		(void)notify_set_state(tok, 1);
 	}
 	(void)notify_post("com.apple.springboard.ringerstate");
-	say("sweet: SpringBoard: com.apple.springboard.ringerstate -> 1 (+2s)\n");
+	say("hot: SpringBoard: com.apple.springboard.ringerstate -> 1 (+2s)\n");
 
 	sleep(8);
 	if (sb_ringer_token >= 0) {
 		(void)notify_set_state(sb_ringer_token, 1);
 	}
 	(void)notify_post("com.apple.springboard.ringerstate");
-	say("sweet: SpringBoard: com.apple.springboard.ringerstate -> 1 (+10s)\n");
+	say("hot: SpringBoard: com.apple.springboard.ringerstate -> 1 (+10s)\n");
 	return NULL;
 }
 
@@ -870,7 +870,7 @@ bb_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 			orig_bb_button_init = method_setImplementation(method,
 			    (IMP)bb26_button_init_with_context);
 		}
-		say("sweet: backboardd: -[BKButtonHIDEventProcessor ringerState] -> 1 (unmuted)\n");
+		say("hot: backboardd: -[BKButtonHIDEventProcessor ringerState] -> 1 (unmuted)\n");
 	}
 	if (!bb_cb_hooked && (cls = objc_getClass("CBBacklightNode")) != NULL) {
 		bb_cb_hooked = true;
@@ -878,12 +878,12 @@ bb_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 		if (method != NULL) {
 			orig_get_backlight_calib = method_setImplementation(method,
 			    (IMP)bb26_get_backlight_calib);
-			say("sweet: backboardd: -[CBBacklightNode getBacklightCalibration:] -> 625-nit fallback\n");
+			say("hot: backboardd: -[CBBacklightNode getBacklightCalibration:] -> 625-nit fallback\n");
 		}
 	}
 }
 
-/* ---- akd & cdpd (iOS 26+): SweetAuth non-SEP Apple ID & iCloud compatibility ---- */
+/* ---- akd & cdpd (iOS 26+): HotAuth non-SEP Apple ID & iCloud compatibility ---- */
 
 extern void *objc_autoreleasePoolPush(void);
 extern void objc_autoreleasePoolPop(void *pool);
@@ -910,7 +910,7 @@ auth_logf(const char *format, ...)
 	if (n > (int)sizeof(line) - 1) {
 		n = (int)sizeof(line) - 1;
 	}
-	fd = open("/private/var/local/sweetauth.log",
+	fd = open("/private/var/local/hotauth.log",
 	    O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
 	if (fd >= 0) {
 		if (fstat(fd, &st) == 0 && st.st_size > 65536) {
@@ -1017,7 +1017,7 @@ json_extract_u64(const char *json, const char *key, uint64_t *out_val)
 }
 
 static bool
-sweetauthd_query_anisette(const char *op, char *body_out, size_t body_cap)
+hotauthd_query_anisette(const char *op, char *body_out, size_t body_cap)
 {
 	struct sockaddr_in sin;
 	struct timeval tv;
@@ -1092,7 +1092,7 @@ make_ak_error(int64_t code, const char *desc)
 	}
 	cf_dom = CFSTR("AKAnisetteError");
 	cf_desc = CFStringCreateWithCString(kCFAllocatorDefault,
-	    desc != NULL ? desc : "SweetAuth Anisette bridge unavailable",
+	    desc != NULL ? desc : "HotAuth Anisette bridge unavailable",
 	    kCFStringEncodingUTF8);
 	if (cf_desc != NULL) {
 		keys[0] = CFSTR("NSLocalizedDescription");
@@ -1127,10 +1127,10 @@ ak_fetch_anisette_common(const char *op, void (^completion)(id, id))
 		char err_msg[384];
 		uint64_t rinfo = 17106176ULL;
 
-		if (!sweetauthd_query_anisette(op, body, sizeof(body))) {
-			auth_logf("akd %s: sweetauthd unreachable on 127.0.0.1:29171", op);
+		if (!hotauthd_query_anisette(op, body, sizeof(body))) {
+			auth_logf("akd %s: hotauthd unreachable on 127.0.0.1:29171", op);
 			completion(NULL, make_ak_error(-8004,
-			    "sweetauthd is not reachable on 127.0.0.1:29171"));
+			    "hotauthd is not reachable on 127.0.0.1:29171"));
 			objc_autoreleasePoolPop(pool);
 			return;
 		}
@@ -1185,7 +1185,7 @@ ak_fetch_anisette_common(const char *op, void (^completion)(id, id))
 
 		if (!json_extract_string(body, "error", err_msg, sizeof(err_msg))) {
 			(void)strlcpy(err_msg,
-			    "Open SweetAuth -> Settings Sign-In to configure Anisette, or use iCloud Sync (App Password).",
+			    "Open HotAuth -> Settings Sign-In to configure Anisette, or use iCloud Sync (App Password).",
 			    sizeof(err_msg));
 		}
 		auth_logf("akd %s failed: %s", op, err_msg);
@@ -1205,7 +1205,7 @@ ak_bool_anisette_common(const char *op, void (^completion)(BOOL, id))
 		char body[2048];
 		char err_msg[384];
 
-		if (sweetauthd_query_anisette(op, body, sizeof(body)) &&
+		if (hotauthd_query_anisette(op, body, sizeof(body)) &&
 		    strstr(body, "\"ok\":true") != NULL) {
 			auth_logf("akd %s: OK", op);
 			completion(YES, NULL);
@@ -1213,7 +1213,7 @@ ak_bool_anisette_common(const char *op, void (^completion)(BOOL, id))
 			return;
 		}
 		if (!json_extract_string(body, "error", err_msg, sizeof(err_msg))) {
-			(void)strlcpy(err_msg, "Anisette provisioning not configured in SweetAuth",
+			(void)strlcpy(err_msg, "Anisette provisioning not configured in HotAuth",
 			    sizeof(err_msg));
 		}
 		auth_logf("akd %s: %s", op, err_msg);
@@ -1310,7 +1310,7 @@ akd_image_added(__unused const struct mach_header *header, __unused intptr_t sli
 		if (m != NULL) {
 			(void)method_setImplementation(m, (IMP)ak_erase_anisette);
 		}
-		auth_logf("hooked AKNativeAnisetteService -> sweetauthd (127.0.0.1:29171)");
+		auth_logf("hooked AKNativeAnisetteService -> hotauthd (127.0.0.1:29171)");
 	}
 }
 
@@ -1376,7 +1376,7 @@ cdp_image_added(__unused const struct mach_header *header, __unused intptr_t sli
 
 __attribute__((constructor))
 static void
-sweet_sysfix_init(void)
+hot_sysfix_init(void)
 {
 	const char *name = getprogname();
 
@@ -1391,7 +1391,7 @@ sweet_sysfix_init(void)
 		/*
 		 * Disable 10-bit deep framebuffer (b3a8) and Apple framebuffer
 		 * compression BEFORE backboardd's main() opens IOMFB / QuartzCore
-		 * (2.6 s before SweetMetal2.bundle loads on Boot #1), ensuring a
+		 * (2.6 s before HotMetal2.bundle loads on Boot #1), ensuring a
 		 * plain 8-bit BGRA swapchain and full 60 Hz gpu_direct compositing.
 		 */
 		(void)setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);

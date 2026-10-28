@@ -5,16 +5,16 @@ Talks to bsd/dev/sweet_files.c + bsd/dev/sweet_diag.c (Kernel 0132+, TCP 2223)
 over Wi-Fi (en0) or USB Ethernet (ue0 / FlameBridge) on Windows, macOS, or Linux.
 
 Quick start:
-  python tools/sweet-dbg.py connect 192.168.1.42   # or: connect --scan
-  python tools/sweet-dbg.py status                 # health, FPS, GPU/Turnip clients, crashes
-  python tools/sweet-dbg.py doctor                 # automated root-cause checks & remedies
-  python tools/sweet-dbg.py watch                  # live terminal TUI + scrolling KLOG
-  python tools/sweet-dbg.py web                    # live browser dashboard + remote touch
-  python tools/sweet-dbg.py klog -f                # lossless live XNU console tail over TCP
-  python tools/sweet-dbg.py crashes                # userland crash ring (+ ipsw symbolication)
-  python tools/sweet-dbg.py shot                   # auto-geometry PNG screenshot
-  python tools/sweet-dbg.py cmd "fbmode cpu"       # live display/backlight/touch/poke commands
-  python tools/sweet-dbg.py snapshot --redact      # save redacted debug bundle to logs/
+  python tools/hot-dbg.py connect 192.168.1.42   # or: connect --scan
+  python tools/hot-dbg.py status                 # health, FPS, GPU/Turnip clients, crashes
+  python tools/hot-dbg.py doctor                 # automated root-cause checks & remedies
+  python tools/hot-dbg.py watch                  # live terminal TUI + scrolling KLOG
+  python tools/hot-dbg.py web                    # live browser dashboard + remote touch
+  python tools/hot-dbg.py klog -f                # lossless live XNU console tail over TCP
+  python tools/hot-dbg.py crashes                # userland crash ring (+ ipsw symbolication)
+  python tools/hot-dbg.py shot                   # auto-geometry PNG screenshot
+  python tools/hot-dbg.py cmd "fbmode cpu"       # live display/backlight/touch/poke commands
+  python tools/hot-dbg.py snapshot --redact      # save redacted debug bundle to logs/
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,7 +34,7 @@ import zlib
 
 DEFAULT_PORT = 2223
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SAVED_HOST_PATH = os.path.join(REPO_ROOT, "work", ".sweet-host")
+SAVED_HOST_PATH = os.path.join(REPO_ROOT, "work", ".hot-host")
 LOGS_DIR = os.path.join(REPO_ROOT, "logs")
 
 
@@ -100,7 +100,7 @@ def parse_host_port(spec, default_port=DEFAULT_PORT):
 def resolve_endpoint(explicit=None):
     if explicit:
         return parse_host_port(explicit)
-    env = os.environ.get("SWEET_HOST", "").strip()
+    env = (os.environ.get("HOT_HOST", "") or os.environ.get("SWEET_HOST", "")).strip()
     if env:
         return parse_host_port(env)
     if os.path.isfile(SAVED_HOST_PATH):
@@ -119,7 +119,7 @@ def resolve_endpoint(explicit=None):
     return ("192.168.7.2", DEFAULT_PORT)
 
 
-class SweetClient:
+class HotClient:
     def __init__(self, host, port=DEFAULT_PORT, timeout=8.0):
         self.host = host
         self.port = port
@@ -327,7 +327,7 @@ def run_doctor_checks(diag, mtl2_log=None, wland_log=None):
             "Check device-tree display node and SweetFramebuffer::start in klog.")
     elif not disp.get("power_on"):
         add("WARN", "Display", "Display power state is OFF (screen asleep / dimmed out).",
-            "Press Power button or run: python tools/sweet-dbg.py cmd 'tap 540 1200'")
+            "Press Power button or run: python tools/hot-dbg.py cmd 'tap 540 1200'")
     elif disp.get("presents_total", 0) == 0:
         add("FAIL", "Display", "0 frames presented to panel — backboardd has not swapped a surface yet.",
             "Check crashes & klog for backboardd / RenderBox / CoreAnimation startup errors.")
@@ -335,7 +335,7 @@ def run_doctor_checks(diag, mtl2_log=None, wland_log=None):
         add("WARN", "Display",
             f"Display is using slow CPU copyRow fallback ({fps1:.1f} fps, avg {avg_us} us/frame); "
             f"reason='{reason}', surface FourCC='{fourcc}'.",
-            "If forced via fbmode, run: python tools/sweet-dbg.py cmd 'fbmode direct'. "
+            "If forced via fbmode, run: python tools/hot-dbg.py cmd 'fbmode direct'. "
             "If FourCC is unexpected, inspect presentGPU() in SweetFramebuffer.cpp.")
     elif avg_us > 16667:
         add("WARN", "Display",
@@ -352,14 +352,14 @@ def run_doctor_checks(diag, mtl2_log=None, wland_log=None):
     v2_names = {c.get("name") for c in clients if c.get("abi") == "v2_turnip"}
     if not gpu.get("enabled"):
         add("WARN", "GPU/Metal", "Adreno 640 driver is disabled (sweetgpu=1 not in boot-args).",
-            "Boot with sweetgpu=1 sweetmtl=2 for hardware GPU blits and Turnip Metal2.")
+            "Boot with sweetgpu=1 hotmtl=2 for hardware GPU blits and Turnip Metal2.")
     elif not gpu.get("ready"):
         add("FAIL", "GPU/Metal", "Adreno 640 enabled in boot-args but gpu.ready is false (init/GMU/zap failed).",
-            "Run: python tools/sweet-dbg.py klog -g 'SWEET GPU|a6xx' to inspect firmware/zap init.")
+            "Run: python tools/hot-dbg.py klog -g 'SWEET GPU|a6xx' to inspect firmware/zap init.")
     elif "backboardd" not in v2_names:
         add("WARN", "GPU/Metal",
             f"Adreno 640 ready, but backboardd is NOT attached as a v2_turnip client (open clients: {[c.get('name') for c in clients]}).",
-            "Ensure sweetmtl=2 is set and /System/Library/Extensions/SweetMetal2.bundle is installed.")
+            "Ensure hotmtl=2 is set and /System/Library/Extensions/HotMetal2.bundle is installed.")
     else:
         add("OK", "GPU/Metal",
             f"Adreno 640 @ {gpu.get('clock_mhz')} MHz, {len(clients)} Metal client(s) open "
@@ -445,7 +445,7 @@ def run_doctor_checks(diag, mtl2_log=None, wland_log=None):
         add("WARN" if "SpringBoard" not in counts and "backboardd" not in counts else "FAIL",
             "Crashes",
             f"{c_total} fatal userland signal(s) since boot ({top}); latest {last.get('name')}[{last.get('pid')}] {sig_desc} pc={last.get('pc')} far={last.get('far')}.",
-            "Run: python tools/sweet-dbg.py crashes   (symbolicates automatically if ipsw + dyld_shared_cache are present).")
+            "Run: python tools/hot-dbg.py crashes   (symbolicates automatically if ipsw + dyld_shared_cache are present).")
     else:
         add("OK", "Crashes", "0 fatal userland crashes since boot.")
 
@@ -494,7 +494,7 @@ def render_status_text(diag, host_label=""):
     )
     hdr_host = f" ({host_label})" if host_label else ""
     lines.append(
-        f"{B('=== SWEET LIVE OS DEBUGGER' + hdr_host + ' ===')}  "
+        f"{B('=== IOS-26-HOT LIVE OS DEBUGGER' + hdr_host + ' ===')}  "
         f"up {format_uptime(sys_d.get('uptime_ms', 0))}  "
         f"CPUs={sys_d.get('cpus_online', 0)} ({'/'.join(str(x) for x in cf)} MHz)  {wdt_str}"
     )
@@ -663,7 +663,7 @@ WEB_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sweet Live iOS Debugger</title>
+<title>IOS-26-Hot Live iOS Debugger</title>
 <style>
   :root {
     --bg: #0b0f17; --card: #131a27; --border: #233047; --text: #e6edf7;
@@ -703,7 +703,7 @@ WEB_HTML = r"""<!DOCTYPE html>
 <body>
 <header>
   <div class="title">
-    <span>Sweet Live iOS Debugger</span>
+    <span>IOS-26-Hot Live iOS Debugger</span>
     <span id="connPill" class="pill">Connecting...</span>
     <span id="hostPill" class="pill"></span>
   </div>
@@ -1084,7 +1084,7 @@ def detect_local_prefix():
 
 def scan_subnet_for_phone(prefix, port=DEFAULT_PORT):
     def probe(ip):
-        c = SweetClient(ip, port=port, timeout=0.35)
+        c = HotClient(ip, port=port, timeout=0.35)
         try:
             d = c.diag(timeout=0.35)
             if isinstance(d, dict) and "display" in d and "system" in d:
@@ -1131,15 +1131,15 @@ def cmd_connect(args):
         prefix = args.scan if isinstance(args.scan, str) and args.scan != "auto" else detect_local_prefix()
         if not prefix:
             raise SystemExit("Could not detect LAN /24 prefix; pass e.g. --scan 192.168.1 or an explicit IP.")
-        print(f"Scanning {prefix}.1..254:{port} for a booted Sweet iOS kernel...")
+        print(f"Scanning {prefix}.1..254:{port} for a booted IOS-26-Hot kernel...")
         hits = scan_subnet_for_phone(prefix, port=port)
         if not hits:
-            raise SystemExit(f"No booted Sweet iOS device responded on {prefix}.0/24:{port}.")
+            raise SystemExit(f"No booted IOS-26-Hot device responded on {prefix}.0/24:{port}.")
         target_ip, d = hits[0]
         spec = f"{target_ip}:{port}" if port != DEFAULT_PORT else target_ip
     else:
         h, p = parse_host_port(target_ip)
-        c = SweetClient(h, p, timeout=4.0)
+        c = HotClient(h, p, timeout=4.0)
         d = c.diag(timeout=4.0)
         spec = f"{h}:{p}" if p != DEFAULT_PORT else h
 
@@ -1149,7 +1149,7 @@ def cmd_connect(args):
     disp = d.get("display", {})
     gpu = d.get("gpu", {})
     print(
-        f"{badge('OK', 'CONNECTED')} Saved {B(spec)} to work/.sweet-host — "
+        f"{badge('OK', 'CONNECTED')} Saved {B(spec)} to work/.hot-host — "
         f"panel {disp.get('panel_w')}x{disp.get('panel_h')}, "
         f"{disp.get('present_mode')} ({disp.get('fps_1s', 0):.1f} fps), "
         f"GPU={'ready' if gpu.get('ready') else 'off'} ({len(gpu.get('clients', []))} Metal clients)"
@@ -1174,7 +1174,7 @@ def cmd_doctor(args, client):
     if args.json:
         print(json.dumps(findings, indent=2))
         return
-    print(f"{B('=== SWEET AUTOMATED DOCTOR (' + client.label + ') ===')}")
+    print(f"{B('=== IOS-26-HOT AUTOMATED DOCTOR (' + client.label + ') ===')}")
     for f in findings:
         print(f"  {badge(f['level'])} {B(f['area'] + ':')} {f['summary']}")
         if f.get("fix"):
@@ -1393,10 +1393,10 @@ def build_parser():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--host", "-H", help="Phone IP[:PORT] (overrides $SWEET_HOST and work/.sweet-host)")
+    ap.add_argument("--host", "-H", help="Phone IP[:PORT] (overrides $HOT_HOST and work/.hot-host)")
     sub = ap.add_subparsers(dest="sub")
 
-    p_con = sub.add_parser("connect", help="Probe phone on TCP 2223 and save IP to work/.sweet-host")
+    p_con = sub.add_parser("connect", help="Probe phone on TCP 2223 and save IP to work/.hot-host")
     p_con.add_argument("target", nargs="?", help="Phone IP[:PORT]")
     p_con.add_argument("--scan", nargs="?", const="auto", default=None,
                        help="Scan /24 LAN subnet (e.g. 192.168.1, or auto-detect)")
@@ -1449,7 +1449,7 @@ def main(argv=None):
         return
 
     host, port = resolve_endpoint(args.host)
-    client = SweetClient(host, port)
+    client = HotClient(host, port)
     sub = args.sub or "status"
 
     if sub == "status":

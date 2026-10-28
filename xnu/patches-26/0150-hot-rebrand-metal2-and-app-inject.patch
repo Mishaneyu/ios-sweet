@@ -1,0 +1,101 @@
+From 4a91ab5a1574165a641542fd54573fe667cd8312 Mon Sep 17 00:00:00 2001
+From: XNU 26 Rebase <rebase@local>
+Date: Wed, 28 Oct 2026 19:40:46 +0000
+Subject: [PATCH] 0150: hot: rebrand HotMetal2/HotMTL2Device (hotmtl=2) and
+ HotStore/HotAuth/libhot_* exec inject
+
+---
+ bsd/kern/kern_exec.c                  | 30 ++++++++++++++++++++-------
+ iokit/Kernel/arm/SweetAccelerator.cpp | 14 ++++++++-----
+ 2 files changed, 32 insertions(+), 12 deletions(-)
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index d60df67..9bbeb0b 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6850,12 +6850,16 @@ sweet_exec_inject_init(void)
+ 		(void)vnode_close(vp, FREAD, ctx);
+ 	}
+ 	if (exec_inject_conf[0] == '\0') {
+-		const char *media_lib = sweet_file_exists("/usr/local/lib/libsweet_media.dylib", ctx) ?
+-		    "/usr/local/lib/libsweet_media.dylib" :
+-		    (sweet_file_exists("/private/var/local/lib/libsweet_media.dylib", ctx) ? "/var/local/lib/libsweet_media.dylib" : NULL);
+-		const char *sysfix_lib = sweet_file_exists("/usr/local/lib/libsweet_sysfix.dylib", ctx) ?
+-		    "/usr/local/lib/libsweet_sysfix.dylib" :
+-		    (sweet_file_exists("/private/var/local/lib/libsweet_sysfix.dylib", ctx) ? "/var/local/lib/libsweet_sysfix.dylib" : NULL);
++		const char *media_lib = sweet_file_exists("/usr/local/lib/libhot_media.dylib", ctx) ?
++		    "/usr/local/lib/libhot_media.dylib" :
++		    (sweet_file_exists("/private/var/local/lib/libhot_media.dylib", ctx) ? "/var/local/lib/libhot_media.dylib" :
++		    (sweet_file_exists("/usr/local/lib/libsweet_media.dylib", ctx) ? "/usr/local/lib/libsweet_media.dylib" :
++		    (sweet_file_exists("/private/var/local/lib/libsweet_media.dylib", ctx) ? "/var/local/lib/libsweet_media.dylib" : NULL)));
++		const char *sysfix_lib = sweet_file_exists("/usr/local/lib/libhot_sysfix.dylib", ctx) ?
++		    "/usr/local/lib/libhot_sysfix.dylib" :
++		    (sweet_file_exists("/private/var/local/lib/libhot_sysfix.dylib", ctx) ? "/var/local/lib/libhot_sysfix.dylib" :
++		    (sweet_file_exists("/usr/local/lib/libsweet_sysfix.dylib", ctx) ? "/usr/local/lib/libsweet_sysfix.dylib" :
++		    (sweet_file_exists("/private/var/local/lib/libsweet_sysfix.dylib", ctx) ? "/var/local/lib/libsweet_sysfix.dylib" : NULL)));
+ 		if (media_lib && sysfix_lib) {
+ 			snprintf(exec_inject_conf, sizeof(exec_inject_conf),
+ 			    "%s mediaserverd ; %s containermanagerd containermanagerd_system SpringBoard",
+@@ -6894,12 +6898,24 @@ sweet_is_userapp(struct image_params *imgp)
+ 		if (slash != NULL && slash >= exec_path + 18 &&
+ 		    strncmp(slash - 4, ".app", 4) == 0) {
+ 			prefix_len = (size_t)(slash - exec_path);
+-			if ((prefix_len == strlen("/Applications/SweetStore.app") &&
++			if ((prefix_len == strlen("/Applications/HotStore.app") &&
++			    strncmp(exec_path, "/Applications/HotStore.app", prefix_len) == 0) ||
++			    (prefix_len == strlen("/Applications/HotAuth.app") &&
++			    strncmp(exec_path, "/Applications/HotAuth.app", prefix_len) == 0) ||
++			    (prefix_len == strlen("/Applications/SweetStore.app") &&
+ 			    strncmp(exec_path, "/Applications/SweetStore.app", prefix_len) == 0) ||
+ 			    (prefix_len == strlen("/Applications/SweetAuth.app") &&
+ 			    strncmp(exec_path, "/Applications/SweetAuth.app", prefix_len) == 0)) {
+ 				return false;
+ 			}
++			if (prefix_len + sizeof("/.hotstore_installed") <= sizeof(marker)) {
++				memcpy(marker, exec_path, prefix_len);
++				memcpy(marker + prefix_len, "/.hotstore_installed",
++				    sizeof("/.hotstore_installed"));
++				if (sweet_file_exists(marker, vfs_context_kernel())) {
++					return true;
++				}
++			}
+ 			if (prefix_len + sizeof("/.sweetstore_installed") <= sizeof(marker)) {
+ 				memcpy(marker, exec_path, prefix_len);
+ 				memcpy(marker + prefix_len, "/.sweetstore_installed",
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index f8c307e..10d7cf2 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -119,7 +119,9 @@ IOService *
+ SweetAccelerator::probe(IOService *provider, SInt32 *score)
+ {
+ 	uint32_t on = 0;
+-	PE_parse_boot_argn("sweetmtl", &on, sizeof(on));
++	if (!PE_parse_boot_argn("hotmtl", &on, sizeof(on))) {
++		PE_parse_boot_argn("sweetmtl", &on, sizeof(on));
++	}
+ 	return on ? IOService::probe(provider, score) : NULL;
+ }
+ 
+@@ -129,12 +131,14 @@ SweetAccelerator::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
+-	/* sweetmtl=1: SweetMetal (host-made templates, phone/metal); sweetmtl=2: SweetMetal2 (metal2vulkan + Turnip, phone/metal2) */
++	/* hotmtl=2 / sweetmtl=2: HotMetal2 (metal2vulkan + Turnip, phone/metal2); =1: SweetMetal (phone/metal) */
+ 	uint32_t which = 1;
+-	PE_parse_boot_argn("sweetmtl", &which, sizeof(which));
+-	const char *plugin = which == 2 ? "SweetMetal2" : "SweetMetal";
++	if (!PE_parse_boot_argn("hotmtl", &which, sizeof(which))) {
++		PE_parse_boot_argn("sweetmtl", &which, sizeof(which));
++	}
++	const char *plugin = which == 2 ? "HotMetal2" : "SweetMetal";
+ 	setProperty("MetalPluginName", plugin);
+-	setProperty("MetalPluginClassName", which == 2 ? "SweetMTL2Device" : "SweetMTLDevice");
++	setProperty("MetalPluginClassName", which == 2 ? "HotMTL2Device" : "SweetMTLDevice");
+ 	setProperty("IOGLBundleName", plugin);
+ 	setProperty("model", "Adreno 640");
+ 	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
+-- 
+2.43.0
+

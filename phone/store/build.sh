@@ -1,45 +1,45 @@
 #!/bin/sh
-# Build SweetStore.app (/Applications/SweetStore.app) and sweetstored (/var/local/bin/sweetstored)
-# for iOS 16 arm64 into phone/store/out (ad-hoc signed with entitlements).
+# Build HotStore.app (/Applications/HotStore.app) and hotstored (/var/local/bin/hotstored)
+# for iOS arm64 into phone/store/out (ad-hoc signed with entitlements).
 set -e
 cd "$(dirname "$0")"
 ROOT=$(cd ../.. && pwd)
 CC="$ROOT/work/userland/bin/ios-cc"
 
 rm -rf out
-mkdir -p out/SweetStore.app
+mkdir -p out/HotStore.app
 
 # 1. Root installer & WebApp packager daemon (127.0.0.1:29170 + optional LAN :29172)
 "$CC" -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
 	-framework Foundation -framework CoreGraphics -framework ImageIO -lz \
-	-o out/sweetstored sweetstored.m
-strip -x out/sweetstored
-codesign -f -s - --entitlements sweetstored-ents.plist out/sweetstored
+	-o out/hotstored hotstored.m
+strip -x out/hotstored
+codesign -f -s - --entitlements hotstored-ents.plist out/hotstored
 
 # 2. Native UIKit Store, App Store Search & IPA Installer app
 "$CC" -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
 	-framework UIKit -framework QuartzCore -framework Foundation \
 	-framework CoreGraphics -framework UniformTypeIdentifiers \
-	-o out/SweetStore.app/SweetStore SweetStore.m
-strip -x out/SweetStore.app/SweetStore
+	-o out/HotStore.app/HotStore HotStore.m
+strip -x out/HotStore.app/HotStore
 
-# 2b. Standalone UIKit + WKWebView app stub packaged by sweetstored (/create-webapp)
+# 2b. Standalone UIKit + WKWebView app stub packaged by hotstored (/create-webapp)
 "$CC" -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
 	-framework UIKit -framework QuartzCore -framework CoreGraphics -framework WebKit -framework Foundation \
-	-o out/SweetStore.app/SweetWebAppStub SweetWebApp.m
-strip -x out/SweetStore.app/SweetWebAppStub
-codesign -f -s - out/SweetStore.app/SweetWebAppStub
+	-o out/HotStore.app/HotWebAppStub HotWebApp.m
+strip -x out/HotStore.app/HotWebAppStub
+codesign -f -s - out/HotStore.app/HotWebAppStub
 
 # 2c. Per-app iOS 26 container, Keychain & StoreKit/APNs compatibility dylib (@userapps)
 # Built WITHOUT -fobjc-arc (MRC) so swizzled initWithSuiteName: preserves +1 retain semantics.
 "$CC" -O2 -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -dynamiclib \
-	-install_name /usr/local/lib/libsweet_appfix.dylib \
+	-install_name /usr/local/lib/libhot_appfix.dylib \
 	-framework Foundation -framework CoreFoundation -framework Security -lobjc \
-	-Wl,-dead_strip -o out/libsweet_appfix.dylib inject_appfix.m
-strip -x out/libsweet_appfix.dylib
-codesign -f -s - out/libsweet_appfix.dylib 2>/dev/null
+	-Wl,-dead_strip -o out/libhot_appfix.dylib inject_appfix.m
+strip -x out/libhot_appfix.dylib
+codesign -f -s - out/libhot_appfix.dylib 2>/dev/null
 
-cp Info.plist out/SweetStore.app/Info.plist
+cp Info.plist out/HotStore.app/Info.plist
 
 # 3. Generate crisp PNG app icons (pure Python stdlib, zero external deps)
 python3 - <<'PY'
@@ -115,13 +115,13 @@ def write_icon(path, size):
     with open(path, "wb") as f:
         f.write(png)
 
-write_icon("out/SweetStore.app/AppIcon60x60@2x.png", 120)
-write_icon("out/SweetStore.app/AppIcon60x60@3x.png", 180)
+write_icon("out/HotStore.app/AppIcon60x60@2x.png", 120)
+write_icon("out/HotStore.app/AppIcon60x60@3x.png", 180)
 PY
 
-codesign -f -s - --entitlements SweetStore-ents.plist out/SweetStore.app
+codesign -f -s - --entitlements HotStore-ents.plist out/HotStore.app
 
-for bin in out/sweetstored out/SweetStore.app/SweetStore out/SweetStore.app/SweetWebAppStub out/libsweet_appfix.dylib; do
+for bin in out/hotstored out/HotStore.app/HotStore out/HotStore.app/HotWebAppStub out/libhot_appfix.dylib; do
 	WEAK=$(nm -m "$bin" | grep "weak external" | grep -v "dynamically looked up" || true)
 	if [ -n "$WEAK" ]; then
 		echo "ERROR: unexpected weak external symbols in $bin:" >&2
@@ -130,4 +130,4 @@ for bin in out/sweetstored out/SweetStore.app/SweetStore out/SweetStore.app/Swee
 	fi
 done
 
-ls -la out out/SweetStore.app
+ls -la out out/HotStore.app

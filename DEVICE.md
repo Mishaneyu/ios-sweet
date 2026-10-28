@@ -10,7 +10,7 @@
 | --- | --- |
 | **Model** | Realme X2 Pro (`RMX1931`, codename `samurai`) |
 | **SoC** | Qualcomm Snapdragon 855+ / 855 (`SM8150`, `4x Cortex-A55` + `3x Cortex-A76` + `1x Cortex-A76 Prime`) |
-| **GPU** | Qualcomm Adreno 640 (`675 MHz`, Mesa Turnip Vulkan + `SweetMetal2.bundle`) |
+| **GPU** | Qualcomm Adreno 640 (`675 MHz`, Mesa Turnip Vulkan + `HotMetal2.bundle`) |
 | **RAM** | 8 GB LPDDR4X (`<0x80000000 0x3bb00000>`, `<0xc0000000 0x1c0000000>`) |
 | **Storage** | UFS 3.0 (`1d84000.ufshc`, `userdata` on GPT `sda16`) |
 | **Display** | Samsung `SOFEF03F-M` `1080x2400` (`20:9`) AMOLED DSC command-mode panel (`cont_splash` at `0x9d000000`) |

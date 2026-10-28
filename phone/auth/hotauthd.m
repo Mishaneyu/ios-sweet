@@ -1,5 +1,5 @@
 /*
- * sweetauthd.m — Local Apple Account & iCloud compatibility daemon ("microG for iOS")
+ * hotauthd.m — Local Apple Account & iCloud compatibility daemon ("microG for iOS")
  * Bound strictly to 127.0.0.1:29171 on RMX1931 / SWEET (iOS 26.5.2).
  *
  * Endpoints:
@@ -10,11 +10,11 @@
  *                                provisions native CardDAV, CalDAV, and IMAP/SMTP accounts
  *                                in accountsd for Contacts, Calendar, Mail, and Notes
  *   GET  /v1/config            — Returns current Anisette bridge config
- *   POST /v1/config            — Saves Anisette v1/v3 config (/private/var/local/sweetauth/config.json, 0600)
+ *   POST /v1/config            — Saves Anisette v1/v3 config (/private/var/local/hotauth/config.json, 0600)
  *   GET  /v1/anisette?op=...   — Supplies AKAnisetteData (machineID, oneTimePassword, routingInfo)
- *                                to akd (via libsweet_sysfix.dylib) using user-configured v1 or v3 URL
- *   GET  /v1/logs              — Reads /private/var/local/sweetauth.log
- *   POST /v1/clear-logs        — Truncates /private/var/local/sweetauth.log
+ *                                to akd (via libhot_sysfix.dylib) using user-configured v1 or v3 URL
+ *   GET  /v1/logs              — Reads /private/var/local/hotauth.log
+ *   POST /v1/clear-logs        — Truncates /private/var/local/hotauth.log
  */
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
@@ -39,16 +39,16 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-static NSString *const kAuthDir       = @"/private/var/local/sweetauth";
-static NSString *const kConfigPath    = @"/private/var/local/sweetauth/config.json";
-static NSString *const kADIStatePath  = @"/private/var/local/sweetauth/adi_state.plist";
-static NSString *const kAuthLogPath   = @"/private/var/local/sweetauth.log";
+static NSString *const kAuthDir       = @"/private/var/local/hotauth";
+static NSString *const kConfigPath    = @"/private/var/local/hotauth/config.json";
+static NSString *const kADIStatePath  = @"/private/var/local/hotauth/adi_state.plist";
+static NSString *const kAuthLogPath   = @"/private/var/local/hotauth.log";
 
 static NSLock *gStateLock = nil;
 
 static void authd_log(NSString *msg)
 {
-	NSString *line = [NSString stringWithFormat:@"[sweetauthd %d] %@\n", (int)getpid(), msg];
+	NSString *line = [NSString stringWithFormat:@"[hotauthd %d] %@\n", (int)getpid(), msg];
 	NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
 	int fd = open(kAuthLogPath.UTF8String, O_WRONLY | O_CREAT | O_APPEND, 0666);
 	if (fd >= 0) {
@@ -184,15 +184,15 @@ static BOOL run_keychain_roundtrip_512b(int *out_status, NSString **out_step, NS
 	}
 	NSDictionary *legacyCleanup = @{
 		(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-		(__bridge id)kSecAttrService: @"org.iosonpixel.sweetauth.selftest",
+		(__bridge id)kSecAttrService: @"com.ios26hot.hotauth.selftest",
 		(__bridge id)kSecAttrAccount: @"roundtrip512",
 	};
 	(void)SecItemDelete((__bridge CFDictionaryRef)legacyCleanup);
 
 	NSDictionary *baseQuery = @{
 		(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-		(__bridge id)kSecAttrAccessGroup: @"org.iosonpixel.sweetauthd",
-		(__bridge id)kSecAttrService: @"org.iosonpixel.sweetauth.selftest",
+		(__bridge id)kSecAttrAccessGroup: @"com.ios26hot.hotauthd",
+		(__bridge id)kSecAttrService: @"com.ios26hot.hotauth.selftest",
 		(__bridge id)kSecAttrAccount: @"roundtrip512",
 	};
 	(void)SecItemDelete((__bridge CFDictionaryRef)baseQuery);
@@ -256,7 +256,7 @@ static NSInteger probe_https_status(NSString *urlStr)
 
 	NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
 	req.HTTPMethod = @"GET";
-	[req setValue:@"SweetAuth/1.0" forHTTPHeaderField:@"User-Agent"];
+	[req setValue:@"HotAuth/1.0" forHTTPHeaderField:@"User-Agent"];
 
 	__block NSInteger code = 0;
 	dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -318,10 +318,10 @@ static NSDictionary *run_selfcheck(void)
 	} @catch (__unused NSException *e) {}
 
 	NSString *injText = [NSString stringWithContentsOfFile:@"/private/var/local/inject.conf" encoding:NSUTF8StringEncoding error:nil] ?: @"";
-	BOOL sysfixOK = [[NSFileManager defaultManager] fileExistsAtPath:@"/usr/local/lib/libsweet_sysfix.dylib"]
+	BOOL sysfixOK = [[NSFileManager defaultManager] fileExistsAtPath:@"/usr/local/lib/libhot_sysfix.dylib"]
 	             && ([injText rangeOfString:@"akd"].location != NSNotFound)
 	             && ([injText rangeOfString:@"cdpd"].location != NSNotFound);
-	BOOL appfixOK = [[NSFileManager defaultManager] fileExistsAtPath:@"/usr/local/lib/libsweet_appfix.dylib"]
+	BOOL appfixOK = [[NSFileManager defaultManager] fileExistsAtPath:@"/usr/local/lib/libhot_appfix.dylib"]
 	             && ([injText rangeOfString:@"@userapps"].location != NSNotFound);
 
 	[gStateLock lock];
@@ -847,7 +847,7 @@ static NSString *handle_anisette_op(NSString *op)
 	NSString *url = [[cfg[@"url"] isKindOfClass:[NSString class]] ? cfg[@"url"] : @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 
 	if (!enabled || url.length == 0) {
-		return @"{\"ok\":false,\"code\":-8004,\"error\":\"Anisette bridge is disabled. Open SweetAuth -> Settings Bridge to configure a v1/v3 URL, or use SweetAuth -> iCloud Sync (App Password).\"}";
+		return @"{\"ok\":false,\"code\":-8004,\"error\":\"Anisette bridge is disabled. Open HotAuth -> Settings Bridge to configure a v1/v3 URL, or use HotAuth -> iCloud Sync (App Password).\"}";
 	}
 	if ([op isEqualToString:@"sync"]) {
 		return @"{\"ok\":true}";

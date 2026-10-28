@@ -156,7 +156,7 @@ jobs:
           find work/metal2vulkan -not -path '*/.git/*' -exec touch -t 202501010000 {} +
           sh tools/build-m2v-bridge.sh ios
 
-      - name: Build SweetMetal2.bundle
+      - name: Build HotMetal2.bundle
         run: |
           sh phone/metal2/build.sh
 
@@ -233,11 +233,11 @@ jobs:
       - name: Package userland bundle
         run: |
           mkdir -p dist-userland/bin dist-userland/Extensions dist-userland/lib dist-userland/HAL dist-userland/Applications
-          cp -R phone/metal2/out/SweetMetal2.bundle dist-userland/Extensions/
-          cp phone/media/out/libsweet_media.dylib phone/media/out/libsweet_sysfix.dylib phone/store/out/libsweet_appfix.dylib dist-userland/lib/
-          cp -R phone/audio/out/HakiosAudio.driver dist-userland/HAL/
-          cp -R phone/store/out/SweetStore.app phone/auth/out/SweetAuth.app dist-userland/Applications/
-          cp phone/store/out/sweetstored phone/auth/out/sweetauthd dist-userland/bin/
+          cp -R phone/metal2/out/HotMetal2.bundle dist-userland/Extensions/
+          cp phone/media/out/libhot_media.dylib phone/media/out/libhot_sysfix.dylib phone/store/out/libhot_appfix.dylib dist-userland/lib/
+          cp -R phone/audio/out/HotAudio.driver dist-userland/HAL/
+          cp -R phone/store/out/HotStore.app phone/auth/out/HotAuth.app dist-userland/Applications/
+          cp phone/store/out/hotstored phone/auth/out/hotauthd dist-userland/bin/
           cp phone/metal2/out/m2vtest dist-userland/bin/
           cp phone/wifi/out/wland dist-userland/bin/
           cp phone/cellular/out/* dist-userland/bin/

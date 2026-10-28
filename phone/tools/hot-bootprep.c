@@ -1,8 +1,8 @@
 /*
- * sweet-bootprep.c — Early boot pre-flight wrapper before exec'ing wland:
+ * hot-bootprep.c — Early boot pre-flight wrapper before exec'ing wland:
  *  1. Unpacks /var/local/fw/rmtfs/{oppostanvbk,oppodycnvbk}.img from .gz if staged (via libz.1.dylib).
  *  2. One-shot purges stale pre-Wave-5 IconsCache & MobileGestalt cache across all SystemGroup
- *     UUID/named containers so fixed SweetMetal2 ("custom_fn") and /baseband ADT re-populate clean caches.
+ *     UUID/named containers so fixed HotMetal2 ("custom_fn") and /baseband ADT re-populate clean caches.
  *  3. Execs /var/local/bin/wland with original arguments.
  */
 #include <dirent.h>

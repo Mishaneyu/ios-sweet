@@ -24,5 +24,6 @@ tools/camsnap/camsnap
 tools/flamebridge/FlameBridge.app/Contents/MacOS/
 tools/flamebridge/FlameBridge.app/Contents/_CodeSignature/
 *.ipa
+hotauth/
 sweetauth/
 .DS_Store

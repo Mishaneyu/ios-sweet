@@ -1,8 +1,8 @@
 /*
  * SPDX-License-Identifier: APSL-2.0
  *
- * libsweet_appfix.dylib: runtime compatibility layer for third-party iOS apps
- * installed via SweetStore on RMX1931 / SWEET (iOS 26.5.2).
+ * libhot_appfix.dylib: runtime compatibility layer for third-party iOS apps
+ * installed via HotStore on RMX1931 / SWEET (iOS 26.5.2).
  *
  * Injected automatically into @userapps via kern.exec_inject (patch 0148):
  *   1. Isolated per-app Data container (/private/var/mobile/Containers/Data/Application/<bundleId>)
@@ -38,10 +38,10 @@
 typedef struct {
 	const void *replacement;
 	const void *replacee;
-} sweet_interpose_t;
+} hot_interpose_t;
 
-#define SWEET_INTERPOSE(_repl, _orig) \
-	__attribute__((used)) static const sweet_interpose_t _interpose_##_orig \
+#define HOT_INTERPOSE(_repl, _orig) \
+	__attribute__((used)) static const hot_interpose_t _interpose_##_orig \
 	__attribute__((section("__DATA,__interpose"))) = { \
 		(const void *)(uintptr_t)&_repl, \
 		(const void *)(uintptr_t)&_orig \
@@ -188,16 +188,16 @@ read_bundle_id_early(const char *app_dir, char *out_bid, size_t cap)
 
 /* ---- 1. NSHomeDirectory Interposition ---- */
 
-NSString *sweet_NSHomeDirectory(void);
+NSString *hot_NSHomeDirectory(void);
 NSString *
-sweet_NSHomeDirectory(void)
+hot_NSHomeDirectory(void)
 {
 	if (g_active && g_app_container[0] != '\0') {
 		return [NSString stringWithUTF8String:g_app_container];
 	}
 	return NSHomeDirectory();
 }
-SWEET_INTERPOSE(sweet_NSHomeDirectory, NSHomeDirectory);
+HOT_INTERPOSE(hot_NSHomeDirectory, NSHomeDirectory);
 
 /* ---- 2. App Group & NSUserDefaults Suite Shims ---- */
 
@@ -245,7 +245,7 @@ sw_initWithSuiteName(id self, SEL _cmd, NSString *suitename)
 	}
 	char clean[192];
 	sanitize_ident(suitename.UTF8String, clean, sizeof(clean));
-	NSString *alt = [NSString stringWithFormat:@"org.iosonpixel.suite.%s", clean];
+	NSString *alt = [NSString stringWithFormat:@"com.ios26hot.suite.%s", clean];
 	appfix_log("NSUserDefaults suite fallback %s -> %s", suitename.UTF8String, alt.UTF8String);
 	if (g_orig_ud_suite) {
 		/* Allocate a fresh NSUserDefaults since failed init may have released self */
@@ -277,9 +277,9 @@ strip_sec_access_group(CFDictionaryRef src)
 	return m;
 }
 
-OSStatus sweet_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result);
+OSStatus hot_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result);
 OSStatus
-sweet_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result)
+hot_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result)
 {
 	OSStatus st = SecItemAdd(attributes, result);
 	if (g_active && !g_in_secitem && (st == -34018 || st == -25243)) {
@@ -295,11 +295,11 @@ sweet_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result)
 	}
 	return st;
 }
-SWEET_INTERPOSE(sweet_SecItemAdd, SecItemAdd);
+HOT_INTERPOSE(hot_SecItemAdd, SecItemAdd);
 
-OSStatus sweet_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result);
+OSStatus hot_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result);
 OSStatus
-sweet_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
+hot_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
 {
 	OSStatus st = SecItemCopyMatching(query, result);
 	if (g_active && !g_in_secitem && (st == -34018 || st == -25243)) {
@@ -315,11 +315,11 @@ sweet_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
 	}
 	return st;
 }
-SWEET_INTERPOSE(sweet_SecItemCopyMatching, SecItemCopyMatching);
+HOT_INTERPOSE(hot_SecItemCopyMatching, SecItemCopyMatching);
 
-OSStatus sweet_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate);
+OSStatus hot_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate);
 OSStatus
-sweet_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate)
+hot_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate)
 {
 	OSStatus st = SecItemUpdate(query, attributesToUpdate);
 	if (g_active && !g_in_secitem && (st == -34018 || st == -25243)) {
@@ -337,11 +337,11 @@ sweet_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate)
 	}
 	return st;
 }
-SWEET_INTERPOSE(sweet_SecItemUpdate, SecItemUpdate);
+HOT_INTERPOSE(hot_SecItemUpdate, SecItemUpdate);
 
-OSStatus sweet_SecItemDelete(CFDictionaryRef query);
+OSStatus hot_SecItemDelete(CFDictionaryRef query);
 OSStatus
-sweet_SecItemDelete(CFDictionaryRef query)
+hot_SecItemDelete(CFDictionaryRef query)
 {
 	OSStatus st = SecItemDelete(query);
 	if (g_active && !g_in_secitem && (st == -34018 || st == -25243)) {
@@ -357,7 +357,7 @@ sweet_SecItemDelete(CFDictionaryRef query)
 	}
 	return st;
 }
-SWEET_INTERPOSE(sweet_SecItemDelete, SecItemDelete);
+HOT_INTERPOSE(hot_SecItemDelete, SecItemDelete);
 
 /* ---- 4. Non-Blocking StoreKit & APNs Shims ---- */
 
@@ -379,7 +379,7 @@ sw_skRequestStart(id self, __unused SEL _cmd)
 		if (del && [del respondsToSelector:failSel]) {
 			NSError *err = [NSError errorWithDomain:@"SKErrorDomain"
 			                                   code:2
-			                               userInfo:@{NSLocalizedDescriptionKey: @"In-App Purchases unavailable on SWEET"}];
+			                               userInfo:@{NSLocalizedDescriptionKey: @"In-App Purchases unavailable on IOS-26-Hot"}];
 			((void (*)(id, SEL, id, id))objc_msgSend)(del, failSel, self, err);
 		}
 	});
@@ -468,7 +468,7 @@ appfix_exception_handler(NSException *exc)
 
 __attribute__((constructor))
 static void
-sweet_appfix_init(void)
+hot_appfix_init(void)
 {
 	char exec_path[1024];
 	char real_exec[1024];
@@ -492,17 +492,20 @@ sweet_appfix_init(void)
 	memcpy(app_dir, ep, app_len);
 	app_dir[app_len] = '\0';
 
-	/* Only activate inside user containers or .sweetstore_installed apps */
+	/* Only activate inside user containers or .hotstore_installed apps */
 	bool is_user_container = (strncmp(app_dir, "/private/var/containers/Bundle/Application/", 43) == 0 ||
 	                          strncmp(app_dir, "/var/containers/Bundle/Application/", 35) == 0);
 	if (!is_user_container) {
-		if (strcmp(app_dir, "/Applications/SweetStore.app") == 0 ||
+		if (strcmp(app_dir, "/Applications/HotStore.app") == 0 ||
+		    strcmp(app_dir, "/Applications/HotAuth.app") == 0 ||
+		    strcmp(app_dir, "/Applications/SweetStore.app") == 0 ||
 		    strcmp(app_dir, "/Applications/SweetAuth.app") == 0) {
 			return;
 		}
-		char marker[512];
-		snprintf(marker, sizeof(marker), "%s/.sweetstore_installed", app_dir);
-		if (access(marker, F_OK) != 0) {
+		char marker[512], legacy_marker[512];
+		snprintf(marker, sizeof(marker), "%s/.hotstore_installed", app_dir);
+		snprintf(legacy_marker, sizeof(legacy_marker), "%s/.sweetstore_installed", app_dir);
+		if (access(marker, F_OK) != 0 && access(legacy_marker, F_OK) != 0) {
 			return;
 		}
 	}

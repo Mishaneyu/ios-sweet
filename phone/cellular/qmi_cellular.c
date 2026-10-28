@@ -1,6 +1,6 @@
 /*
  * Shared QMI-over-QRTR client library for qmicli and cellulard.
- * Connects to /var/run/sweet-qrtr.sock (multiplexed by wland onto MPSS node 0).
+ * Connects to /var/run/hot-qrtr.sock (multiplexed by wland onto MPSS node 0).
  *
  * PRIVACY: Never requests, parses, logs, or serializes IMEI, IMEISV, IMSI,
  * ICCID, or subscriber phone numbers (MSISDN).
@@ -132,7 +132,7 @@ int qmi_open(struct qmi_ctx *ctx, const char *sock_path)
 	ctx->voice_user = saved_vuser;
 	ctx->rat_mode_pref = saved_rat;
 
-	const char *path = (sock_path && sock_path[0]) ? sock_path : SWEET_QRTR_SOCK;
+	const char *path = (sock_path && sock_path[0]) ? sock_path : HOT_QRTR_SOCK;
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
 		return -1;
@@ -203,9 +203,9 @@ static int send_all_nb(int fd, const void *buf, size_t len, unsigned timeout_ms)
 	return 0;
 }
 
-static void record_server(struct qmi_ctx *ctx, const struct sweet_qrtr_msg *m)
+static void record_server(struct qmi_ctx *ctx, const struct hot_qrtr_msg *m)
 {
-	if (m->type == SWEET_QRTR_TYPE_NEW_SERVER) {
+	if (m->type == HOT_QRTR_TYPE_NEW_SERVER) {
 		int free_idx = -1;
 		for (int i = 0; i < QMI_MAX_SERVERS; i++) {
 			if (ctx->servers[i].valid &&
@@ -225,7 +225,7 @@ static void record_server(struct qmi_ctx *ctx, const struct sweet_qrtr_msg *m)
 			ctx->servers[free_idx].node = m->node;
 			ctx->servers[free_idx].port = m->port;
 		}
-	} else if (m->type == SWEET_QRTR_TYPE_DEL_SERVER) {
+	} else if (m->type == HOT_QRTR_TYPE_DEL_SERVER) {
 		for (int i = 0; i < QMI_MAX_SERVERS; i++) {
 			if (ctx->servers[i].valid &&
 			    ctx->servers[i].node == m->node &&
@@ -249,7 +249,7 @@ static void record_server(struct qmi_ctx *ctx, const struct sweet_qrtr_msg *m)
 					ctx->voice_initial_queried = false;
 					wipe_sensitive(ctx->voice_calls, sizeof(ctx->voice_calls));
 					ctx->voice_call_count = 0;
-					sweet_voice_write_shm(0, 0, 0);
+					hot_voice_write_shm(0, 0, 0);
 				}
 			}
 		}
@@ -309,19 +309,19 @@ static int pump_once(struct qmi_ctx *ctx, uint32_t want_svc, uint16_t want_txn,
 		}
 		ctx->rx_len += (size_t)r;
 
-		while (ctx->rx_len >= sizeof(struct sweet_qrtr_msg)) {
-			struct sweet_qrtr_msg hdr;
+		while (ctx->rx_len >= sizeof(struct hot_qrtr_msg)) {
+			struct hot_qrtr_msg hdr;
 			memcpy(&hdr, ctx->rx_buf, sizeof(hdr));
-			if (hdr.len > SWEET_QRTR_MAX_DATA)
+			if (hdr.len > HOT_QRTR_MAX_DATA)
 				return -1;
 			size_t frame_len = sizeof(hdr) + hdr.len;
 			if (ctx->rx_len < frame_len)
 				break;
 			const uint8_t *p = ctx->rx_buf + sizeof(hdr);
-			if (hdr.type == SWEET_QRTR_TYPE_NEW_SERVER ||
-			    hdr.type == SWEET_QRTR_TYPE_DEL_SERVER) {
+			if (hdr.type == HOT_QRTR_TYPE_NEW_SERVER ||
+			    hdr.type == HOT_QRTR_TYPE_DEL_SERVER) {
 				record_server(ctx, &hdr);
-			} else if (hdr.type == SWEET_QRTR_TYPE_DATA && hdr.len >= 7) {
+			} else if (hdr.type == HOT_QRTR_TYPE_DATA && hdr.len >= 7) {
 				uint8_t flags = p[0];
 				uint16_t txn = rd_le16(p + 1);
 				uint16_t msg_id = rd_le16(p + 3);
@@ -443,9 +443,9 @@ int qmi_request(struct qmi_ctx *ctx, uint32_t service, uint16_t msg_id,
 	if (!txn)
 		txn = ctx->next_txn++;
 
-	uint8_t frame[sizeof(struct sweet_qrtr_msg) + 7 + 4096];
-	struct sweet_qrtr_msg hdr = {
-		.type = SWEET_QRTR_TYPE_DATA,
+	uint8_t frame[sizeof(struct hot_qrtr_msg) + 7 + 4096];
+	struct hot_qrtr_msg hdr = {
+		.type = HOT_QRTR_TYPE_DATA,
 		.node = srv->node,
 		.port = srv->port,
 		.service = service,
@@ -1296,12 +1296,12 @@ const char *qmi_voice_state_str(uint8_t state)
 	}
 }
 
-void sweet_voice_write_shm(uint32_t active, uint32_t call_state, uint32_t call_mode)
+void hot_voice_write_shm(uint32_t active, uint32_t call_state, uint32_t call_mode)
 {
 	static bool s_inited;
-	static struct sweet_voice_call_shm s_last;
-	struct sweet_voice_call_shm shm = {
-		.magic = SWEET_VOICE_CALL_STATE_MAGIC,
+	static struct hot_voice_call_shm s_last;
+	struct hot_voice_call_shm shm = {
+		.magic = HOT_VOICE_CALL_STATE_MAGIC,
 		.active = active ? 1u : 0u,
 		.call_state = call_state,
 		.call_mode = call_mode,
@@ -1310,15 +1310,15 @@ void sweet_voice_write_shm(uint32_t active, uint32_t call_state, uint32_t call_m
 		return;
 
 	char tmp[96];
-	snprintf(tmp, sizeof(tmp), "%s.tmp.%d", SWEET_VOICE_CALL_STATE_PATH, (int)getpid());
+	snprintf(tmp, sizeof(tmp), "%s.tmp.%d", HOT_VOICE_CALL_STATE_PATH, (int)getpid());
 	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
 	if (fd < 0)
 		return;
 	(void)fchmod(fd, 0666);
 	ssize_t nw = write(fd, &shm, sizeof(shm));
 	close(fd);
-	if (nw == (ssize_t)sizeof(shm) && rename(tmp, SWEET_VOICE_CALL_STATE_PATH) == 0) {
-		(void)chmod(SWEET_VOICE_CALL_STATE_PATH, 0666);
+	if (nw == (ssize_t)sizeof(shm) && rename(tmp, HOT_VOICE_CALL_STATE_PATH) == 0) {
+		(void)chmod(HOT_VOICE_CALL_STATE_PATH, 0666);
 		s_last = shm;
 		s_inited = true;
 	} else {
@@ -1488,7 +1488,7 @@ static void parse_voice_call_tlvs(struct qmi_ctx *ctx, struct cellular_state *st
 		}
 	}
 
-	sweet_voice_write_shm(shm_active, shm_state, shm_mode);
+	hot_voice_write_shm(shm_active, shm_state, shm_mode);
 
 	bool should_notify = is_ind || parsed_count > 0 || ctx->voice_call_count > 0;
 	if (ctx->on_voice_calls_changed && should_notify)
@@ -1606,7 +1606,7 @@ int qmi_voice_dial(struct qmi_cellular *qc, const char *number, bool emergency, 
 	}
 	wipe_sensitive(clean, sizeof(clean));
 	wipe_sensitive(rsp, sizeof(rsp));
-	sweet_voice_write_shm(1, QMI_VOICE_CALL_STATE_ORIGINATING, 0);
+	hot_voice_write_shm(1, QMI_VOICE_CALL_STATE_ORIGINATING, 0);
 	return 0;
 }
 
@@ -1639,7 +1639,7 @@ int qmi_voice_answer(struct qmi_cellular *qc, uint8_t call_id)
 	uint16_t qerr = 0;
 	if (qmi_check_result(rsp, rsp_len, &qerr) != 0)
 		return -(int)(qerr ? qerr : 1);
-	sweet_voice_write_shm(1, QMI_VOICE_CALL_STATE_CONVERSATION, 0);
+	hot_voice_write_shm(1, QMI_VOICE_CALL_STATE_CONVERSATION, 0);
 	return 0;
 }
 

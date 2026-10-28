@@ -1,15 +1,15 @@
 /*
- * SweetStore 2.0 — App Store Discovery, Multi-Repo Native IPA Installer & WebApp Studio
+ * HotStore 2.0 — App Store Discovery, Multi-Repo Native IPA Installer & WebApp Studio
  * for iOS 26.5.2 on RMX1931 / SWEET.
  *
- * Talks to local root daemon sweetstored v2 (http://127.0.0.1:29170) to:
+ * Talks to local root daemon hotstored v2 (http://127.0.0.1:29170) to:
  *   1. Search & browse live Apple App Store Top Charts (itunes.apple.com public API).
  *   2. Cross-match bundleIds against AltStore / SideStore / Feather / GitHub unencrypted
  *      (cryptid=0) .ipa repositories for 1-tap native arm64/arm64e installation.
  *   3. Package commercial FairPlay-only services into standalone native Home Screen
- *      WKWebView .app bundles (SweetWebAppStub) with official 512px App Store icons.
- *   4. Manage installed apps, per-app Adreno 640 SweetMetal2 GPU / CPU toggles,
- *      Wi-Fi browser .ipa uploads (port 29172), and libsweet_appfix.dylib logs.
+ *      WKWebView .app bundles (HotWebAppStub) with official 512px App Store icons.
+ *   4. Manage installed apps, per-app Adreno 640 HotMetal2 GPU / CPU toggles,
+ *      Wi-Fi browser .ipa uploads (port 29172), and libhot_appfix.dylib logs.
  */
 
 #import <UIKit/UIKit.h>
@@ -272,7 +272,7 @@ static NSDictionary *SSResolveWebAppSpec(NSString *bundleId, NSString *name, NSS
 		self.pending[urlStr] = [NSMutableArray arrayWithObject:[completion copy]];
 	}
 	NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-	[req setValue:@"SweetStore/2.0 (iOS 26.5.2)" forHTTPHeaderField:@"User-Agent"];
+	[req setValue:@"HotStore/2.0 (iOS 26.5.2)" forHTTPHeaderField:@"User-Agent"];
 	[[self.session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
 		(void)resp; (void)err;
 		UIImage *decoded = nil;
@@ -577,7 +577,7 @@ static NSDictionary *SSResolveWebAppSpec(NSString *bundleId, NSString *name, NSS
 	self.expectedBytes = 0;
 
 	NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-	[req setValue:@"AltStore/2.0 SweetStore/2.0 (iPhone; iOS 26.5.2)" forHTTPHeaderField:@"User-Agent"];
+	[req setValue:@"AltStore/2.0 HotStore/2.0 (iPhone; iOS 26.5.2)" forHTTPHeaderField:@"User-Agent"];
 	self.activeDownloadTask = [self.downloadSession downloadTaskWithRequest:req];
 	[self.activeDownloadTask resume];
 
@@ -626,7 +626,7 @@ didFinishDownloadingToURL:(NSURL *)location
 
 	NSFileManager *fm = [NSFileManager defaultManager];
 	[fm createDirectoryAtPath:kLocalIpaStageDir withIntermediateDirectories:YES attributes:nil error:nil];
-	NSString *dest = [NSString stringWithFormat:@"%@/.sweetdl-%llu.ipa",
+	NSString *dest = [NSString stringWithFormat:@"%@/.hotdl-%llu.ipa",
 	                  kLocalIpaStageDir, (unsigned long long)([[NSDate date] timeIntervalSince1970] * 1000.0)];
 	[fm removeItemAtPath:dest error:nil];
 
@@ -669,7 +669,7 @@ didFinishDownloadingToURL:(NSURL *)location
 		if (err || ![resp[@"ok"] boolValue]) {
 			self.downloadError = SSString(resp[@"error"]).length > 0
 			                   ? SSString(resp[@"error"])
-			                   : (err.localizedDescription ?: @"Cannot reach sweetstored daemon");
+			                   : (err.localizedDescription ?: @"Cannot reach hotstored daemon");
 			[[NSNotificationCenter defaultCenter] postNotificationName:SSStateDidChangeNotification object:self];
 		}
 	}];
@@ -682,7 +682,7 @@ didFinishDownloadingToURL:(NSURL *)location
 	NSFileManager *fm = [NSFileManager defaultManager];
 	[fm createDirectoryAtPath:kLocalIpaStageDir withIntermediateDirectories:YES attributes:nil error:nil];
 	NSString *baseName = url.lastPathComponent.length > 0 ? url.lastPathComponent : @"Imported.ipa";
-	NSString *dest = [NSString stringWithFormat:@"%@/.sweetdl-%llu-%@",
+	NSString *dest = [NSString stringWithFormat:@"%@/.hotdl-%llu-%@",
 	                  kLocalIpaStageDir, (unsigned long long)([[NSDate date] timeIntervalSince1970] * 1000.0), baseName];
 	[fm removeItemAtPath:dest error:nil];
 	NSError *cpErr = nil;
@@ -950,7 +950,7 @@ didFinishDownloadingToURL:(NSURL *)location
 		}
 		dispatch_group_enter(grp);
 		NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:nsu];
-		[req setValue:@"AltStore/2.0 SweetStore/2.0" forHTTPHeaderField:@"User-Agent"];
+		[req setValue:@"AltStore/2.0 HotStore/2.0" forHTTPHeaderField:@"User-Agent"];
 		[[repoSess dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
 			(void)resp;
 			if (err || data.length == 0) {
@@ -2104,12 +2104,12 @@ didFinishDownloadingToURL:(NSURL *)location
 				c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 			}
 		} else if (!sc.daemonOnline) {
-			c.textLabel.text = @"Connecting to sweetstored v2...";
+			c.textLabel.text = @"Connecting to hotstored v2...";
 			c.textLabel.textColor = [UIColor systemOrangeColor];
 			c.detailTextLabel.text = @"Waiting for local installer daemon on 127.0.0.1:29170";
 			c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
 		} else {
-			c.textLabel.text = @"sweetstored v2 Ready (iOS 26 De-PAC + AppFix)";
+			c.textLabel.text = @"hotstored v2 Ready (iOS 26 De-PAC + AppFix)";
 			c.textLabel.textColor = [UIColor systemGreenColor];
 			c.detailTextLabel.text = [NSString stringWithFormat:@"%lu installed apps • %lu local .ipa files",
 			                          (unsigned long)sc.installedApps.count, (unsigned long)sc.localIpas.count];

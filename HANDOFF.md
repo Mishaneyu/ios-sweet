@@ -1,9 +1,15 @@
 # Handoff: iOS on Realme X2 Pro (RMX1931 / samurai) & Pixel 4 (flame)
 
-Last updated **2026-10-28, 23:45 IST** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
+Last updated **2026-10-29, 01:15 IST** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md) (hardware facts,
 test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every kernel patch).
 
 ## Start here (next session)
+
+### `IOS-26-Hot` REBRAND (`v0.8.0-ios26`, kernel `0150`): `HotMetal2`, `HotStore 2.0`, `HotAuth`, `HotAudio`, `libhot_*` & `hot-*` TOOLS (2026-10-29)
+- **Kernel**: `xnu-12377.121.6` patch `0150` (`xnu/patches-26/0150-hot-rebrand-metal2-and-app-inject.patch`), publishing `HotMetal2` / `HotMTL2Device` under `hotmtl=2` (retaining `sweetmtl=2` fallback) and matching `HotStore.app`, `HotAuth.app`, `.hotstore_installed`, and `libhot_*.dylib` in `kern_exec.c`.
+- **Userland & Host Rebrand**: Renamed project-authored apps, daemons, drivers, interposers, and tools from upstream's Redmi Note 10 Pro (`sweet`) codename to **`Hot*` / `hot*`**:
+  - `HotMetal2.bundle` (`HotMTL2Device`), `HotStore.app` (`HotWebAppStub`, `hotstored`), `HotAuth.app` (`hotauthd`), `HotAudio.driver` (`hot-audiotest`, `/tmp/hot-audio.shm`, `/tmp/hot-voice-call.state`), `libhot_appfix.dylib`, `libhot_sysfix.dylib`, `libhot_media.dylib`, `hot-bootprep`, `hot-idle-xpc`, `hotdiag`, `tools/hot-dbg.py`, and `tools/hot-init-v84.S`.
+  - `tools/make-ios26-overlay.py` accepts `--hotmetal2` (with `--sweetmetal2` alias), registers `com.ios26hot.{hotstored,hotauthd}`, installs compatibility symlinks in `/private/var/local/bin/`, and cleans legacy `SweetStore.app` / `SweetAuth.app` / `SweetMetal2.bundle` / `HakiosAudio.driver` paths via `.sweet-rm`.
 
 ### WAVE 6 (`wave6m`, kernel `0149`): VOICE CALLS + STEREO ADSP AUDIO + SWEETAUTH/SWEETSTORE 2.0 + BOOT-1 `BGRA` `gpu_direct`, `wlan_pd` PD-MAPPER FIX & KEYCHAIN ACCESS-GROUP FIX STAGED OFFLINE (2026-10-28)
 - **Kernel**: Untouched GitHub Actions CI artifact `work/boot/kernel-26-0149` (`xnu-12377.121.6`, kernel `0149`, `21,420,160` B).

@@ -1,19 +1,19 @@
 /*
  * SPDX-License-Identifier: APSL-2.0
  *
- * HakiosAudio.driver: CoreAudio HAL AudioServerPlugIn for iOS 16 & iOS 26
+ * HotAudio.driver: CoreAudio HAL AudioServerPlugIn for iOS 16 & iOS 26
  * (D22AP / D421AP) on RMX1931 / SWEET.
  * Adapted from HackiOS userland/src/audio_plugin.c (https://github.com/oosexgang/hackios-xnu-kernel).
  *
  * Presents the five built-in devices expected by D421AP's VirtualAudio.plugin
  * routing tables:
- *   - "Speaker"        stereo 48 kHz output -> /tmp/sweet-audio.shm (adspd) +
+ *   - "Speaker"        stereo 48 kHz output -> /tmp/hot-audio.shm (adspd) +
  *                      /dev/hakios-audio (+ HAKIOS_AUDIO_SET_VOLUME ioctl),
  *                      plus silent stereo reference input
  *   - "Hawking"        silent mono input required by 'vhaw' companion route
  *   - "Actuator"       mono 48 kHz Taptic Engine waveform -> /dev/hakios-haptic
  *   - "Codec"          4-ch 48 kHz built-in microphone ('mc01'..'mc04') ->
- *                      /tmp/sweet-audio.shm mic_pcm or /dev/hakios-mic
+ *                      /tmp/hot-audio.shm mic_pcm or /dev/hakios-mic
  *   - "Baseband Voice" mono 48 kHz cellular call route (signals adspd MVM/CVS/CVP)
  */
 #include <CoreFoundation/CoreFoundation.h>
@@ -37,7 +37,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "hakios.audio.h"
+#include "hot_audio.h"
 
 /* CFPlugIn COM types (omitted from iPhoneOS.sdk headers on newer Xcode). */
 typedef SInt32 HRESULT;
@@ -219,7 +219,7 @@ static struct device devices[] = {
 #define MIC_SOURCE_2        'mc02'
 #define MIC_SOURCE_3        'mc03'
 #define MIC_SOURCE_4        'mc04'
-#define MANUFACTURER        CFSTR("sweet")
+#define MANUFACTURER        CFSTR("hot")
 #define TIMESTAMP_PERIOD    16384
 #define VALUE_MAX_WORDS     16
 
@@ -227,7 +227,7 @@ static AudioServerPlugInHostRef host;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int sink = -1;
 static unsigned sink_open_tries;
-static struct sweet_audio_shm *shm_ptr;
+static struct hot_audio_shm *shm_ptr;
 static UInt64 shm_last_try;
 static UInt64 retry_interval_ticks;
 static Float64 ticks_per_frame;
@@ -293,18 +293,18 @@ volume_to_q16(Float32 scalar)
 	return (uint32_t)q16;
 }
 
-static struct sweet_audio_shm *
+static struct hot_audio_shm *
 ensure_shm(void)
 {
-	struct sweet_audio_shm *mapped;
+	struct hot_audio_shm *mapped;
 	struct stat st;
 	UInt64 now;
 	int fd;
 
 	mapped = __atomic_load_n(&shm_ptr, __ATOMIC_ACQUIRE);
 	if (mapped != NULL) {
-		if (__atomic_load_n(&mapped->magic, __ATOMIC_ACQUIRE) == SWEET_AUDIO_SHM_MAGIC &&
-		    mapped->version == SWEET_AUDIO_SHM_VERSION) {
+		if (__atomic_load_n(&mapped->magic, __ATOMIC_ACQUIRE) == HOT_AUDIO_SHM_MAGIC &&
+		    mapped->version == HOT_AUDIO_SHM_VERSION) {
 			return mapped;
 		}
 		return NULL;
@@ -316,23 +316,23 @@ ensure_shm(void)
 	}
 	shm_last_try = now;
 
-	fd = open(SWEET_AUDIO_SHM_PATH, O_RDWR | O_CLOEXEC);
+	fd = open(HOT_AUDIO_SHM_PATH, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		return NULL;
 	}
-	if (fstat(fd, &st) != 0 || (size_t)st.st_size < sizeof(struct sweet_audio_shm)) {
+	if (fstat(fd, &st) != 0 || (size_t)st.st_size < sizeof(struct hot_audio_shm)) {
 		close(fd);
 		return NULL;
 	}
-	mapped = mmap(NULL, sizeof(struct sweet_audio_shm), PROT_READ | PROT_WRITE,
+	mapped = mmap(NULL, sizeof(struct hot_audio_shm), PROT_READ | PROT_WRITE,
 	    MAP_SHARED, fd, 0);
 	close(fd);
 	if (mapped == MAP_FAILED) {
 		return NULL;
 	}
-	if (__atomic_load_n(&mapped->magic, __ATOMIC_ACQUIRE) != SWEET_AUDIO_SHM_MAGIC ||
-	    mapped->version != SWEET_AUDIO_SHM_VERSION) {
-		munmap(mapped, sizeof(struct sweet_audio_shm));
+	if (__atomic_load_n(&mapped->magic, __ATOMIC_ACQUIRE) != HOT_AUDIO_SHM_MAGIC ||
+	    mapped->version != HOT_AUDIO_SHM_VERSION) {
+		munmap(mapped, sizeof(struct hot_audio_shm));
 		return NULL;
 	}
 
@@ -341,7 +341,7 @@ ensure_shm(void)
 	__atomic_store_n(&mapped->baseband_voice_io, devices[4].running != 0 ? 1u : 0u, __ATOMIC_RELEASE);
 	__atomic_store_n(&mapped->codec_mic_source, mic_source, __ATOMIC_RELEASE);
 	__atomic_store_n(&shm_ptr, mapped, __ATOMIC_RELEASE);
-	say("sweet: audio: attached %s (vol_q16=%u)\n", SWEET_AUDIO_SHM_PATH,
+	say("hot: audio: attached %s (vol_q16=%u)\n", HOT_AUDIO_SHM_PATH,
 	    (unsigned)volume_to_q16(volume));
 	return mapped;
 }
@@ -349,21 +349,21 @@ ensure_shm(void)
 static void
 shm_write_speaker(const int16_t *samples, UInt32 frames)
 {
-	struct sweet_audio_shm *s = ensure_shm();
+	struct hot_audio_shm *s = ensure_shm();
 	uint32_t w, r, mask, i;
 
 	if (s == NULL || samples == NULL || frames == 0) {
 		return;
 	}
-	mask = SWEET_AUDIO_RING_FRAMES - 1u;
+	mask = HOT_AUDIO_RING_FRAMES - 1u;
 	w = __atomic_load_n(&s->write_frames, __ATOMIC_RELAXED);
 	r = __atomic_load_n(&s->read_frames, __ATOMIC_ACQUIRE);
-	if (w - r > SWEET_AUDIO_RING_FRAMES) {
+	if (w - r > HOT_AUDIO_RING_FRAMES) {
 		w = r;
 	}
-	if (frames > SWEET_AUDIO_RING_FRAMES) {
-		samples += (size_t)(frames - SWEET_AUDIO_RING_FRAMES) * HAKIOS_AUDIO_CHANNELS;
-		frames = SWEET_AUDIO_RING_FRAMES;
+	if (frames > HOT_AUDIO_RING_FRAMES) {
+		samples += (size_t)(frames - HOT_AUDIO_RING_FRAMES) * HAKIOS_AUDIO_CHANNELS;
+		frames = HOT_AUDIO_RING_FRAMES;
 	}
 	for (i = 0; i < frames; i++) {
 		uint32_t idx = ((w + i) & mask) * HAKIOS_AUDIO_CHANNELS;
@@ -390,7 +390,7 @@ static void
 volume_to_kernel(void)
 {
 	struct hakios_audio_volume v = { (uint32_t)lround(-scalar_to_db(volume) * 8), volume <= 0 };
-	struct sweet_audio_shm *s = ensure_shm();
+	struct hot_audio_shm *s = ensure_shm();
 	uint32_t q16 = volume_to_q16(volume);
 	int fd = ensure_sink_fd();
 
@@ -398,11 +398,11 @@ volume_to_kernel(void)
 		__atomic_store_n(&s->volume_q16, q16, __ATOMIC_RELEASE);
 	}
 	if (fd >= 0 && ioctl(fd, HAKIOS_AUDIO_SET_VOLUME, &v) == 0) {
-		say("sweet: audio: volume %.3f (%s-%.1f dB, q16=%u)\n",
+		say("hot: audio: volume %.3f (%s-%.1f dB, q16=%u)\n",
 		    volume, v.muted ? "muted, " : "", v.below / 8.0, (unsigned)q16);
 		return;
 	}
-	say("sweet: audio: volume %.3f (%s-%.1f dB, q16=%u, shm=%s)\n",
+	say("hot: audio: volume %.3f (%s-%.1f dB, q16=%u, shm=%s)\n",
 	    volume, v.muted ? "muted, " : "", v.below / 8.0, (unsigned)q16,
 	    s != NULL ? "ok" : "pending");
 }
@@ -483,7 +483,7 @@ initialize(__unused AudioServerPlugInDriverRef drv, AudioServerPlugInHostRef the
 	sink = open(HAKIOS_AUDIO_DEVICE, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 	sink_open_tries = 1;
 	(void)ensure_shm();
-	say("sweet: audio: HakiosAudio initialized (D421AP 5-device HAL, %s: %s, shm: %s)\n",
+	say("hot: audio: HotAudio initialized (D421AP 5-device HAL, %s: %s, shm: %s)\n",
 	    HAKIOS_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open",
 	    shm_ptr != NULL ? "attached" : "waiting");
 	return 0;
@@ -932,7 +932,7 @@ set_property_data(AudioServerPlugInDriverRef drv, AudioObjectID object, pid_t cl
 		AudioObjectPropertyAddress changed = {
 			kAudioSelectorControlPropertyCurrentItem, kAudioObjectPropertyScopeGlobal, 0
 		};
-		struct sweet_audio_shm *s;
+		struct hot_audio_shm *s;
 		UInt32 wanted;
 
 		if (size != sizeof(UInt32)) {
@@ -983,7 +983,7 @@ set_property_data(AudioServerPlugInDriverRef drv, AudioObjectID object, pid_t cl
 	}
 }
 
-/* ---- Codec 4-channel microphone (/tmp/sweet-audio.shm or /dev/hakios-mic) ---- */
+/* ---- Codec 4-channel microphone (/tmp/hot-audio.shm or /dev/hakios-mic) ---- */
 
 static int mic = -1;
 static UInt64 mic_frames, mic_heard;
@@ -991,7 +991,7 @@ static UInt64 mic_frames, mic_heard;
 static void
 codec_open(void)
 {
-	struct sweet_audio_shm *s = ensure_shm();
+	struct hot_audio_shm *s = ensure_shm();
 
 	mic = open("/dev/hakios-mic", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 	mic_frames = mic_heard = 0;
@@ -1012,19 +1012,19 @@ codec_close(void)
 static void
 codec_read(int16_t *samples, UInt32 frames)
 {
-	struct sweet_audio_shm *s = ensure_shm();
+	struct hot_audio_shm *s = ensure_shm();
 	UInt32 have = 0;
 
 	if (s != NULL) {
 		uint32_t mw = __atomic_load_n(&s->mic_write_frames, __ATOMIC_ACQUIRE);
 		uint32_t avail = mw - mic_read_pos;
-		if (avail > SWEET_AUDIO_MIC_RING_FRAMES) {
+		if (avail > HOT_AUDIO_MIC_RING_FRAMES) {
 			mic_read_pos = mw;
 			avail = 0;
 		}
 		if (avail > 0) {
 			uint32_t take = avail < frames ? avail : frames;
-			uint32_t mask = SWEET_AUDIO_MIC_RING_FRAMES - 1u;
+			uint32_t mask = HOT_AUDIO_MIC_RING_FRAMES - 1u;
 			for (uint32_t i = 0; i < take; i++) {
 				uint32_t idx = ((mic_read_pos + i) & mask) * CODEC_CHANNELS;
 				memcpy(&samples[i * CODEC_CHANNELS], &s->mic_pcm[idx],
@@ -1059,7 +1059,7 @@ static OSStatus
 start_io(__unused AudioServerPlugInDriverRef drv, AudioObjectID object, __unused UInt32 client)
 {
 	struct device *d = device_of(object);
-	struct sweet_audio_shm *s;
+	struct hot_audio_shm *s;
 
 	if (d == NULL || object != d->object) {
 		return kAudioHardwareBadObjectError;
@@ -1081,7 +1081,7 @@ start_io(__unused AudioServerPlugInDriverRef drv, AudioObjectID object, __unused
 			if (s != NULL) {
 				__atomic_store_n(&s->baseband_voice_io, 1u, __ATOMIC_RELEASE);
 			}
-			say("sweet: audio: Baseband Voice IO started\n");
+			say("hot: audio: Baseband Voice IO started\n");
 		}
 	}
 	pthread_mutex_unlock(&lock);
@@ -1092,7 +1092,7 @@ static OSStatus
 stop_io(__unused AudioServerPlugInDriverRef drv, AudioObjectID object, __unused UInt32 client)
 {
 	struct device *d = device_of(object);
-	struct sweet_audio_shm *s;
+	struct hot_audio_shm *s;
 
 	if (d == NULL || object != d->object) {
 		return kAudioHardwareBadObjectError;
@@ -1111,7 +1111,7 @@ stop_io(__unused AudioServerPlugInDriverRef drv, AudioObjectID object, __unused 
 			if (s != NULL) {
 				__atomic_store_n(&s->baseband_voice_io, 0u, __ATOMIC_RELEASE);
 			}
-			say("sweet: audio: Baseband Voice IO stopped\n");
+			say("hot: audio: Baseband Voice IO stopped\n");
 		}
 	}
 	pthread_mutex_unlock(&lock);
@@ -1181,7 +1181,7 @@ actuator_write(const int16_t *samples, UInt32 frames)
 	}
 	if (peak > 0 && haptic_said < 12) {
 		haptic_said++;
-		say("sweet: audio: actuator %u frames, peak %d/32768%s\n", (unsigned)frames, peak,
+		say("hot: audio: actuator %u frames, peak %d/32768%s\n", (unsigned)frames, peak,
 		    haptic >= 0 ? "" : " (no /dev/hakios-haptic)");
 	}
 }
@@ -1224,7 +1224,7 @@ static AudioServerPlugInDriverInterface interface_vtable = {
 static AudioServerPlugInDriverInterface *driver_instance = &interface_vtable;
 
 void *
-HakiosAudio_Create(__unused CFAllocatorRef allocator, CFUUIDRef type)
+HotAudio_Create(__unused CFAllocatorRef allocator, CFUUIDRef type)
 {
 	return CFEqual(type, kAudioServerPlugInTypeUUID) ? &driver_instance : NULL;
 }

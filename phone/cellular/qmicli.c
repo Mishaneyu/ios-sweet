@@ -54,7 +54,7 @@ static int try_cellulard_ctrl(const char *cmd, size_t cmd_len, char *reply, size
 	struct sockaddr_un sun;
 	memset(&sun, 0, sizeof(sun));
 	sun.sun_family = AF_UNIX;
-	snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", SWEET_CELLULARD_CTRL_SOCK);
+	snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", HOT_CELLULARD_CTRL_SOCK);
 #ifdef __APPLE__
 	sun.sun_len = (uint8_t)sizeof(sun);
 #endif
@@ -229,7 +229,7 @@ static int handle_voice_subcommand(const char *sock_path, int argc, char **argv,
 		(void)qmi_voice_query_calls(&ctx, &st);
 		int rc = qmi_voice_end(&ctx, cid);
 		if (rc == 0)
-			sweet_voice_write_shm(0, QMI_VOICE_CALL_STATE_END, 0);
+			hot_voice_write_shm(0, QMI_VOICE_CALL_STATE_END, 0);
 		qmi_close(&ctx);
 		printf("{\"ok\": %s, \"action\": \"hangup\", \"call_id\": %u, \"rc\": %d}\n",
 		       rc == 0 ? "true" : "false", cid, rc);
@@ -264,7 +264,7 @@ static int handle_voice_subcommand(const char *sock_path, int argc, char **argv,
 
 int main(int argc, char **argv)
 {
-	const char *sock_path = SWEET_QRTR_SOCK;
+	const char *sock_path = HOT_QRTR_SOCK;
 	const char *wds_apn = "";
 	bool do_online = false;
 	bool do_low_power = false;

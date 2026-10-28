@@ -5,15 +5,15 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>SweetStore</string>
+	<string>HotStore</string>
 	<key>CFBundleExecutable</key>
-	<string>SweetStore</string>
+	<string>HotStore</string>
 	<key>CFBundleIdentifier</key>
-	<string>org.iosonpixel.sweetstore</string>
+	<string>com.ios26hot.hotstore</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>SweetStore</string>
+	<string>HotStore</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

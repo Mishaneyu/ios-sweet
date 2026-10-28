@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: APSL-2.0
  *
- * libsweet_media.dylib: mediaserverd companion for iOS 16 on RMX1931 / SWEET.
+ * libhot_media.dylib: mediaserverd companion for iOS 16 on RMX1931 / SWEET.
  * Adapted from HackiOS userland/src/inject_media.c (https://github.com/oosexgang/hackios-xnu-kernel).
  *
  * Loaded into mediaserverd via kern.exec_inject (0200-rmx1931-hackios-peripherals.patch):
@@ -102,7 +102,7 @@ ensure_torch_fd(void)
 		torch_open_tries++;
 		torch_fd = open("/dev/hakios-torch", O_WRONLY);
 		if (torch_fd >= 0) {
-			say("sweet: mediaserverd: opened /dev/hakios-torch\n");
+			say("hot: mediaserverd: opened /dev/hakios-torch\n");
 		}
 	}
 	return torch_fd;
@@ -150,7 +150,7 @@ shared_vendor(id self, SEL selector)
 	}
 	if (!camera_present && access("/dev/hakios-camera", F_OK) == 0) {
 		camera_present = true;
-		say("sweet: mediaserverd: /dev/hakios-camera detected\n");
+		say("hot: mediaserverd: /dev/hakios-camera detected\n");
 	}
 	if (camera_present) {
 		void *create_fn = dlsym(RTLD_DEFAULT, "hakios_camera_device_create");
@@ -161,7 +161,7 @@ shared_vendor(id self, SEL selector)
 				    objc_getClass("BWFigCaptureDeviceVendor"), sel_registerName("alloc"));
 				camera_vendor = ((id (*)(id, SEL, void *))objc_msgSend)(
 				    made, sel_registerName("initWithDeviceCreateFunction:"), create_fn);
-				say("sweet: mediaserverd: camera device vendor %s\n",
+				say("hot: mediaserverd: camera device vendor %s\n",
 				    camera_vendor ? "created" : "FAILED");
 			}
 			pthread_mutex_unlock(&lock);
@@ -172,7 +172,7 @@ shared_vendor(id self, SEL selector)
 		pthread_mutex_lock(&lock);
 		if (ours == NULL && vendor_class != NULL) {
 			ours = class_createInstance(vendor_class, 0);
-			say("sweet: mediaserverd: providing HakiosFlashlightVendor to FigFlashlight\n");
+			say("hot: mediaserverd: providing HotFlashlightVendor to FigFlashlight\n");
 		}
 		pthread_mutex_unlock(&lock);
 		return ours;
@@ -188,7 +188,7 @@ flashlight_set(uint32_t level)
 
 	if (written != (ssize_t)sizeof(level) || torch_said < 40) {
 		torch_said++;
-		say("sweet: mediaserverd: flashlight %u/1000%s\n", level,
+		say("hot: mediaserverd: flashlight %u/1000%s\n", level,
 		    written == (ssize_t)sizeof(level) ? "" : " (write failed)");
 	}
 }
@@ -286,7 +286,7 @@ audio_source_start(id self, SEL selector, id *error)
 	*error = NULL;
 	if (!said) {
 		said = true;
-		say("sweet: mediaserverd: capture audio broker absent; continuing session silently\n");
+		say("hot: mediaserverd: capture audio broker absent; continuing session silently\n");
 	}
 	return true;
 }
@@ -301,7 +301,7 @@ quality_prioritization(id self, SEL selector)
 
 	if (asked > 1 && !said) {
 		said = true;
-		say("sweet: mediaserverd: clamping still qualityPrioritization %d -> 1 (speed)\n", asked);
+		say("hot: mediaserverd: clamping still qualityPrioritization %d -> 1 (speed)\n", asked);
 	}
 	return asked > 1 ? 1 : asked;
 }
@@ -314,7 +314,7 @@ gnr_render(id self, __unused SEL selector, void *sample_buffer, __unused id inpu
 
 	if (!said) {
 		said = true;
-		say("sweet: mediaserverd: bypassing BWGNRNode\n");
+		say("hot: mediaserverd: bypassing BWGNRNode\n");
 	}
 	if (output != nil) {
 		((void (*)(id, SEL, void *))objc_msgSend)(output, sel_registerName("emitSampleBuffer:"), sample_buffer);
@@ -343,7 +343,7 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
 			if (timebase.denom == 0) {
 				mach_timebase_info(&timebase);
 			}
-			say("sweet: mediaserverd: encoded %zux%zu photo in %.0f ms\n",
+			say("hot: mediaserverd: encoded %zux%zu photo in %.0f ms\n",
 			    CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image),
 			    (double)(mach_absolute_time() - began) * timebase.numer / timebase.denom / 1e6);
 		}
@@ -367,7 +367,7 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 	if (sample_buffer == NULL) {
 		if (!said) {
 			said = true;
-			say("sweet: mediaserverd: dropping NULL sampleBuffer on BWNodeOutput\n");
+			say("hot: mediaserverd: dropping NULL sampleBuffer on BWNodeOutput\n");
 		}
 		return;
 	}
@@ -404,7 +404,7 @@ register_hevc_encoder(void)
 	if (info != NULL) {
 		int status = register_encoder(0x68766331u /* 'hvc1' */, info, create);
 		CFRelease(info);
-		say("sweet: mediaserverd: registered VCPHEVC software HEVC encoder (%d)\n", status);
+		say("hot: mediaserverd: registered VCPHEVC software HEVC encoder (%d)\n", status);
 	}
 }
 
@@ -447,9 +447,9 @@ flashlight_classes(void)
 		{ "setProperty:value:", "i@:@@", (IMP)flashlight_stream_set },
 	};
 
-	vendor_class = make_class("HakiosFlashlightVendor", vendor, sizeof(vendor) / sizeof(vendor[0]));
-	device_class = make_class("HakiosFlashlightDevice", NULL, 0);
-	stream_class = make_class("HakiosFlashlightStream", stream, sizeof(stream) / sizeof(stream[0]));
+	vendor_class = make_class("HotFlashlightVendor", vendor, sizeof(vendor) / sizeof(vendor[0]));
+	device_class = make_class("HotFlashlightDevice", NULL, 0);
+	stream_class = make_class("HotFlashlightStream", stream, sizeof(stream) / sizeof(stream[0]));
 }
 
 static struct replacement {
@@ -494,7 +494,7 @@ image_added(__unused const struct mach_header *header, intptr_t image_slide)
 		    class_getClassMethod(cls, sel_registerName(r->selector));
 		original = method ? method_getImplementation(method) : NULL;
 		if (original == NULL) {
-			say("sweet: mediaserverd: %c[%s %s] missing\n",
+			say("hot: mediaserverd: %c[%s %s] missing\n",
 			    r->instance ? '-' : '+', r->class_name, r->selector);
 			continue;
 		}
@@ -505,7 +505,7 @@ image_added(__unused const struct mach_header *header, intptr_t image_slide)
 			*r->original = original;
 		}
 		method_setImplementation(method, r->replacement);
-		say("sweet: mediaserverd: %c[%s %s] hooked (unslid %#lx)\n",
+		say("hot: mediaserverd: %c[%s %s] hooked (unslid %#lx)\n",
 		    r->instance ? '-' : '+', r->class_name, r->selector,
 		    (unsigned long)((uintptr_t)original - (uintptr_t)image_slide));
 	}
@@ -513,7 +513,7 @@ image_added(__unused const struct mach_header *header, intptr_t image_slide)
 
 __attribute__((constructor))
 static void
-sweet_media_init(void)
+hot_media_init(void)
 {
 	const char *name = getprogname();
 

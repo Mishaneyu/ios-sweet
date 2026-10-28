@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "../wifi/sweet_qrtr.h"
+#include "../wifi/hot_qrtr.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -93,12 +93,12 @@ extern "C" {
 #define QMI_VOICE_CALL_STATE_SETUP		0x0au
 #define QMI_VOICE_CALL_STATE_PRE_ALERTING	0x0bu
 
-/* Shared ADSP voice call state flag (/tmp/sweet-voice-call.state, mode 0666) */
-#define SWEET_VOICE_CALL_STATE_PATH		"/tmp/sweet-voice-call.state"
-#define SWEET_VOICE_CALL_STATE_MAGIC		0x53575643u /* 'SWVC' */
-#define SWEET_CELLULARD_CTRL_SOCK		"/var/run/sweet-cellulard.sock"
+/* Shared ADSP voice call state flag (/tmp/hot-voice-call.state, mode 0666) */
+#define HOT_VOICE_CALL_STATE_PATH		"/tmp/hot-voice-call.state"
+#define HOT_VOICE_CALL_STATE_MAGIC		0x48545643u /* 'HTVC' */
+#define HOT_CELLULARD_CTRL_SOCK		"/var/run/hot-cellulard.sock"
 
-struct sweet_voice_call_shm {
+struct hot_voice_call_shm {
 	uint32_t magic;
 	uint32_t active;
 	uint32_t call_state;
@@ -238,7 +238,7 @@ struct qmi_ctx {
 	uint16_t             next_txn;
 	struct qmi_srv_record servers[QMI_MAX_SERVERS];
 	size_t               rx_len;
-	uint8_t              rx_buf[sizeof(struct sweet_qrtr_msg) + SWEET_QRTR_MAX_DATA];
+	uint8_t              rx_buf[sizeof(struct hot_qrtr_msg) + HOT_QRTR_MAX_DATA];
 	qmi_ind_fn           ind_cb;
 	void                *ind_user;
 	on_voice_calls_changed_fn on_voice_calls_changed;
@@ -299,7 +299,7 @@ int  qmi_voice_answer(struct qmi_cellular *qc, uint8_t call_id);
 int  qmi_voice_end(struct qmi_cellular *qc, uint8_t call_id);
 int  qmi_voice_manage(struct qmi_cellular *qc, uint8_t sups_type, uint8_t call_id);
 int  qmi_voice_dtmf(struct qmi_cellular *qc, uint8_t call_id, char digit, bool start);
-void sweet_voice_write_shm(uint32_t active, uint32_t call_state, uint32_t call_mode);
+void hot_voice_write_shm(uint32_t active, uint32_t call_state, uint32_t call_mode);
 
 /* Redacted JSON serializer */
 int  cellular_state_format_json(const struct cellular_state *st, char *buf, size_t cap);

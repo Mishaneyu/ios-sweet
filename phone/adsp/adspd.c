@@ -6,7 +6,7 @@
  *
  * Usage:
  *   adspd [auto|up]     Boot ADSP, bring up Q6AFE/ADM/ASM + MAX98927, stream PCM
- *   adspd status        Show /var/local/adsp-status.json & /tmp/sweet-audio.shm
+ *   adspd status        Show /var/local/adsp-status.json & /tmp/hot-audio.shm
  *   adspd tone [ms]     Play stereo C5+E5 test chime (via running daemon or standalone)
  *   adspd voice-test    Verify live Q6Voice (MVM/CVS/CVP) bringup & media resume
  *   adspd i2c-scan      Reset MAX98927L/R and scan SOUTH gpio51/52 I2C bus
@@ -33,7 +33,7 @@
 /* Private XNU libsystem_kernel jetsam control (same as wland.c) */
 int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
     void *buffer, size_t size);
-struct sweet_memlimit_props {
+struct hot_memlimit_props {
 	int32_t  active;
 	uint32_t active_attr;
 	int32_t  inactive;
@@ -42,7 +42,7 @@ struct sweet_memlimit_props {
 
 struct adsp_status g_status;
 volatile int g_stop_requested;
-struct sweet_audio_shm *g_shm;
+struct hot_audio_shm *g_shm;
 static uint64_t boot_t0_ms;
 
 void
@@ -217,12 +217,12 @@ static int
 shm_init_ring(void)
 {
 	struct stat st;
-	struct sweet_audio_shm *m;
+	struct hot_audio_shm *m;
 	int fd;
 
-	fd = open(SWEET_AUDIO_SHM_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+	fd = open(HOT_AUDIO_SHM_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
 	if (fd < 0) {
-		adsp_log("shm: open %s failed: %s", SWEET_AUDIO_SHM_PATH, strerror(errno));
+		adsp_log("shm: open %s failed: %s", HOT_AUDIO_SHM_PATH, strerror(errno));
 		return -1;
 	}
 	(void)fchmod(fd, 0666);
@@ -230,14 +230,14 @@ shm_init_ring(void)
 		close(fd);
 		return -1;
 	}
-	if ((size_t)st.st_size < sizeof(struct sweet_audio_shm)) {
-		if (ftruncate(fd, (off_t)sizeof(struct sweet_audio_shm)) != 0) {
+	if ((size_t)st.st_size < sizeof(struct hot_audio_shm)) {
+		if (ftruncate(fd, (off_t)sizeof(struct hot_audio_shm)) != 0) {
 			adsp_log("shm: ftruncate failed: %s", strerror(errno));
 			close(fd);
 			return -1;
 		}
 	}
-	m = mmap(NULL, sizeof(struct sweet_audio_shm), PROT_READ | PROT_WRITE,
+	m = mmap(NULL, sizeof(struct hot_audio_shm), PROT_READ | PROT_WRITE,
 	    MAP_SHARED, fd, 0);
 	close(fd);
 	if (m == MAP_FAILED) {
@@ -245,19 +245,19 @@ shm_init_ring(void)
 		return -1;
 	}
 
-	if (__atomic_load_n(&m->magic, __ATOMIC_ACQUIRE) != SWEET_AUDIO_SHM_MAGIC ||
-	    m->version != SWEET_AUDIO_SHM_VERSION) {
+	if (__atomic_load_n(&m->magic, __ATOMIC_ACQUIRE) != HOT_AUDIO_SHM_MAGIC ||
+	    m->version != HOT_AUDIO_SHM_VERSION) {
 		memset(m, 0, sizeof(*m));
-		m->version = SWEET_AUDIO_SHM_VERSION;
+		m->version = HOT_AUDIO_SHM_VERSION;
 		m->volume_q16 = 65536u;
 		m->codec_mic_source = 'mc01';
-		__atomic_store_n(&m->magic, SWEET_AUDIO_SHM_MAGIC, __ATOMIC_RELEASE);
-		adsp_log("shm: created %s (%zu B, mode 0666)", SWEET_AUDIO_SHM_PATH, sizeof(*m));
+		__atomic_store_n(&m->magic, HOT_AUDIO_SHM_MAGIC, __ATOMIC_RELEASE);
+		adsp_log("shm: created %s (%zu B, mode 0666)", HOT_AUDIO_SHM_PATH, sizeof(*m));
 	} else {
 		uint32_t w = __atomic_load_n(&m->write_frames, __ATOMIC_ACQUIRE);
 		__atomic_store_n(&m->read_frames, w, __ATOMIC_RELEASE);
 		adsp_log("shm: attached existing %s at frame %u (vol_q16=%u)",
-		    SWEET_AUDIO_SHM_PATH, w, m->volume_q16);
+		    HOT_AUDIO_SHM_PATH, w, m->volume_q16);
 	}
 	g_shm = m;
 	return 0;
@@ -266,7 +266,7 @@ shm_init_ring(void)
 static void
 escape_jetsam_and_bg(void)
 {
-	struct sweet_memlimit_props ml = { 2048, 0, 2048, 0 };
+	struct hot_memlimit_props ml = { 2048, 0, 2048, 0 };
 
 	(void)memorystatus_control(7, getpid(), 0, &ml, sizeof(ml));
 	(void)setpriority(PRIO_DARWIN_PROCESS, 0, 0);
@@ -288,7 +288,7 @@ qrtr_sock_is_live(void)
 	}
 	/*
 	 * Check /var/local/wland.boot + /var/local/wland.log instead of opening
-	 * and immediately closing /var/run/sweet-qrtr.sock (which would allocate
+	 * and immediately closing /var/run/hot-qrtr.sock (which would allocate
 	 * qrtr-mux port 0x40 and emit a spurious QRTR_TYPE_DEL_CLIENT to MPSS).
 	 */
 	if (sysctlbyname("kern.boottime", &bt, &blen, NULL, 0) != 0) {
@@ -451,9 +451,9 @@ cmd_status(void)
 		printf("%s: not present (%s)\n", ADSP_STATUS_PATH, strerror(errno));
 	}
 
-	int fd = open(SWEET_AUDIO_SHM_PATH, O_RDONLY | O_CLOEXEC);
+	int fd = open(HOT_AUDIO_SHM_PATH, O_RDONLY | O_CLOEXEC);
 	if (fd >= 0) {
-		struct sweet_audio_shm *s = mmap(NULL, sizeof(*s), PROT_READ, MAP_SHARED, fd, 0);
+		struct hot_audio_shm *s = mmap(NULL, sizeof(*s), PROT_READ, MAP_SHARED, fd, 0);
 		close(fd);
 		if (s != MAP_FAILED) {
 			uint32_t w = __atomic_load_n(&s->write_frames, __ATOMIC_ACQUIRE);
@@ -461,13 +461,13 @@ cmd_status(void)
 			printf("=== %s ===\n"
 			    "  magic=0x%08x ver=%u write=%u read=%u queued=%u\n"
 			    "  volume_q16=%u speaker_running=%u baseband_voice_io=%u mic_src=0x%08x\n",
-			    SWEET_AUDIO_SHM_PATH, s->magic, s->version, w, r, w - r,
+			    HOT_AUDIO_SHM_PATH, s->magic, s->version, w, r, w - r,
 			    s->volume_q16, s->speaker_running, s->baseband_voice_io,
 			    s->codec_mic_source);
 			munmap(s, sizeof(*s));
 		}
 	} else {
-		printf("%s: not present (%s)\n", SWEET_AUDIO_SHM_PATH, strerror(errno));
+		printf("%s: not present (%s)\n", HOT_AUDIO_SHM_PATH, strerror(errno));
 	}
 	return 0;
 }
@@ -563,7 +563,7 @@ cmd_voice_test(unsigned hold_ms)
 		printf("adspd voice-test: FAILED to enter voice_active within 3000 ms\n");
 	}
 
-	/* Restore previous /tmp/sweet-voice-call.state (or mark idle) */
+	/* Restore previous /tmp/hot-voice-call.state (or mark idle) */
 	fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
 	if (fd >= 0) {
 		(void)fchmod(fd, 0666);
@@ -600,8 +600,8 @@ cmd_voice_test(unsigned hold_ms)
 static int
 inject_tone_via_shm(unsigned duration_ms)
 {
-	int fd = open(SWEET_AUDIO_SHM_PATH, O_RDWR | O_CLOEXEC);
-	struct sweet_audio_shm *s;
+	int fd = open(HOT_AUDIO_SHM_PATH, O_RDWR | O_CLOEXEC);
+	struct hot_audio_shm *s;
 
 	if (fd < 0) {
 		return -1;
@@ -614,14 +614,14 @@ inject_tone_via_shm(unsigned duration_ms)
 
 	uint32_t total_frames = (duration_ms * HAKIOS_AUDIO_RATE) / 1000u;
 	uint32_t done = 0;
-	uint32_t mask = SWEET_AUDIO_RING_FRAMES - 1u;
+	uint32_t mask = HOT_AUDIO_RING_FRAMES - 1u;
 	uint32_t start_r = __atomic_load_n(&s->read_frames, __ATOMIC_ACQUIRE);
 
 	if (__atomic_load_n(&s->volume_q16, __ATOMIC_ACQUIRE) == 0) {
 		__atomic_store_n(&s->volume_q16, 65536u, __ATOMIC_RELEASE);
 	}
 	printf("adspd tone: feeding %u ms stereo C5+E5 chime into running daemon via %s...\n",
-	    duration_ms, SWEET_AUDIO_SHM_PATH);
+	    duration_ms, HOT_AUDIO_SHM_PATH);
 
 	while (done < total_frames) {
 		uint32_t w = __atomic_load_n(&s->write_frames, __ATOMIC_RELAXED);
@@ -686,7 +686,7 @@ run_daemon(bool is_auto, bool tone_only, unsigned tone_ms)
 	g_status.adm_copp_id = -1;
 	snprintf(g_status.state, sizeof(g_status.state), "starting");
 
-	/* Create /tmp/sweet-audio.shm (0666) BEFORE waiting on wland so mediaserverd attaches early */
+	/* Create /tmp/hot-audio.shm (0666) BEFORE waiting on wland so mediaserverd attaches early */
 	if (shm_init_ring() != 0) {
 		return 1;
 	}

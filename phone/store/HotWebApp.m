@@ -1,7 +1,7 @@
 /*
- * SweetWebApp.m — Standalone native UIKit + WKWebView app runtime stub ("SweetWebAppStub").
+ * HotWebApp.m — Standalone native UIKit + WKWebView app runtime stub ("HotWebAppStub").
  *
- * Packaged by sweetstored (POST /create-webapp) into real Home Screen .app bundles for
+ * Packaged by hotstored (POST /create-webapp) into real Home Screen .app bundles for
  * commercial apps whose native binaries are FairPlay-encrypted (cryptid = 1).
  *
  * Driven purely by Info.plist keys:

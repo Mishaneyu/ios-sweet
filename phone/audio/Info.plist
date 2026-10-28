@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.hakios.audio</string>
+	<string>com.ios26hot.audio</string>
 	<key>CFBundleName</key>
-	<string>HakiosAudio</string>
+	<string>HotAudio</string>
 	<key>CFBundleExecutable</key>
-	<string>HakiosAudio</string>
+	<string>HotAudio</string>
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -28,7 +28,7 @@
 	<key>CFPlugInFactories</key>
 	<dict>
 		<key>7C3E5B0A-52D4-4F6B-9E0D-6B1A2D7F0C51</key>
-		<string>HakiosAudio_Create</string>
+		<string>HotAudio_Create</string>
 	</dict>
 </dict>
 </plist>

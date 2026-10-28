@@ -7,7 +7,7 @@
  *             QUATERNARY_MI2S_TX 0x1007 SD0 / PSEUDOPORT_01 0x8001 for voice)
  *   - Q6ADM  (COPP ADM_TOPOLOGY_NONE 0x10312 + matrix routing)
  *   - Q6ASM  (shared memory map of 0xE1000000 via SID 1<<32, 8 x 20 ms S16_LE
- *             periods fed from /tmp/sweet-audio.shm or built-in tone generator)
+ *             periods fed from /tmp/hot-audio.shm or built-in tone generator)
  *   - Q6Voice (APR_SVC_ADSP_MVM 0x09 + CVS 0x0A + CVP 0x0B "default modem voice"
  *              cellular voice call routing)
  */
@@ -639,9 +639,9 @@ fill_period_pcm(int16_t *dst_stereo, uint32_t frames)
 	uint32_t r = __atomic_load_n(&g_shm->read_frames, __ATOMIC_RELAXED);
 	uint32_t vol = __atomic_load_n(&g_shm->volume_q16, __ATOMIC_ACQUIRE);
 	uint32_t avail = w - r;
-	uint32_t mask = SWEET_AUDIO_RING_FRAMES - 1u;
+	uint32_t mask = HOT_AUDIO_RING_FRAMES - 1u;
 
-	if (avail > SWEET_AUDIO_RING_FRAMES) {
+	if (avail > HOT_AUDIO_RING_FRAMES) {
 		r = w;
 		__atomic_store_n(&g_shm->read_frames, r, __ATOMIC_RELEASE);
 		avail = 0;
@@ -885,10 +885,10 @@ detect_voice_call_wanted(bool *out_speakerphone)
 	bool active = false;
 
 	/*
-	 * Note: MobilePhone.app / audiomxd touches HakiosAudio's Baseband Voice IO
+	 * Note: MobilePhone.app / audiomxd touches HotAudio's Baseband Voice IO
 	 * stream even while idle on the keypad, so NEVER trigger Q6Voice off
 	 * g_shm->baseband_voice_io alone. Gate strictly on cellulard's atomic
-	 * /tmp/sweet-voice-call.state ('SWVC' struct or JSON control override).
+	 * /tmp/hot-voice-call.state ('HTVC' struct or JSON control override).
 	 */
 	if (g_shm != NULL &&
 	    __atomic_load_n(&g_shm->speaker_running, __ATOMIC_ACQUIRE) != 0) {
@@ -905,7 +905,7 @@ detect_voice_call_wanted(bool *out_speakerphone)
 			memcpy(&magic, buf, 4);
 			memcpy(&v_active, buf + 4, 4);
 			memcpy(&v_mode, buf + 12, 4);
-			if (magic == 0x53575643u /* 'SWVC' from cellulard */) {
+			if (magic == 0x48545643u /* 'HTVC' from cellulard */) {
 				active = (v_active != 0);
 				if (v_mode == 1u) {
 					spk = true;
