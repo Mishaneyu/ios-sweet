@@ -17,6 +17,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <os/lock.h>
@@ -26,7 +27,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -300,6 +303,55 @@
 - (instancetype)initWithFimwareUpdateInfo:(id)dict;
 @end
 
+@interface SweetCTCallCapResp : NSObject
+- (instancetype)initWithCapabilities:(id)caps;
+@end
+
+/* CallKit dynamic SPI interfaces (loaded via dlopen, zero build-time framework link needed) */
+@interface SweetCXHandleSPI : NSObject
+- (instancetype)initWithType:(NSInteger)type value:(NSString *)value;
+@end
+
+@interface SweetCXSenderIdentitySPI : NSObject
+- (instancetype)initWithUUID:(NSUUID *)UUID handle:(id)handle localizedName:(NSString *)localizedName;
+@end
+
+@interface SweetCXProviderConfigSPI : NSObject
+- (instancetype)initWithLocalizedName:(NSString *)localizedName;
+- (void)setLocalizedName:(NSString *)localizedName;
+- (void)setSupportedHandleTypes:(NSSet *)types;
+- (void)setSupportsAudioOnly:(BOOL)v;
+- (void)setSupportsVideo:(BOOL)v;
+- (void)setSupportsEmergency:(BOOL)v;
+- (void)setSupportsVoicemail:(BOOL)v;
+- (void)setSupportsCurrentPlatform:(BOOL)v;
+- (void)setSupportsRinging:(BOOL)v;
+- (void)setSupportsDynamicSystemUI:(BOOL)v;
+- (void)setIncludesCallsInRecents:(BOOL)v;
+- (void)setMaximumCallGroups:(NSUInteger)v;
+- (void)setMaximumCallsPerCallGroup:(NSUInteger)v;
+- (void)setOrderedSenderIdentities:(NSOrderedSet *)identities;
+- (void)setSenderIdentities:(NSSet *)identities;
+@end
+
+@interface SweetCXProviderSPI : NSObject
+- (instancetype)initWithConfiguration:(id)configuration;
+- (void)setDelegate:(id)delegate queue:(dispatch_queue_t)queue;
+- (void)reportNewIncomingCallWithUUID:(NSUUID *)UUID
+			       update:(id)update
+			   completion:(void (^)(NSError *error))completion;
+- (void)reportCallWithUUID:(NSUUID *)UUID updated:(id)update;
+- (void)reportOutgoingCallWithUUID:(NSUUID *)UUID startedConnectingAtDate:(NSDate *)dateStartedConnecting;
+- (void)reportOutgoingCallWithUUID:(NSUUID *)UUID connectedAtDate:(NSDate *)dateConnected;
+- (void)reportCallWithUUID:(NSUUID *)UUID endedAtDate:(NSDate *)dateEnded endedReason:(NSInteger)endedReason;
+@end
+
+@interface SweetCXActionSPI : NSObject
+- (NSUUID *)callUUID;
+- (void)fulfill;
+- (void)fail;
+@end
+
 /* Client delegate push interface */
 @interface SweetCTDelegateProxy : NSObject
 - (void)subscriptionInfoDidChange;
@@ -329,11 +381,14 @@ static void (*fn_xpc_conn_set_target_queue)(sweet_xpc_t, dispatch_queue_t);
 static void (*fn_xpc_conn_set_handler)(sweet_xpc_t, void (^)(sweet_xpc_t));
 static void (*fn_xpc_conn_resume)(sweet_xpc_t);
 static void (*fn_xpc_conn_send)(sweet_xpc_t, sweet_xpc_t);
+static sweet_xpc_t (*fn_xpc_dict_create)(const char * const *, const sweet_xpc_t *, size_t);
 static sweet_xpc_t (*fn_xpc_dict_create_reply)(sweet_xpc_t);
 static void (*fn_xpc_dict_set_int64)(sweet_xpc_t, const char *, int64_t);
 static void (*fn_xpc_dict_set_string)(sweet_xpc_t, const char *, const char *);
 static void (*fn_xpc_dict_set_bool)(sweet_xpc_t, const char *, bool);
+static void (*fn_xpc_dict_set_value)(sweet_xpc_t, const char *, sweet_xpc_t);
 static const char *(*fn_xpc_dict_get_string)(sweet_xpc_t, const char *);
+static sweet_xpc_t (*fn_xpc_dict_get_value)(sweet_xpc_t, const char *);
 static const void *(*fn_xpc_get_type)(sweet_xpc_t);
 static sweet_xpc_t (*fn_xpc_retain)(sweet_xpc_t);
 static void (*fn_xpc_release)(sweet_xpc_t);
@@ -370,11 +425,14 @@ static void resolve_runtime_symbols(void)
 	fn_xpc_conn_set_handler = dlsym(RTLD_DEFAULT, "xpc_connection_set_event_handler");
 	fn_xpc_conn_resume = dlsym(RTLD_DEFAULT, "xpc_connection_resume");
 	fn_xpc_conn_send = dlsym(RTLD_DEFAULT, "xpc_connection_send_message");
+	fn_xpc_dict_create = dlsym(RTLD_DEFAULT, "xpc_dictionary_create");
 	fn_xpc_dict_create_reply = dlsym(RTLD_DEFAULT, "xpc_dictionary_create_reply");
 	fn_xpc_dict_set_int64 = dlsym(RTLD_DEFAULT, "xpc_dictionary_set_int64");
 	fn_xpc_dict_set_string = dlsym(RTLD_DEFAULT, "xpc_dictionary_set_string");
 	fn_xpc_dict_set_bool = dlsym(RTLD_DEFAULT, "xpc_dictionary_set_bool");
+	fn_xpc_dict_set_value = dlsym(RTLD_DEFAULT, "xpc_dictionary_set_value");
 	fn_xpc_dict_get_string = dlsym(RTLD_DEFAULT, "xpc_dictionary_get_string");
+	fn_xpc_dict_get_value = dlsym(RTLD_DEFAULT, "xpc_dictionary_get_value");
 	fn_xpc_get_type = dlsym(RTLD_DEFAULT, "xpc_get_type");
 	fn_xpc_retain = dlsym(RTLD_DEFAULT, "xpc_retain");
 	fn_xpc_release = dlsym(RTLD_DEFAULT, "xpc_release");
@@ -432,6 +490,42 @@ static void ct_set(id obj, NSString *key, id val)
 	} @catch (id exc) {
 		(void)exc;
 	}
+}
+
+static id ct_get(id obj, NSString *key)
+{
+	if (!obj || !key)
+		return nil;
+	@try {
+		return [obj valueForKey:key];
+	} @catch (id exc) {
+		return nil;
+	}
+}
+
+static void wipe_ram(void *p, size_t n)
+{
+	volatile uint8_t *vp = (volatile uint8_t *)p;
+	while (n--)
+		*vp++ = 0;
+}
+
+static bool is_emergency_cstr(const char *s)
+{
+	if (!s || !s[0])
+		return false;
+	char digits[24];
+	size_t o = 0;
+	wipe_ram(digits, sizeof(digits));
+	for (size_t i = 0; s[i] && o + 1 < sizeof(digits); i++) {
+		if ((s[i] >= '0' && s[i] <= '9') || s[i] == '+' || s[i] == '*' || s[i] == '#')
+			digits[o++] = s[i];
+	}
+	bool m = (!strcmp(digits, "112") || !strcmp(digits, "911") || !strcmp(digits, "100") ||
+		  !strcmp(digits, "101") || !strcmp(digits, "102") || !strcmp(digits, "108") ||
+		  !strcmp(digits, "999") || !strcmp(digits, "000"));
+	wipe_ram(digits, sizeof(digits));
+	return m;
 }
 
 /* ---- CoreTelephony Model Object Builders ---- */
@@ -526,7 +620,7 @@ static NSString *sim_status_string(const struct cellular_state *st)
 		return @"kCTSIMSupportSIMStatusPUKLocked";
 	if (!strcmp(st->sim_state, "network_locked"))
 		return @"kCTSIMSupportSIMStatusNetworkLocked";
-	if (!strcmp(st->app_state, "ready"))
+	if (!strcmp(st->app_state, "ready") || !strcmp(st->app_state, "subscription_ready"))
 		return @"kCTSIMSupportSIMStatusReady";
 	return @"kCTSIMSupportSIMStatusInserted";
 }
@@ -1252,9 +1346,20 @@ static void trigger_qmi_radio_power(bool online);
 
 - (void)context:(id)ctx getCapability:(NSString *)cap completion:(void (^)(BOOL, NSDictionary *, NSError *))completion
 {
-	(void)ctx; (void)cap;
+	(void)ctx;
+	BOOL enabled = ([cap isEqualToString:@"kCTCapabilityPhoneServices"] ||
+			[cap isEqualToString:@"kCTCapabilityVoLTE"]);
+	NSDictionary *info = [cap isEqualToString:@"kCTCapabilityPhoneServices"] ? @{
+		@"kCTCapabilityAgent": @YES,
+		@"kCTCapabilityAgent2": @YES,
+		@"kCTCallManagementIsPhoneServicesActive": @YES,
+		@"kCTCallManagementPhoneServicesCSCallingAvailable": @YES,
+		@"kCTCallManagementPhoneServicesVoLTECallingAvailable": @YES,
+		@"kCTCallManagementEmergencyWifiAllowed": @NO,
+		@"kCTCallManagementEmergencyWifiCallCapable": @NO,
+	} : @{};
 	if (completion)
-		completion(NO, @{}, nil);
+		completion(enabled, info, nil);
 }
 
 - (void)getVoicemailInfo:(id)ctx completion:(void (^)(BOOL, NSNumber *, NSString *, NSError *))completion
@@ -1271,6 +1376,58 @@ static void trigger_qmi_radio_power(bool online);
 		completion(@"64.0", nil);
 }
 
+static id build_call_capabilities_obj(void)
+{
+	Class cls = NSClassFromString(@"CTCallCapabilities");
+	id caps = cls ? [[cls alloc] init] : nil;
+	ct_set(caps, @"isCSCallingAvailable", @YES);
+	ct_set(caps, @"isVoLTECallingAvailable", @YES);
+	ct_set(caps, @"isWiFiCallingAvailable", @NO);
+	ct_set(caps, @"isEmergencyCallingOnWifiAllowed", @NO);
+	ct_set(caps, @"isEmergencyCallingOnWifiAvailable", @NO);
+	ct_set(caps, @"isCarrierSupportsWiFiCallingOnOtherDevices", @NO);
+	return caps;
+}
+
+static NSDictionary *build_system_capabilities_dict(void)
+{
+	return @{
+		@"kCTCapabilityPhoneServices": @{
+			@"kCTCapabilityAgent": @YES,
+			@"kCTCapabilityAgent2": @YES,
+			@"kCTCallManagementIsPhoneServicesActive": @YES,
+			@"kCTCallManagementPhoneServicesCSCallingAvailable": @YES,
+			@"kCTCallManagementPhoneServicesVoLTECallingAvailable": @YES,
+			@"kCTCallManagementEmergencyWifiAllowed": @NO,
+			@"kCTCallManagementEmergencyWifiCallCapable": @NO,
+		},
+	};
+}
+
+static id resolve_carrier_bundle_val(const struct cellular_state *st, id keyHierarchy, id defaultVal)
+{
+	NSString *k = @"";
+	if ([keyHierarchy isKindOfClass:[NSArray class]] && [(NSArray *)keyHierarchy count] > 0)
+		k = [[(NSArray *)keyHierarchy lastObject] description];
+	else if ([keyHierarchy isKindOfClass:[NSString class]])
+		k = (NSString *)keyHierarchy;
+
+	id val = nil;
+	if ([k isEqualToString:@"CarrierName"] || [k isEqualToString:@"MVNOCarrierName"]) {
+		val = st->operator_name[0] ? [NSString stringWithUTF8String:st->operator_name] : @"Carrier";
+	} else if ([k isEqualToString:@"StatusBarImages"]) {
+		NSString *nm = st->operator_name[0] ? [NSString stringWithUTF8String:st->operator_name] : @"";
+		val = @[ @{ @"StatusBarCarrierName": nm, @"AllowPrefixMatching": @YES } ];
+	} else if ([k isEqualToString:@"Show3GSwitch"] || [k isEqualToString:@"LTEConnectionShows4G"]) {
+		val = @NO;
+	} else if ([k isEqualToString:@"Show4GSwitch"] || [k isEqualToString:@"AllowEDGEEditing"] ||
+		   [k isEqualToString:@"VoLTEEnabled"] || [k isEqualToString:@"SupportsCallsOverIMS"] ||
+		   [k isEqualToString:@"ShowCallForwarding"] || [k isEqualToString:@"ShowCallWaiting"]) {
+		val = @YES;
+	}
+	return val ? val : defaultVal;
+}
+
 - (void)copyCarrierBundleValue:(id)ctx key:(NSArray *)keyHierarchy
 		    bundleType:(id)btype completion:(void (^)(id, NSError *))completion
 {
@@ -1282,21 +1439,8 @@ static void trigger_qmi_radio_power(bool online);
 {
 	(void)ctx; (void)btype;
 	struct cellular_state st = snapshot_state();
-	NSString *k = ([keyHierarchy isKindOfClass:[NSArray class]] && keyHierarchy.count > 0)
-		      ? [keyHierarchy.lastObject description] : @"";
-	id val = nil;
-	if ([k isEqualToString:@"CarrierName"] || [k isEqualToString:@"MVNOCarrierName"]) {
-		val = st.operator_name[0] ? [NSString stringWithUTF8String:st.operator_name] : @"Carrier";
-	} else if ([k isEqualToString:@"StatusBarImages"]) {
-		NSString *nm = st.operator_name[0] ? [NSString stringWithUTF8String:st.operator_name] : @"";
-		val = @[ @{ @"StatusBarCarrierName": nm, @"AllowPrefixMatching": @YES } ];
-	} else if ([k isEqualToString:@"Show3GSwitch"] || [k isEqualToString:@"LTEConnectionShows4G"]) {
-		val = @NO;
-	} else if ([k isEqualToString:@"Show4GSwitch"] || [k isEqualToString:@"AllowEDGEEditing"]) {
-		val = @YES;
-	}
 	if (completion)
-		completion(val, nil);
+		completion(resolve_carrier_bundle_val(&st, keyHierarchy, nil), nil);
 }
 
 /* -- Unified CTXPCRequestMessage Dispatcher (sendRequest:completionHandler:) -- */
@@ -1383,7 +1527,8 @@ static void trigger_qmi_radio_power(bool online);
 			resp = rcls ? [(SweetCTObjResp *)[rcls alloc] initWithResult:@"P"] : nil;
 		} else if ([cname isEqualToString:@"CTXPCIsAnySimReadyRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCBooleanResponseMessage");
-			BOOL rdy = st.sim_present && !strcmp(st.app_state, "ready");
+			BOOL rdy = st.sim_present &&
+				   (!strcmp(st.app_state, "ready") || !strcmp(st.app_state, "subscription_ready"));
 			resp = rcls ? [(SweetCTBoolResp *)[rcls alloc] initWithResult:rdy] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetIsDataAttachedRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetIsDataAttachedResponse");
@@ -1514,7 +1659,18 @@ static void trigger_qmi_radio_power(bool online);
 			resp = rcls ? [(SweetCTEncResp *)[rcls alloc] initWithEncryptionStatusInfo:enc] : nil;
 		} else if ([cname isEqualToString:@"CTXPCGetRejectCauseCodeRequest"]) {
 			Class rcls = NSClassFromString(@"CTXPCGetRejectCauseCodeResponse");
-			resp = rcls ? [(SweetCTCauseResp *)[rcls alloc] initWithCauseCode:@(0)] : nil;
+			resp = rcls ? [(SweetCTCauseResp *)[rcls alloc] initWithCauseCode:@(st.last_reject_cause)] : nil;
+		} else if ([cname isEqualToString:@"CTXPCGetCallCapabilitiesRequest"]) {
+			id caps = build_call_capabilities_obj();
+			Class rcls = NSClassFromString(@"CTXPCGetCallCapabilitiesResponse");
+			if (rcls) {
+				if ([rcls instancesRespondToSelector:@selector(initWithCapabilities:)])
+					resp = [(SweetCTCallCapResp *)[rcls alloc] initWithCapabilities:caps];
+				else {
+					resp = [[rcls alloc] init];
+					ct_set(resp, @"capabilities", caps);
+				}
+			}
 		} else if ([cname isEqualToString:@"CTXPCSupportEmbeddedSimRequest"] ||
 			   [cname isEqualToString:@"CTXPCEmbeddedSIMOnlyConfigRequest"] ||
 			   [cname isEqualToString:@"CTXPCNeedToLaunchSetUpeSIMRequest"] ||
@@ -1645,9 +1801,185 @@ static void trigger_qmi_radio_power(bool online);
 	return nil;
 }
 
+static void invoke_ct_reply_block(id replyBlock, BOOL setterOnly,
+				  id objVal, BOOL boolVal, NSInteger intVal, NSError *errVal)
+{
+	if (!replyBlock || !fn_Block_signature)
+		return;
+	const char *bsig = fn_Block_signature((__bridge void *)replyBlock);
+	if (!bsig)
+		return;
+	NSMethodSignature *bms = [NSMethodSignature signatureWithObjCTypes:bsig];
+	if (!bms)
+		return;
+	NSInvocation *binv = [NSInvocation invocationWithMethodSignature:bms];
+	[binv setTarget:replyBlock];
+	uint8_t zero[64] = { 0 };
+	NSUInteger n = bms.numberOfArguments;
+	for (NSUInteger k = 1; k < n; k++) {
+		const char *pt = [bms getArgumentTypeAtIndex:k];
+		if (!pt) {
+			[binv setArgument:zero atIndex:(NSInteger)k];
+			continue;
+		}
+		bool isErrSlot = (strstr(pt, "NSError") != NULL) ||
+				 (setterOnly && n == 2 && pt[0] == '@') ||
+				 (n >= 3 && k == n - 1 && pt[0] == '@');
+		if (isErrSlot) {
+			__unsafe_unretained NSError *uerr = errVal;
+			[binv setArgument:&uerr atIndex:(NSInteger)k];
+		} else if (k == 1) {
+			if (pt[0] == '@') {
+				__unsafe_unretained id uobj = objVal;
+				[binv setArgument:&uobj atIndex:(NSInteger)k];
+			} else if (pt[0] == 'B') {
+				bool bv = boolVal ? true : false;
+				[binv setArgument:&bv atIndex:(NSInteger)k];
+			} else if (pt[0] == 'c' || pt[0] == 'C') {
+				signed char cv = boolVal ? 1 : 0;
+				[binv setArgument:&cv atIndex:(NSInteger)k];
+			} else if (pt[0] == 'i' || pt[0] == 'I') {
+				int iv = (int)intVal;
+				[binv setArgument:&iv atIndex:(NSInteger)k];
+			} else if (pt[0] == 'q' || pt[0] == 'Q') {
+				long long qv = (long long)intVal;
+				[binv setArgument:&qv atIndex:(NSInteger)k];
+			} else {
+				[binv setArgument:zero atIndex:(NSInteger)k];
+			}
+		} else {
+			[binv setArgument:zero atIndex:(NSInteger)k];
+		}
+	}
+	[binv invoke];
+}
+
+- (BOOL)handleDynamicCTSelector:(NSString *)sname invocation:(NSInvocation *)inv
+{
+	NSMethodSignature *sig = inv.methodSignature;
+	NSUInteger argc = sig.numberOfArguments;
+	__unsafe_unretained id replyBlock = nil;
+	if (argc >= 3) {
+		const char *lastType = [sig getArgumentTypeAtIndex:argc - 1];
+		if (lastType && strncmp(lastType, "@?", 2) == 0)
+			[inv getArgument:&replyBlock atIndex:(NSInteger)(argc - 1)];
+	}
+
+	struct cellular_state st = snapshot_state();
+
+	if ([sname isEqualToString:@"getCallCapabilities:completion:"] ||
+	    [sname isEqualToString:@"getCallCapabilities:"]) {
+		invoke_ct_reply_block(replyBlock, NO, build_call_capabilities_obj(), YES, 1, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"context:getSystemCapabilities:"] ||
+	    [sname isEqualToString:@"context:getSystemCapabilitiesWithCompletion:"] ||
+	    [sname isEqualToString:@"getSystemCapabilities:completion:"]) {
+		invoke_ct_reply_block(replyBlock, NO, build_system_capabilities_dict(), YES, 1, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"copyCarrierBundleValue:keyHierarchy:bundleType:completion:"] ||
+	    [sname isEqualToString:@"copyCarrierBundleValueWithDefault:keyHierarchy:bundleType:completion:"]) {
+		__unsafe_unretained id keyHier = nil;
+		__unsafe_unretained id defVal = nil;
+		if (argc > 3 && [sig getArgumentTypeAtIndex:3][0] == '@')
+			[inv getArgument:&keyHier atIndex:3];
+		if ([sname hasPrefix:@"copyCarrierBundleValueWithDefault:"] &&
+		    argc > 2 && [sig getArgumentTypeAtIndex:2][0] == '@') {
+			/* Note: arg2 is context on both; default value if present is nil-safe */
+			(void)defVal;
+		}
+		id val = resolve_carrier_bundle_val(&st, keyHier, nil);
+		invoke_ct_reply_block(replyBlock, NO, val, val != nil, 0, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"copyCarrierBookmarks:completion:"]) {
+		invoke_ct_reply_block(replyBlock, NO, @[], NO, 0, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"getPNRContext:completion:"]) {
+		Class pcls = NSClassFromString(@"CTPNRContextInfo");
+		id pnr = pcls ? [[pcls alloc] init] : nil;
+		ct_set(pnr, @"isReady", @NO);
+		NSString *plmn = (st.mcc[0] && st.mnc[0])
+				 ? [NSString stringWithFormat:@"%s%s", st.mcc, st.mnc] : @"";
+		ct_set(pnr, @"plmn", plmn);
+		invoke_ct_reply_block(replyBlock, NO, pnr, NO, 0, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"getSupports5G:completion:"]) {
+		invoke_ct_reply_block(replyBlock, NO, @NO, NO, 0, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"getInternationalDataAccess:completion:"] ||
+	    [sname isEqualToString:@"getInternationalDataAccessSync:completion:"]) {
+		invoke_ct_reply_block(replyBlock, NO, @YES, YES, 1, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"getConnectionState:connectionType:completion:"]) {
+		Class ccls = NSClassFromString(@"CTDataConnectionStatus");
+		id cs = ccls ? [[ccls alloc] init] : nil;
+		NSInteger stateInt = st.data_connected ? 2 : 0;
+		ct_set(cs, @"state", @(stateInt));
+		ct_set(cs, @"ipFamily", @(st.wds_ip_family));
+		ct_set(cs, @"interfaceName", st.data_connected ? @"pdp_ip0" : @"");
+		ct_set(cs, @"apnName", st.data_apn[0] ? [NSString stringWithUTF8String:st.data_apn] : @"");
+		invoke_ct_reply_block(replyBlock, NO, cs, st.data_connected, stateInt, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"getTetheringStatus:connectionType:"] ||
+	    [sname isEqualToString:@"getTetheringStatus:connectionType:completion:"] ||
+	    [sname isEqualToString:@"getTetheringStatus:completion:"]) {
+		Class tcls = NSClassFromString(@"CTTetheringStatus");
+		id ts = tcls ? [[tcls alloc] init] : nil;
+		ct_set(ts, @"carrierEnabled", @NO);
+		ct_set(ts, @"userAuthenticated", @NO);
+		ct_set(ts, @"misPdpMaxHosts", @0);
+		invoke_ct_reply_block(replyBlock, NO, ts, NO, 0, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"refreshCellMonitor:completion:"] ||
+	    [sname isEqualToString:@"setPacketContextActiveByServiceType:connectionType:active:completion:"] ||
+	    [sname isEqualToString:@"setAssertionForConnectionType:enable:completion:"]) {
+		invoke_ct_reply_block(replyBlock, YES, @YES, YES, 0, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"reliableNetworkFallback:completion:"]) {
+		Class rcls = NSClassFromString(@"CTReliableNetworkFallbackSettings");
+		id obj = rcls ? [[rcls alloc] init] : @NO;
+		if (rcls)
+			ct_set(obj, @"isEnabled", @NO);
+		invoke_ct_reply_block(replyBlock, NO, obj, NO, 0, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"privacyProxy:completion:"]) {
+		Class pcls = NSClassFromString(@"CTPrivacyProxyInfo");
+		id obj = pcls ? [[pcls alloc] init] : @{};
+		invoke_ct_reply_block(replyBlock, NO, obj, NO, 0, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"copyBundleIdentifier:bundleType:completion:"]) {
+		invoke_ct_reply_block(replyBlock, NO, @"com.apple.DefaultCarrier_bundle", YES, 0, nil);
+		return YES;
+	}
+	if ([sname isEqualToString:@"copyBundleVersion:bundleType:completion:"]) {
+		invoke_ct_reply_block(replyBlock, NO, @"64.0", YES, 0, nil);
+		return YES;
+	}
+	return NO;
+}
+
 - (void)forwardInvocation:(NSInvocation *)anInvocation
 {
 	NSString *sname = NSStringFromSelector(anInvocation.selector);
+	@try {
+		if ([self handleDynamicCTSelector:sname invocation:anInvocation])
+			return;
+	} @catch (id exc) {
+		clog("handleDynamicCTSelector exception (%s): %s",
+		     [sname UTF8String], [[exc description] UTF8String]);
+	}
+
 	os_unfair_lock_lock(&g_clients_lock);
 	BOOL first = ![g_logged_unhandled containsObject:sname];
 	if (first)
@@ -1662,33 +1994,13 @@ static void trigger_qmi_radio_power(bool online);
 		NSUInteger argc = sig.numberOfArguments;
 		if (argc >= 3) {
 			const char *lastType = [sig getArgumentTypeAtIndex:argc - 1];
-			if (lastType && strncmp(lastType, "@?", 2) == 0 && fn_Block_signature) {
+			if (lastType && strncmp(lastType, "@?", 2) == 0) {
 				__unsafe_unretained id replyBlock = nil;
 				[anInvocation getArgument:&replyBlock atIndex:(NSInteger)(argc - 1)];
-				if (replyBlock) {
-					const char *bsig = fn_Block_signature((__bridge void *)replyBlock);
-					if (bsig) {
-						NSMethodSignature *bms = [NSMethodSignature signatureWithObjCTypes:bsig];
-						NSInvocation *binv = [NSInvocation invocationWithMethodSignature:bms];
-						[binv setTarget:replyBlock];
-						NSError *err = [NSError errorWithDomain:NSPOSIXErrorDomain
-										   code:ENOTSUP
-									       userInfo:nil];
-						uint8_t zero[64] = { 0 };
-						for (NSUInteger k = 1; k < bms.numberOfArguments; k++) {
-							const char *pt = [bms getArgumentTypeAtIndex:k];
-							if (pt && (strstr(pt, "NSError") != NULL ||
-								   (k == bms.numberOfArguments - 1 &&
-								    pt[0] == '@' && bms.numberOfArguments >= 3))) {
-								__unsafe_unretained NSError *uerr = err;
-								[binv setArgument:&uerr atIndex:(NSInteger)k];
-							} else {
-								[binv setArgument:zero atIndex:(NSInteger)k];
-							}
-						}
-						[binv invoke];
-					}
-				}
+				NSError *err = [NSError errorWithDomain:NSPOSIXErrorDomain
+								   code:ENOTSUP
+							       userInfo:nil];
+				invoke_ct_reply_block(replyBlock, NO, nil, NO, 0, err);
 			}
 		}
 	} @catch (id exc) {
@@ -1727,6 +2039,24 @@ static void trigger_qmi_radio_power(bool online);
 		       forSelector:@selector(sendRequest:completionHandler:)
 		     argumentIndex:0
 			   ofReply:YES];
+		static const char * const extraReplySels[] = {
+			"copyCarrierBundleValue:keyHierarchy:bundleType:completion:",
+			"copyCarrierBundleValueWithDefault:keyHierarchy:bundleType:completion:",
+			"context:getSystemCapabilities:",
+			"context:getSystemCapabilitiesWithCompletion:",
+			"getCallCapabilities:completion:",
+		};
+		for (size_t si = 0; si < sizeof(extraReplySels) / sizeof(extraReplySels[0]); si++) {
+			SEL s = sel_registerName(extraReplySels[si]);
+			struct objc_method_description md = find_proto_method(expProto, s, [NSMutableSet set]);
+			if (md.types) {
+				@try {
+					[expIfc setClasses:allowed forSelector:s argumentIndex:0 ofReply:YES];
+				} @catch (id exc) {
+					(void)exc;
+				}
+			}
+		}
 
 		SweetXPCInterfaceSPI *remIfc = remProto ? [(id)ifcCls interfaceWithProtocol:remProto] : nil;
 
@@ -1841,6 +2171,55 @@ static void handle_legacy_xpc_dict(sweet_xpc_t peer, sweet_xpc_t msg)
 	fn_xpc_dict_set_bool(reply, "kAutoReadOutEnabled", false);
 	fn_xpc_dict_set_bool(reply, "kSmsCellBroadcastEnabled", false);
 
+	/* Populate kCTCopySystemCapabilities / kCTCapabilityPhoneServices */
+	if (fn_xpc_dict_create && fn_xpc_dict_set_value) {
+		sweet_xpc_t phone_caps = fn_xpc_dict_create(NULL, NULL, 0);
+		sweet_xpc_t sys_caps = fn_xpc_dict_create(NULL, NULL, 0);
+		if (phone_caps && sys_caps) {
+			fn_xpc_dict_set_bool(phone_caps, "kCTCapabilityAgent", true);
+			fn_xpc_dict_set_bool(phone_caps, "kCTCapabilityAgent2", true);
+			fn_xpc_dict_set_bool(phone_caps, "kCTCallManagementIsPhoneServicesActive", true);
+			fn_xpc_dict_set_bool(phone_caps, "kCTCallManagementPhoneServicesCSCallingAvailable", true);
+			fn_xpc_dict_set_bool(phone_caps, "kCTCallManagementPhoneServicesVoLTECallingAvailable", true);
+			fn_xpc_dict_set_bool(phone_caps, "kCTCallManagementEmergencyWifiAllowed", false);
+			fn_xpc_dict_set_bool(phone_caps, "kCTCallManagementEmergencyWifiCallCapable", false);
+			fn_xpc_dict_set_value(sys_caps, "kCTCapabilityPhoneServices", phone_caps);
+			fn_xpc_dict_set_value(reply, "kCTCapabilityPhoneServices", phone_caps);
+			fn_xpc_dict_set_value(reply, "kCTSystemCapabilities", sys_caps);
+			fn_xpc_dict_set_value(reply, "kCTCopySystemCapabilities", sys_caps);
+		}
+		if (phone_caps && fn_xpc_release)
+			fn_xpc_release(phone_caps);
+		if (sys_caps && fn_xpc_release)
+			fn_xpc_release(sys_caps);
+	}
+
+	/* Privacy-safe emergency number check in RAM ONLY (never log digits) */
+	if (fn_xpc_dict_get_string) {
+		static const char * const num_keys[] = {
+			"kCTEmergencyNumber", "kCTCallNumber", "PhoneNumber", "number", "kNumber"
+		};
+		const char *num = NULL;
+		for (size_t i = 0; i < sizeof(num_keys) / sizeof(num_keys[0]); i++) {
+			num = fn_xpc_dict_get_string(msg, num_keys[i]);
+			if (num && num[0])
+				break;
+		}
+		const char *req_cmd = fn_xpc_dict_get_string(msg, "request");
+		if (!req_cmd)
+			req_cmd = fn_xpc_dict_get_string(msg, "kRequest");
+		bool is_emerg_req = (num != NULL) ||
+				    (req_cmd && strstr(req_cmd, "Emergency") != NULL) ||
+				    (fn_xpc_dict_get_value &&
+				     fn_xpc_dict_get_value(msg, "kCTCopyIsEmergencyNumber") != NULL);
+		if (is_emerg_req) {
+			bool em = is_emergency_cstr(num);
+			fn_xpc_dict_set_bool(reply, "kCTIsEmergencyNumber", em);
+			fn_xpc_dict_set_bool(reply, "isEmergencyNumber", em);
+			fn_xpc_dict_set_bool(reply, "kIsEmergencyNumber", em);
+		}
+	}
+
 	fn_xpc_conn_send(peer, reply);
 	if (fn_xpc_release)
 		fn_xpc_release(reply);
@@ -1909,28 +2288,616 @@ static uint64_t cell_mono_ms(void)
 static uint32_t core_srv_mask(const struct qmi_ctx *ctx)
 {
 	uint32_t m = 0;
-	if (qmi_has_service(ctx, QMI_SVC_DMS)) m |= QMI_IND_MASK_DMS;
-	if (qmi_has_service(ctx, QMI_SVC_UIM)) m |= QMI_IND_MASK_UIM;
-	if (qmi_has_service(ctx, QMI_SVC_NAS)) m |= QMI_IND_MASK_NAS;
-	if (qmi_has_service(ctx, QMI_SVC_WDS)) m |= QMI_IND_MASK_WDS;
+	if (qmi_has_service(ctx, QMI_SVC_DMS))   m |= QMI_IND_MASK_DMS;
+	if (qmi_has_service(ctx, QMI_SVC_UIM))   m |= QMI_IND_MASK_UIM;
+	if (qmi_has_service(ctx, QMI_SVC_NAS))   m |= QMI_IND_MASK_NAS;
+	if (qmi_has_service(ctx, QMI_SVC_WDS))   m |= QMI_IND_MASK_WDS;
+	if (qmi_has_service(ctx, QMI_SVC_VOICE)) m |= QMI_IND_MASK_VOICE;
 	return m;
 }
 
 static void try_connect_and_sync(void);
+static void commit_and_publish(const struct cellular_state *next, bool force_broadcast);
+
+/* ---- CallKit CXXPCProvider + Voice Call Bridge + Local CLI Control Socket ---- */
+
+@interface SweetTrackedCall : NSObject
+@property (nonatomic, strong) NSUUID *uuid;
+@property (nonatomic, assign) uint8_t callId;
+@property (nonatomic, assign) uint8_t lastState;
+@property (nonatomic, assign) BOOL outgoing;
+@property (nonatomic, assign) BOOL reportedConnecting;
+@property (nonatomic, assign) BOOL reportedConnected;
+@property (nonatomic, assign) BOOL reportedIncoming;
+@property (nonatomic, assign) BOOL reportedRemoteHandle;
+@end
+
+@implementation SweetTrackedCall
+@end
+
+@interface SweetCXProviderDelegate : NSObject
+@end
+
+static SweetCXProviderSPI *g_cx_provider;
+static SweetCXProviderDelegate *g_cx_delegate;
+static NSMutableArray<SweetTrackedCall *> *g_tracked_calls;
+static dispatch_source_t g_ctrl_sock_src;
+static int g_ctrl_listen_fd = -1;
+
+static SweetTrackedCall *find_tracked_by_uuid(NSUUID *uuid)
+{
+	if (!uuid)
+		return nil;
+	for (SweetTrackedCall *tc in g_tracked_calls) {
+		if ([tc.uuid isEqual:uuid])
+			return tc;
+	}
+	return nil;
+}
+
+static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
+{
+	if (!cid)
+		return nil;
+	for (SweetTrackedCall *tc in g_tracked_calls) {
+		if (tc.callId == cid)
+			return tc;
+	}
+	return nil;
+}
+
+@implementation SweetCXProviderDelegate
+
+- (void)providerDidReset:(id)provider
+{
+	(void)provider;
+	clog("CallKit providerDidReset (tracked=%lu)", (unsigned long)g_tracked_calls.count);
+	if (g_tracked_calls.count > 0 && g_qmi.fd >= 0)
+		(void)qmi_voice_manage(&g_qmi, 0x08u, 0);
+	[g_tracked_calls removeAllObjects];
+	sweet_voice_write_shm(0, 0, 0);
+}
+
+- (void)providerDidBegin:(id)provider
+{
+	(void)provider;
+	clog("CallKit providerDidBegin");
+}
+
+- (void)provider:(SweetCXProviderSPI *)provider performStartCallAction:(SweetCXActionSPI *)action
+{
+	NSUUID *uuid = [action callUUID];
+	id handle = ct_get(action, @"handle");
+	NSString *numStr = [ct_get(handle, @"value") isKindOfClass:[NSString class]]
+			   ? (NSString *)ct_get(handle, @"value") : @"";
+	BOOL actEmerg = [ct_get(action, @"isEmergency") respondsToSelector:@selector(boolValue)]
+			? [ct_get(action, @"isEmergency") boolValue] : NO;
+
+	char numBuf[64];
+	wipe_ram(numBuf, sizeof(numBuf));
+	if (numStr.length > 0)
+		snprintf(numBuf, sizeof(numBuf), "%s", [numStr UTF8String]);
+	bool isEmerg = actEmerg || is_emergency_cstr(numBuf);
+
+	clog("CallKit performStartCallAction uuid=%s num_len=%lu emergency=%d",
+	     [[uuid UUIDString] UTF8String], (unsigned long)numStr.length, isEmerg ? 1 : 0);
+
+	SweetTrackedCall *tc = [[SweetTrackedCall alloc] init];
+	tc.uuid = uuid;
+	tc.callId = 0;
+	tc.lastState = QMI_VOICE_CALL_STATE_ORIGINATING;
+	tc.outgoing = YES;
+	[g_tracked_calls addObject:tc];
+
+	uint8_t cid = 0;
+	int rc = qmi_voice_dial(&g_qmi, numBuf, isEmerg, &cid);
+	wipe_ram(numBuf, sizeof(numBuf));
+	if (rc < 0) {
+		clog("CallKit startCall qmi_voice_dial failed rc=%d", rc);
+		[g_tracked_calls removeObjectIdenticalTo:tc];
+		[action fail];
+		return;
+	}
+	if (cid != 0 && tc.callId == 0)
+		tc.callId = cid;
+	if (!tc.reportedConnecting) {
+		tc.reportedConnecting = YES;
+		[provider reportOutgoingCallWithUUID:uuid startedConnectingAtDate:[NSDate date]];
+	}
+	if (tc.lastState == QMI_VOICE_CALL_STATE_CONVERSATION && !tc.reportedConnected) {
+		tc.reportedConnected = YES;
+		[provider reportOutgoingCallWithUUID:uuid connectedAtDate:[NSDate date]];
+	}
+	[action fulfill];
+}
+
+- (void)provider:(SweetCXProviderSPI *)provider performAnswerCallAction:(SweetCXActionSPI *)action
+{
+	(void)provider;
+	NSUUID *uuid = [action callUUID];
+	SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+	uint8_t cid = tc ? tc.callId : 0;
+	int rc = qmi_voice_answer(&g_qmi, cid);
+	clog("CallKit performAnswerCallAction uuid=%s call_id=%u -> rc=%d",
+	     [[uuid UUIDString] UTF8String], cid, rc);
+	if (rc == 0 || g_qmi.voice_call_count > 0)
+		[action fulfill];
+	else
+		[action fail];
+}
+
+- (void)provider:(SweetCXProviderSPI *)provider performEndCallAction:(SweetCXActionSPI *)action
+{
+	(void)provider;
+	NSUUID *uuid = [action callUUID];
+	SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+	uint8_t cid = tc ? tc.callId : 0;
+	int rc = (cid != 0) ? qmi_voice_end(&g_qmi, cid) : qmi_voice_manage(&g_qmi, 0x08u, 0);
+	clog("CallKit performEndCallAction uuid=%s call_id=%u -> rc=%d",
+	     [[uuid UUIDString] UTF8String], cid, rc);
+	if (tc)
+		[g_tracked_calls removeObjectIdenticalTo:tc];
+	if (g_tracked_calls.count == 0)
+		sweet_voice_write_shm(0, QMI_VOICE_CALL_STATE_END, 0);
+	[action fulfill];
+}
+
+- (void)provider:(SweetCXProviderSPI *)provider performSetHeldCallAction:(SweetCXActionSPI *)action
+{
+	(void)provider;
+	NSUUID *uuid = [action callUUID];
+	SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+	uint8_t cid = tc ? tc.callId : 0;
+	BOOL onHold = [ct_get(action, @"isOnHold") respondsToSelector:@selector(boolValue)]
+		      ? [ct_get(action, @"isOnHold") boolValue] : NO;
+	int rc = qmi_voice_manage(&g_qmi, 0x03u, cid);
+	clog("CallKit performSetHeldCallAction call_id=%u hold=%d -> rc=%d", cid, onHold ? 1 : 0, rc);
+	[action fulfill];
+}
+
+- (void)provider:(SweetCXProviderSPI *)provider performSetMutedCallAction:(SweetCXActionSPI *)action
+{
+	(void)provider;
+	BOOL muted = [ct_get(action, @"isMuted") respondsToSelector:@selector(boolValue)]
+		     ? [ct_get(action, @"isMuted") boolValue] : NO;
+	clog("CallKit performSetMutedCallAction muted=%d", muted ? 1 : 0);
+	[action fulfill];
+}
+
+- (void)provider:(SweetCXProviderSPI *)provider performPlayDTMFCallAction:(SweetCXActionSPI *)action
+{
+	(void)provider;
+	NSUUID *uuid = [action callUUID];
+	SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+	uint8_t cid = tc ? tc.callId : 0;
+	NSString *digits = [ct_get(action, @"digits") isKindOfClass:[NSString class]]
+			   ? (NSString *)ct_get(action, @"digits") : @"";
+	NSInteger dtype = [ct_get(action, @"type") respondsToSelector:@selector(integerValue)]
+			  ? [ct_get(action, @"type") integerValue] : 1;
+	clog("CallKit performPlayDTMFCallAction call_id=%u digits_len=%lu type=%ld",
+	     cid, (unsigned long)digits.length, (long)dtype);
+	for (NSUInteger i = 0; i < digits.length; i++) {
+		unichar uc = [digits characterAtIndex:i];
+		if (uc < 0x7f) {
+			(void)qmi_voice_dtmf(&g_qmi, cid, (char)uc, true);
+			usleep(100000);
+			(void)qmi_voice_dtmf(&g_qmi, cid, (char)uc, false);
+		}
+	}
+	[action fulfill];
+}
+
+- (void)provider:(SweetCXProviderSPI *)provider didActivateAudioSession:(id)audioSession
+{
+	(void)provider; (void)audioSession;
+	clog("CallKit didActivateAudioSession");
+}
+
+- (void)provider:(SweetCXProviderSPI *)provider didDeactivateAudioSession:(id)audioSession
+{
+	(void)provider; (void)audioSession;
+	clog("CallKit didDeactivateAudioSession");
+}
+
+@end
+
+static id build_cx_call_update(const struct qmi_voice_call *c)
+{
+	Class clsUpd = NSClassFromString(@"CXCallUpdate");
+	Class clsHnd = NSClassFromString(@"CXHandle");
+	if (!clsUpd)
+		return nil;
+	id upd = [[clsUpd alloc] init];
+	if (c->number[0] && clsHnd) {
+		NSString *numStr = [NSString stringWithUTF8String:c->number];
+		if (numStr.length > 0) {
+			id h = [(SweetCXHandleSPI *)[clsHnd alloc] initWithType:2 value:numStr];
+			ct_set(upd, @"remoteHandle", h);
+		}
+	}
+	ct_set(upd, @"hasVideo", @NO);
+	ct_set(upd, @"supportsHolding", @YES);
+	ct_set(upd, @"supportsDTMF", @YES);
+	ct_set(upd, @"usingBaseband", @YES);
+	ct_set(upd, @"localizedCallerName", nil);
+	return upd;
+}
+
+static void on_qmi_voice_calls_changed(struct qmi_ctx *ctx, const struct qmi_voice_call *calls,
+				       size_t count, void *user)
+{
+	(void)ctx; (void)user;
+	if (!g_tracked_calls)
+		g_tracked_calls = [NSMutableArray array];
+
+	NSMutableSet<NSNumber *> *seenIds = [NSMutableSet set];
+	for (size_t i = 0; i < count; i++) {
+		const struct qmi_voice_call *c = &calls[i];
+		if (!c->present || c->call_id == 0)
+			continue;
+
+		SweetTrackedCall *tc = find_tracked_by_id(c->call_id);
+		if (!tc && c->direction == 0x01) {
+			/* Bind pending CallKit/CLI MO call whose QMI call_id just arrived */
+			for (SweetTrackedCall *cand in g_tracked_calls) {
+				if (cand.callId == 0 && cand.outgoing) {
+					cand.callId = c->call_id;
+					tc = cand;
+					break;
+				}
+			}
+		}
+
+		if (c->state == QMI_VOICE_CALL_STATE_END) {
+			clog("voice call_id=%u -> END (end_reason=%u)", c->call_id, c->end_reason);
+			if (tc) {
+				/* CXCallEndedReasonRemoteEnded = 2, CXCallEndedReasonFailed = 1 */
+				NSInteger cxReason = (tc.reportedConnected || c->end_reason == 0 ||
+						      c->end_reason == 16 || c->end_reason == 27 ||
+						      c->end_reason == 102 || c->end_reason == 143) ? 2 : 1;
+				if (g_cx_provider)
+					[g_cx_provider reportCallWithUUID:tc.uuid
+							      endedAtDate:[NSDate date]
+							      endedReason:cxReason];
+				[g_tracked_calls removeObjectIdenticalTo:tc];
+			}
+			continue;
+		}
+
+		[seenIds addObject:@(c->call_id)];
+
+		if (!tc) {
+			tc = [[SweetTrackedCall alloc] init];
+			tc.uuid = [NSUUID UUID];
+			tc.callId = c->call_id;
+			tc.lastState = c->state;
+			tc.outgoing = (c->direction == 0x01);
+			[g_tracked_calls addObject:tc];
+
+			clog("voice new call_id=%u dir=%s state=%s mode=%u num_len=%zu",
+			     c->call_id, tc.outgoing ? "MO" : "MT",
+			     qmi_voice_state_str(c->state), c->mode, strlen(c->number));
+
+			if (!tc.outgoing &&
+			    (c->state == QMI_VOICE_CALL_STATE_INCOMING ||
+			     c->state == QMI_VOICE_CALL_STATE_WAITING ||
+			     c->state == QMI_VOICE_CALL_STATE_SETUP)) {
+				tc.reportedIncoming = YES;
+				tc.reportedRemoteHandle = (c->number[0] != '\0');
+				if (g_cx_provider) {
+					id upd = build_cx_call_update(c);
+					NSUUID *u = tc.uuid;
+					[g_cx_provider reportNewIncomingCallWithUUID:u
+									      update:upd
+									  completion:^(NSError *err) {
+						if (err)
+							clog("CallKit reportNewIncomingCall err: %s",
+							     [[err description] UTF8String]);
+						else
+							clog("CallKit reportNewIncomingCall accepted uuid=%s",
+							     [[u UUIDString] UTF8String]);
+					}];
+				}
+			}
+		} else if (tc.lastState != c->state) {
+			clog("voice call_id=%u state %s -> %s (mode=%u, num_len=%zu)",
+			     c->call_id, qmi_voice_state_str(tc.lastState),
+			     qmi_voice_state_str(c->state), c->mode, strlen(c->number));
+			tc.lastState = c->state;
+		}
+
+		if (!tc.outgoing && tc.reportedIncoming && !tc.reportedRemoteHandle && c->number[0]) {
+			tc.reportedRemoteHandle = YES;
+			if (g_cx_provider && [g_cx_provider respondsToSelector:@selector(reportCallWithUUID:updated:)]) {
+				id upd = build_cx_call_update(c);
+				if (upd)
+					[g_cx_provider reportCallWithUUID:tc.uuid updated:upd];
+			}
+		}
+
+		if (tc.outgoing && g_cx_provider) {
+			if (!tc.reportedConnecting &&
+			    (c->state == QMI_VOICE_CALL_STATE_ORIGINATING ||
+			     c->state == QMI_VOICE_CALL_STATE_ALERTING ||
+			     c->state == QMI_VOICE_CALL_STATE_PRE_ALERTING)) {
+				tc.reportedConnecting = YES;
+				[g_cx_provider reportOutgoingCallWithUUID:tc.uuid
+						  startedConnectingAtDate:[NSDate date]];
+			}
+			if (!tc.reportedConnected && c->state == QMI_VOICE_CALL_STATE_CONVERSATION) {
+				if (!tc.reportedConnecting) {
+					tc.reportedConnecting = YES;
+					[g_cx_provider reportOutgoingCallWithUUID:tc.uuid
+							  startedConnectingAtDate:[NSDate date]];
+				}
+				tc.reportedConnected = YES;
+				[g_cx_provider reportOutgoingCallWithUUID:tc.uuid
+							  connectedAtDate:[NSDate date]];
+			}
+		}
+	}
+
+	/* Reconcile any tracked calls that vanished from GET_ALL_CALL_INFO / ALL_CALL_STATUS_IND */
+	for (NSInteger idx = (NSInteger)g_tracked_calls.count - 1; idx >= 0; idx--) {
+		SweetTrackedCall *tc = g_tracked_calls[(NSUInteger)idx];
+		if (tc.callId != 0 && ![seenIds containsObject:@(tc.callId)]) {
+			clog("voice call_id=%u disappeared from active list -> reporting ended", tc.callId);
+			if (g_cx_provider)
+				[g_cx_provider reportCallWithUUID:tc.uuid
+						      endedAtDate:[NSDate date]
+						      endedReason:(tc.reportedConnected ? 2 : 1)];
+			[g_tracked_calls removeObjectAtIndex:(NSUInteger)idx];
+		}
+	}
+}
+
+static void init_callkit_provider(void)
+{
+	g_tracked_calls = [NSMutableArray array];
+	void *ck = dlopen("/System/Library/Frameworks/CallKit.framework/CallKit", RTLD_NOW);
+	if (!ck) {
+		clog("CallKit.framework dlopen failed: %s", dlerror());
+		return;
+	}
+	Protocol *delProto = objc_getProtocol("CXProviderDelegate");
+	if (delProto)
+		(void)class_addProtocol([SweetCXProviderDelegate class], delProto);
+	Protocol *privDelProto = objc_getProtocol("CXProviderDelegatePrivate");
+	if (privDelProto)
+		(void)class_addProtocol([SweetCXProviderDelegate class], privDelProto);
+
+	Class clsXPCProv = NSClassFromString(@"CXXPCProvider");
+	Class clsProv    = NSClassFromString(@"CXProvider");
+	Class clsCfg     = NSClassFromString(@"CXProviderConfiguration");
+	Class clsSender  = NSClassFromString(@"CXSenderIdentity");
+	Class clsHandle  = NSClassFromString(@"CXHandle");
+	if (!clsCfg || (!clsXPCProv && !clsProv)) {
+		clog("CallKit provider classes unavailable");
+		return;
+	}
+
+	@try {
+		SweetCXProviderConfigSPI *cfg = nil;
+		if ([clsCfg instancesRespondToSelector:@selector(initWithLocalizedName:)])
+			cfg = [(SweetCXProviderConfigSPI *)[clsCfg alloc] initWithLocalizedName:@"Phone"];
+		else
+			cfg = [[clsCfg alloc] init];
+		if ([cfg respondsToSelector:@selector(setLocalizedName:)])
+			[cfg setLocalizedName:@"Phone"];
+		if ([cfg respondsToSelector:@selector(setSupportedHandleTypes:)])
+			[cfg setSupportedHandleTypes:[NSSet setWithObject:@2]];
+		if ([cfg respondsToSelector:@selector(setSupportsAudioOnly:)])
+			[cfg setSupportsAudioOnly:YES];
+		if ([cfg respondsToSelector:@selector(setSupportsVideo:)])
+			[cfg setSupportsVideo:NO];
+		if ([cfg respondsToSelector:@selector(setSupportsEmergency:)])
+			[cfg setSupportsEmergency:YES];
+		if ([cfg respondsToSelector:@selector(setSupportsVoicemail:)])
+			[cfg setSupportsVoicemail:YES];
+		if ([cfg respondsToSelector:@selector(setSupportsCurrentPlatform:)])
+			[cfg setSupportsCurrentPlatform:YES];
+		if ([cfg respondsToSelector:@selector(setSupportsRinging:)])
+			[cfg setSupportsRinging:YES];
+		if ([cfg respondsToSelector:@selector(setSupportsDynamicSystemUI:)])
+			[cfg setSupportsDynamicSystemUI:YES];
+		if ([cfg respondsToSelector:@selector(setIncludesCallsInRecents:)])
+			[cfg setIncludesCallsInRecents:YES];
+		if ([cfg respondsToSelector:@selector(setMaximumCallGroups:)])
+			[cfg setMaximumCallGroups:2];
+		if ([cfg respondsToSelector:@selector(setMaximumCallsPerCallGroup:)])
+			[cfg setMaximumCallsPerCallGroup:5];
+
+		if (clsSender && clsHandle) {
+			id senderH = [(SweetCXHandleSPI *)[clsHandle alloc] initWithType:1 value:@"Primary"];
+			id sender = nil;
+			if ([clsSender instancesRespondToSelector:@selector(initWithUUID:handle:localizedName:)]) {
+				sender = [(SweetCXSenderIdentitySPI *)[clsSender alloc]
+					  initWithUUID:slot1_uuid() handle:senderH localizedName:@"Primary"];
+			}
+			if (sender) {
+				if ([cfg respondsToSelector:@selector(setOrderedSenderIdentities:)])
+					[cfg setOrderedSenderIdentities:[NSOrderedSet orderedSetWithObject:sender]];
+				else if ([cfg respondsToSelector:@selector(setSenderIdentities:)])
+					[cfg setSenderIdentities:[NSSet setWithObject:sender]];
+			}
+		}
+
+		Class chosenCls = clsXPCProv ? clsXPCProv : clsProv;
+		SweetCXProviderSPI *prov = [(SweetCXProviderSPI *)[chosenCls alloc] initWithConfiguration:cfg];
+		if (!prov && clsXPCProv && clsProv) {
+			chosenCls = clsProv;
+			prov = [(SweetCXProviderSPI *)[clsProv alloc] initWithConfiguration:cfg];
+		}
+		if (!prov) {
+			clog("failed to instantiate CallKit provider");
+			return;
+		}
+		g_cx_delegate = [[SweetCXProviderDelegate alloc] init];
+		[prov setDelegate:g_cx_delegate queue:g_qmi_queue];
+		g_cx_provider = prov;
+		clog("initialized CallKit %s (delegate on g_qmi_queue)", class_getName(chosenCls));
+	} @catch (id exc) {
+		clog("init_callkit_provider exception: %s", [[exc description] UTF8String]);
+	}
+}
+
+static void handle_ctrl_client_on_qmi_queue(int cfd)
+{
+	char req[160];
+	char rsp[4096];
+	wipe_ram(req, sizeof(req));
+	ssize_t nr = recv(cfd, req, sizeof(req) - 1, 0);
+	if (nr <= 0) {
+		wipe_ram(req, sizeof(req));
+		close(cfd);
+		return;
+	}
+	req[nr] = '\0';
+	req[strcspn(req, "\r\n")] = '\0';
+
+	int rlen = 0;
+	if (!strncmp(req, "DIAL ", 5)) {
+		int emerg = atoi(req + 5);
+		const char *sp = strchr(req + 5, ' ');
+		const char *num = sp ? sp + 1 : "";
+		uint8_t cid = 0;
+		int rc = qmi_voice_dial(&g_qmi, num, emerg != 0 || is_emergency_cstr(num), &cid);
+		size_t nlen = strlen(num);
+		wipe_ram(req, sizeof(req));
+		clog("ctrl DIAL (len=%zu, emerg=%d) -> rc=%d call_id=%u", nlen, emerg, rc, cid);
+		struct cellular_state cur = snapshot_state();
+		if (rc == 0) {
+			cur.active_calls = (uint32_t)g_qmi.voice_call_count;
+			snprintf(cur.last_call_state, sizeof(cur.last_call_state), "originating");
+			commit_and_publish(&cur, false);
+		}
+		rlen = snprintf(rsp, sizeof(rsp),
+				"{\"ok\": %s, \"action\": \"dial\", \"call_id\": %u, \"rc\": %d}\n",
+				rc == 0 ? "true" : "false", cid, rc);
+	} else if (!strncmp(req, "ANSWER", 6)) {
+		uint8_t cid = (req[6] == ' ') ? (uint8_t)atoi(req + 7) : 0;
+		int rc = qmi_voice_answer(&g_qmi, cid);
+		clog("ctrl ANSWER (call_id=%u) -> rc=%d", cid, rc);
+		rlen = snprintf(rsp, sizeof(rsp),
+				"{\"ok\": %s, \"action\": \"answer\", \"call_id\": %u, \"rc\": %d}\n",
+				rc == 0 ? "true" : "false", cid, rc);
+	} else if (!strncmp(req, "HANGUP", 6)) {
+		uint8_t cid = (req[6] == ' ') ? (uint8_t)atoi(req + 7) : 0;
+		int rc = qmi_voice_end(&g_qmi, cid);
+		if (rc == 0 && cid == 0)
+			sweet_voice_write_shm(0, QMI_VOICE_CALL_STATE_END, 0);
+		clog("ctrl HANGUP (call_id=%u) -> rc=%d", cid, rc);
+		rlen = snprintf(rsp, sizeof(rsp),
+				"{\"ok\": %s, \"action\": \"hangup\", \"call_id\": %u, \"rc\": %d}\n",
+				rc == 0 ? "true" : "false", cid, rc);
+	} else if (!strcmp(req, "CALLS")) {
+		struct cellular_state cur = snapshot_state();
+		(void)qmi_voice_query_calls(&g_qmi, &cur);
+		commit_and_publish(&cur, false);
+		char items[2048];
+		size_t io = 0;
+		items[0] = '\0';
+		for (size_t i = 0; i < g_qmi.voice_call_count; i++) {
+			const struct qmi_voice_call *c = &g_qmi.voice_calls[i];
+			if (!c->present)
+				continue;
+			int w = snprintf(items + io, sizeof(items) - io,
+					 "%s{\"call_id\": %u, \"state\": \"%s\", \"direction\": \"%s\", "
+					 "\"mode\": %u, \"call_type\": %u, \"is_mpty\": %s, "
+					 "\"number_present\": %s, \"number_len\": %zu}",
+					 io ? ", " : "",
+					 c->call_id,
+					 qmi_voice_state_str(c->state),
+					 c->direction == 1 ? "mo" : (c->direction == 2 ? "mt" : "unknown"),
+					 c->mode,
+					 c->call_type,
+					 c->is_mpty ? "true" : "false",
+					 c->number[0] ? "true" : "false",
+					 strlen(c->number));
+			if (w < 0 || (size_t)w >= sizeof(items) - io)
+				break;
+			io += (size_t)w;
+		}
+		rlen = snprintf(rsp, sizeof(rsp),
+			"{\n"
+			"  \"ok\": true,\n"
+			"  \"voice_svc_ready\": %s,\n"
+			"  \"active_calls\": %u,\n"
+			"  \"last_call_state\": \"%s\",\n"
+			"  \"last_call_end_reason\": %u,\n"
+			"  \"calls\": [%s]\n"
+			"}\n",
+			cur.voice_svc_ready ? "true" : "false",
+			cur.active_calls,
+			cur.last_call_state[0] ? cur.last_call_state : "idle",
+			cur.last_call_end_reason,
+			items);
+	} else {
+		rlen = snprintf(rsp, sizeof(rsp), "{\"ok\": false, \"error\": \"unknown_cmd\"}\n");
+	}
+	wipe_ram(req, sizeof(req));
+	if (rlen > 0)
+		(void)send(cfd, rsp, (size_t)rlen, 0);
+	close(cfd);
+}
+
+static void start_ctrl_socket(void)
+{
+	(void)unlink(SWEET_CELLULARD_CTRL_SOCK);
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return;
+	struct sockaddr_un sun;
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_family = AF_UNIX;
+	snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", SWEET_CELLULARD_CTRL_SOCK);
+#ifdef __APPLE__
+	sun.sun_len = (uint8_t)sizeof(sun);
+#endif
+	if (bind(fd, (struct sockaddr *)&sun, sizeof(sun)) < 0 || listen(fd, 4) < 0) {
+		close(fd);
+		return;
+	}
+	(void)chmod(SWEET_CELLULARD_CTRL_SOCK, 0600);
+	int fl = fcntl(fd, F_GETFL, 0);
+	if (fl >= 0)
+		(void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+	g_ctrl_listen_fd = fd;
+	g_ctrl_sock_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, g_qmi_queue);
+	dispatch_source_set_event_handler(g_ctrl_sock_src, ^{
+		for (;;) {
+			int cfd = accept(g_ctrl_listen_fd, NULL, NULL);
+			if (cfd < 0)
+				break;
+#ifdef SO_NOSIGPIPE
+			int one = 1;
+			(void)setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+			struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+			(void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+			handle_ctrl_client_on_qmi_queue(cfd);
+		}
+	});
+	dispatch_resume(g_ctrl_sock_src);
+	clog("listening on %s (0600)", SWEET_CELLULARD_CTRL_SOCK);
+}
 
 static void commit_and_publish(const struct cellular_state *next, bool force_broadcast)
 {
 	os_unfair_lock_lock(&g_state_lock);
 	bool prev_sim = g_state.sim_present;
-	char prev_sim_st[32], prev_op[64], prev_reg[32], prev_rat[16];
+	char prev_sim_st[32], prev_op[64], prev_reg[32], prev_rat[16], prev_call_st[24];
 	int prev_bars = g_state.bars_0_to_4;
 	bool prev_ps = g_state.ps_attached;
 	bool prev_data = g_state.data_connected;
 	uint8_t prev_dms = g_state.dms_mode_raw;
+	uint16_t prev_rej = g_state.last_reject_cause;
+	uint32_t prev_calls = g_state.active_calls;
 	snprintf(prev_sim_st, sizeof(prev_sim_st), "%s", g_state.sim_state);
 	snprintf(prev_op, sizeof(prev_op), "%s", g_state.operator_name);
 	snprintf(prev_reg, sizeof(prev_reg), "%s", g_state.reg_state);
 	snprintf(prev_rat, sizeof(prev_rat), "%s", g_state.rat);
+	snprintf(prev_call_st, sizeof(prev_call_st), "%s", g_state.last_call_state);
 	g_state = *next;
 	os_unfair_lock_unlock(&g_state_lock);
 
@@ -1940,6 +2907,9 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 			   (strcmp(prev_sim_st, next->sim_state) != 0);
 	bool any_changed = sim_changed ||
 			   (prev_dms != next->dms_mode_raw) ||
+			   (prev_rej != next->last_reject_cause) ||
+			   (prev_calls != next->active_calls) ||
+			   (strcmp(prev_call_st, next->last_call_state) != 0) ||
 			   (prev_bars != next->bars_0_to_4) ||
 			   (prev_ps != next->ps_attached) ||
 			   (prev_data != next->data_connected) ||
@@ -1948,13 +2918,16 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 			   (strcmp(prev_rat, next->rat) != 0);
 
 	if (any_changed) {
-		clog("state: sim=%s(slot %d,%s) mode=%s(%u,off=0x%04x,hw=%d) reg=%s rat=%s plmn=%s-%s op='%s' rsrp=%d bars=%d/4 ps=%d data=%d",
+		clog("state: imei=%d sim=%s(slot %d,%s) mode=%s(%u,off=0x%04x,hw=%d) reg=%s(rej=%u) rat=%s plmn=%s-%s op='%s' rsrp=%d bars=%d/4 voice=%d(calls=%u,%s) ps=%d data=%d",
+		     next->imei_present ? 1 : 0,
 		     next->sim_present ? "yes" : "no",
 		     next->sim_slot, next->app_state, next->radio_mode, next->dms_mode_raw,
 		     next->dms_offline_reason, next->dms_hw_restricted ? 1 : 0,
-		     next->reg_state, next->rat, next->mcc, next->mnc,
+		     next->reg_state, next->last_reject_cause, next->rat, next->mcc, next->mnc,
 		     next->operator_name, next->has_rsrp ? next->rsrp_dbm : 0,
-		     next->bars_0_to_4, next->ps_attached ? 1 : 0,
+		     next->bars_0_to_4, next->voice_svc_ready ? 1 : 0,
+		     next->active_calls, next->last_call_state,
+		     next->ps_attached ? 1 : 0,
 		     next->data_connected ? 1 : 0);
 		publish_system_status(next);
 		broadcast_ct_notifications(next, sim_changed);
@@ -2040,6 +3013,7 @@ static void try_connect_and_sync(void)
 	bool just_connected = false;
 	if (g_qmi.fd < 0) {
 		g_qmi.ind_cb = on_qmi_indication;
+		g_qmi.on_voice_calls_changed = on_qmi_voice_calls_changed;
 		if (qmi_open(&g_qmi, SWEET_QRTR_SOCK) < 0)
 			return;
 		just_connected = true;
@@ -2202,8 +3176,12 @@ int main(int argc, char **argv)
 								  DISPATCH_QUEUE_SERIAL);
 		start_legacy_commcenter_xpc(legacy_q);
 
-		/* 4. Start QMI/QRTR connection & 5-second backup poll loop */
+		/* 4. Start QMI/QRTR queue, CallKit CXXPCProvider, CLI control socket & poll loop */
 		g_qmi_queue = dispatch_queue_create("org.iosonpixel.cellulard.qmi", DISPATCH_QUEUE_SERIAL);
+		g_qmi.on_voice_calls_changed = on_qmi_voice_calls_changed;
+		sweet_voice_write_shm(0, 0, 0);
+		init_callkit_provider();
+		start_ctrl_socket();
 		dispatch_async(g_qmi_queue, ^{
 			try_connect_and_sync();
 		});

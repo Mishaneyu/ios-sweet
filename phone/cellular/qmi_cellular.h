@@ -36,12 +36,13 @@ extern "C" {
 #define QMI_FLG_RSP	0x02u
 #define QMI_FLG_IND	0x04u
 
-/* QMI DMS message IDs (NOTE: serial/IMEI/MSISDN messages intentionally excluded) */
-#define QMI_DMS_SET_EVENT_REPORT	0x0001u
-#define QMI_DMS_EVENT_REPORT_IND	0x0001u
-#define QMI_DMS_GET_DEVICE_REV_ID	0x0023u
-#define QMI_DMS_GET_OPERATING_MODE	0x002du
-#define QMI_DMS_SET_OPERATING_MODE	0x002eu
+/* QMI DMS message IDs (0x0025 inspected in RAM only for imei_present boolean; never stored/logged) */
+#define QMI_DMS_SET_EVENT_REPORT		0x0001u
+#define QMI_DMS_EVENT_REPORT_IND		0x0001u
+#define QMI_DMS_GET_DEVICE_REV_ID		0x0023u
+#define QMI_DMS_GET_DEVICE_SERIAL_NUMBERS	0x0025u
+#define QMI_DMS_GET_OPERATING_MODE		0x002du
+#define QMI_DMS_SET_OPERATING_MODE		0x002eu
 
 /* QMI UIM message IDs (NOTE: ICCID/IMSI/MSISDN EF IDs never read) */
 #define QMI_UIM_READ_TRANSPARENT		0x0020u
@@ -51,18 +52,58 @@ extern "C" {
 #define QMI_UIM_CHANGE_PROVISIONING_SESSION	0x0038u
 
 /* QMI NAS message IDs */
-#define QMI_NAS_INDICATION_REGISTER	0x0003u
-#define QMI_NAS_GET_SIGNAL_STRENGTH	0x0020u
-#define QMI_NAS_GET_SERVING_SYSTEM	0x0024u
-#define QMI_NAS_SERVING_SYSTEM_IND	0x0024u
-#define QMI_NAS_GET_HOME_NETWORK	0x0025u
-#define QMI_NAS_GET_OPERATOR_NAME	0x0039u
-#define QMI_NAS_OPERATOR_NAME_IND	0x003au
-#define QMI_NAS_GET_SYS_INFO		0x004du
-#define QMI_NAS_SYS_INFO_IND		0x004eu
-#define QMI_NAS_GET_SIG_INFO		0x004fu
-#define QMI_NAS_CONFIG_SIG_INFO		0x0050u
-#define QMI_NAS_SIG_INFO_IND		0x0051u
+#define QMI_NAS_INDICATION_REGISTER		0x0003u
+#define QMI_NAS_GET_SIGNAL_STRENGTH		0x0020u
+#define QMI_NAS_INITIATE_NETWORK_REGISTER	0x0022u
+#define QMI_NAS_GET_SERVING_SYSTEM		0x0024u
+#define QMI_NAS_SERVING_SYSTEM_IND		0x0024u
+#define QMI_NAS_GET_HOME_NETWORK		0x0025u
+#define QMI_NAS_SET_SYSTEM_SELECTION_PREFERENCE	0x0033u
+#define QMI_NAS_GET_OPERATOR_NAME		0x0039u
+#define QMI_NAS_OPERATOR_NAME_IND		0x003au
+#define QMI_NAS_GET_SYS_INFO			0x004du
+#define QMI_NAS_SYS_INFO_IND			0x004eu
+#define QMI_NAS_GET_SIG_INFO			0x004fu
+#define QMI_NAS_CONFIG_SIG_INFO			0x0050u
+#define QMI_NAS_SIG_INFO_IND			0x0051u
+#define QMI_NAS_NETWORK_REJECT_IND		0x0068u
+
+/* QMI VOICE (0x09) message IDs */
+#define QMI_VOICE_INDICATION_REGISTER		0x0003u
+#define QMI_VOICE_DIAL_CALL			0x0020u
+#define QMI_VOICE_END_CALL			0x0021u
+#define QMI_VOICE_ANSWER_CALL			0x0022u
+#define QMI_VOICE_BURST_DTMF			0x0028u
+#define QMI_VOICE_START_CONT_DTMF		0x0029u
+#define QMI_VOICE_STOP_CONT_DTMF		0x002au
+#define QMI_VOICE_ALL_CALL_STATUS_IND		0x002eu
+#define QMI_VOICE_GET_ALL_CALL_INFO		0x002fu
+#define QMI_VOICE_MANAGE_CALLS			0x0031u
+
+/* QMI VOICE call states */
+#define QMI_VOICE_CALL_STATE_ORIGINATING	0x01u
+#define QMI_VOICE_CALL_STATE_INCOMING		0x02u
+#define QMI_VOICE_CALL_STATE_CONVERSATION	0x03u
+#define QMI_VOICE_CALL_STATE_CC_IN_PROGRESS	0x04u
+#define QMI_VOICE_CALL_STATE_ALERTING		0x05u
+#define QMI_VOICE_CALL_STATE_HOLD		0x06u
+#define QMI_VOICE_CALL_STATE_WAITING		0x07u
+#define QMI_VOICE_CALL_STATE_DISCONNECTING	0x08u
+#define QMI_VOICE_CALL_STATE_END		0x09u
+#define QMI_VOICE_CALL_STATE_SETUP		0x0au
+#define QMI_VOICE_CALL_STATE_PRE_ALERTING	0x0bu
+
+/* Shared ADSP voice call state flag (/tmp/sweet-voice-call.state, mode 0666) */
+#define SWEET_VOICE_CALL_STATE_PATH		"/tmp/sweet-voice-call.state"
+#define SWEET_VOICE_CALL_STATE_MAGIC		0x53575643u /* 'SWVC' */
+#define SWEET_CELLULARD_CTRL_SOCK		"/var/run/sweet-cellulard.sock"
+
+struct sweet_voice_call_shm {
+	uint32_t magic;
+	uint32_t active;
+	uint32_t call_state;
+	uint32_t call_mode;
+};
 
 /* QMI WDA / DPM / WDS message IDs (Stage 7B packet data foundation) */
 #define QMI_WDA_SET_DATA_FORMAT		0x0020u
@@ -98,6 +139,7 @@ struct cellular_state {
 	int      puk1_retries;
 	bool     gw_provisioned;
 
+	bool     imei_present;		/* RAM-only validation of DMS 0x0025 TLV 0x11; never stores digits */
 	uint8_t  dms_mode_raw;
 	char     radio_mode[32];	/* "online", "low_power", "offline", ... */
 	bool     has_dms_offline_reason;
@@ -107,6 +149,8 @@ struct cellular_state {
 
 	uint8_t  reg_state_raw;		/* 0=not_reg, 1=registered, 2=searching, 3=denied, 4=unknown */
 	char     reg_state[32];
+	uint16_t last_reject_cause;	/* QMI_NAS_NETWORK_REJECT_IND (0x0068) TLV 0x03 */
+	uint8_t  last_reject_domain;	/* QMI_NAS_NETWORK_REJECT_IND (0x0068) TLV 0x02 */
 	bool     roaming;
 	bool     cs_attached;
 	bool     ps_attached;
@@ -145,18 +189,47 @@ struct cellular_state {
 	char     data_dns2[64];
 	uint32_t data_mtu;
 
+	/* Redacted QMI_SVC_VOICE (0x09) summary (NO phone numbers ever stored here) */
+	bool     voice_svc_ready;
+	uint32_t active_calls;
+	char     last_call_state[24];
+	uint16_t last_call_end_reason;
+
 	uint32_t servers_count;
 	uint32_t servers_list[QMI_MAX_SERVERS];
 };
 
+#define QMI_MAX_VOICE_CALLS	8
+
+/* RAM-only call entry for CallKit UI; wiped on disconnect, never logged or serialized */
+struct qmi_voice_call {
+	bool     present;
+	uint8_t  call_id;
+	uint8_t  state;
+	uint8_t  call_type;
+	uint8_t  direction;	/* 1=MO, 2=MT */
+	uint8_t  mode;		/* 2=GSM, 3=UMTS, 4=LTE */
+	uint8_t  is_mpty;
+	uint8_t  als;
+	uint8_t  num_pi;
+	uint16_t end_reason;
+	char     number[40];
+};
+
 struct qmi_ctx;
+#define qmi_cellular qmi_ctx
+
 typedef void (*qmi_ind_fn)(struct qmi_ctx *ctx, uint32_t service, uint16_t msg_id,
 			   const uint8_t *tlvs, size_t tlv_len, void *user);
+typedef void (*on_voice_calls_changed_fn)(struct qmi_ctx *ctx,
+					  const struct qmi_voice_call *calls,
+					  size_t count, void *user);
 
 #define QMI_IND_MASK_DMS	(1u << 0)
 #define QMI_IND_MASK_UIM	(1u << 1)
 #define QMI_IND_MASK_NAS	(1u << 2)
 #define QMI_IND_MASK_WDS	(1u << 3)
+#define QMI_IND_MASK_VOICE	(1u << 4)
 
 struct qmi_ctx {
 	int                  fd;
@@ -166,7 +239,15 @@ struct qmi_ctx {
 	uint8_t              rx_buf[sizeof(struct sweet_qrtr_msg) + SWEET_QRTR_MAX_DATA];
 	qmi_ind_fn           ind_cb;
 	void                *ind_user;
+	on_voice_calls_changed_fn on_voice_calls_changed;
+	void                *voice_user;
+	struct qmi_voice_call voice_calls[QMI_MAX_VOICE_CALLS];
+	size_t               voice_call_count;
 	bool                 provision_attempted;
+	bool                 imei_checked;
+	bool                 nas_pref_configured;
+	bool                 nas_auto_reg_attempted;
+	bool                 voice_initial_queried;
 	uint32_t             ind_reg_mask;
 };
 
@@ -206,6 +287,16 @@ const char *qmi_resolve_fallback_apn(const struct cellular_state *st);
 int  qmi_wds_test_session(struct qmi_ctx *ctx, struct cellular_state *st,
 			  const char *apn, bool keep_up);
 int  qmi_wds_stop_session(struct qmi_ctx *ctx, struct cellular_state *st);
+
+/* QMI_SVC_VOICE (0x09) call control & state */
+const char *qmi_voice_state_str(uint8_t state);
+int  qmi_voice_query_calls(struct qmi_cellular *qc, struct cellular_state *st);
+int  qmi_voice_dial(struct qmi_cellular *qc, const char *number, bool emergency, uint8_t *out_call_id);
+int  qmi_voice_answer(struct qmi_cellular *qc, uint8_t call_id);
+int  qmi_voice_end(struct qmi_cellular *qc, uint8_t call_id);
+int  qmi_voice_manage(struct qmi_cellular *qc, uint8_t sups_type, uint8_t call_id);
+int  qmi_voice_dtmf(struct qmi_cellular *qc, uint8_t call_id, char digit, bool start);
+void sweet_voice_write_shm(uint32_t active, uint32_t call_state, uint32_t call_mode);
 
 /* Redacted JSON serializer */
 int  cellular_state_format_json(const struct cellular_state *st, char *buf, size_t cap);

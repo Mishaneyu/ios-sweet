@@ -19,37 +19,37 @@ typedef gzFile (*fn_gzopen_t)(const char *, const char *);
 typedef int (*fn_gzread_t)(gzFile, void *, unsigned int);
 typedef int (*fn_gzclose_t)(gzFile);
 
-static void
-unpack_gz_if_needed(const char *gz_path, const char *dst_path, off_t expected_size)
+static int
+unpack_gz_impl(const char *gz_path, const char *dst_path, off_t expected_size, int force)
 {
 	struct stat st;
-	if (stat(dst_path, &st) == 0 && st.st_size == expected_size) {
-		return;
+	if (!force && stat(dst_path, &st) == 0 && st.st_size == expected_size) {
+		return 0;
 	}
 	if (stat(gz_path, &st) != 0) {
-		return;
+		return 0;
 	}
 	void *zlib = dlopen("/usr/lib/libz.1.dylib", RTLD_NOW);
 	if (!zlib) {
-		return;
+		return 0;
 	}
 	fn_gzopen_t p_gzopen = (fn_gzopen_t)dlsym(zlib, "gzopen");
 	fn_gzread_t p_gzread = (fn_gzread_t)dlsym(zlib, "gzread");
 	fn_gzclose_t p_gzclose = (fn_gzclose_t)dlsym(zlib, "gzclose");
 	if (!p_gzopen || !p_gzread || !p_gzclose) {
-		return;
+		return 0;
 	}
 
 	char tmp_path[256];
 	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dst_path);
 	gzFile gz = p_gzopen(gz_path, "rb");
 	if (!gz) {
-		return;
+		return 0;
 	}
 	int ofd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (ofd < 0) {
 		p_gzclose(gz);
-		return;
+		return 0;
 	}
 	static uint8_t buf[65536];
 	off_t total = 0;
@@ -72,10 +72,41 @@ unpack_gz_if_needed(const char *gz_path, const char *dst_path, off_t expected_si
 	close(ofd);
 	p_gzclose(gz);
 	if (total == expected_size) {
-		rename(tmp_path, dst_path);
-		unlink(gz_path);
-	} else {
-		unlink(tmp_path);
+		if (rename(tmp_path, dst_path) == 0) {
+			unlink(gz_path);
+			return 1;
+		}
+	}
+	unlink(tmp_path);
+	return 0;
+}
+
+static void
+unpack_gz_if_needed(const char *gz_path, const char *dst_path, off_t expected_size)
+{
+	(void)unpack_gz_impl(gz_path, dst_path, expected_size, 0);
+}
+
+static int
+unpack_gz_force_once(const char *gz_path, const char *dst_path, off_t expected_size)
+{
+	return unpack_gz_impl(gz_path, dst_path, expected_size, 1);
+}
+
+static void
+purge_legacy_rmtfs_buffer(const char *buf_file)
+{
+	FILE *f = fopen(buf_file, "r");
+	if (!f) {
+		return;
+	}
+	long long fb = 0;
+	unsigned long long fpa = 0;
+	unsigned fver = 0;
+	int n = fscanf(f, "%lld %llx %u", &fb, &fpa, &fver);
+	fclose(f);
+	if (n != 3 || fver < 3u) {
+		unlink(buf_file);
 	}
 }
 
@@ -142,8 +173,26 @@ main(int argc, char **argv, char **envp)
 	unpack_gz_if_needed("/private/var/local/fw/rmtfs/oppodycnvbk.img.gz",
 	    "/private/var/local/fw/rmtfs/oppodycnvbk.img", 10485760);
 
-	const char *stamp = "/private/var/local/.wave5-caches-purged-v3";
+	const char *efs_stamp = "/private/var/local/fw/rmtfs/.wave6-efs-restored-v1";
+	const char *rmtfs_buf = "/private/var/local/fw/rmtfs/.buffer";
 	struct stat st;
+	if (stat(efs_stamp, &st) != 0) {
+		purge_legacy_rmtfs_buffer(rmtfs_buf);
+		int r1 = unpack_gz_force_once("/private/var/local/fw/rmtfs/modemst1.img.gz",
+		    "/private/var/local/fw/rmtfs/modemst1.img", 2097152);
+		int r2 = unpack_gz_force_once("/private/var/local/fw/rmtfs/modemst2.img.gz",
+		    "/private/var/local/fw/rmtfs/modemst2.img", 2097152);
+		if (r1 || r2) {
+			unlink(rmtfs_buf);
+			int efd = open(efs_stamp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (efd >= 0) {
+				(void)write(efd, "ok\n", 3);
+				close(efd);
+			}
+		}
+	}
+
+	const char *stamp = "/private/var/local/.wave5-caches-purged-v3";
 	if (stat(stamp, &st) != 0) {
 		purge_stale_caches_once();
 		int fd = open(stamp, O_WRONLY | O_CREAT | O_TRUNC, 0644);

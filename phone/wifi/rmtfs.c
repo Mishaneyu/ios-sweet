@@ -20,7 +20,10 @@
 #include "scm.h"
 
 #define RMTFS_DIR	"/var/local/fw/rmtfs"
-#define BUF_SIZE	0x200000u
+#define BUF_EFS_SIZE	0x200000u
+#define BUF_OEM_SIZE	0x100000u
+#define BUF_TOTAL_SIZE	(BUF_EFS_SIZE + BUF_OEM_SIZE)
+#define BUF_VERSION	3u
 #define SECTOR		512
 
 enum { RMTFS_OPEN = 1, RMTFS_CLOSE, RMTFS_RW_IOVEC, RMTFS_ALLOC_BUFF, RMTFS_GET_DEV_ERROR, RMTFS_FORCE_SYNC_IND };
@@ -76,8 +79,9 @@ int rmtfs_prepare(void)
 	if (buf_pa)
 		return 0;
 	/*
-	 * One buffer per phone boot, kept across modem restarts: a fresh 2 MB hyp_assign after
-	 * every restart (the old ones never handed back) ends with an SMC that never returns.
+	 * One 3 MB buffer per phone boot (2 MB EFS for callers 1..4 + 1 MB OEM NV backup for
+	 * callers 5..7), kept across modem restarts: a fresh hyp_assign after every restart
+	 * (the old ones never handed back) ends with an SMC that never returns.
 	 */
 	struct timeval bt;
 	size_t btl = sizeof(bt);
@@ -85,26 +89,43 @@ int rmtfs_prepare(void)
 	FILE *f = fopen(RMTFS_DIR "/.buffer", "r");
 	long long fb = 0;
 	unsigned long long fpa = 0;
+	unsigned fver = 0;
 	if (f) {
-		if (fscanf(f, "%lld %llx", &fb, &fpa) != 2)
+		if (fscanf(f, "%lld %llx %u", &fb, &fpa, &fver) != 3 || fver != BUF_VERSION)
 			fpa = 0;
 		fclose(f);
 	}
 	if (fpa && fb == (long long)bt.tv_sec) {
 		buf_pa = fpa;
-		printf("rmtfs: buffer %llx from this boot's first run\n", (unsigned long long)buf_pa);
+		printf("rmtfs: buffer %llx (v%u, %x bytes) from this boot's first run\n",
+		       (unsigned long long)buf_pa, fver, BUF_TOTAL_SIZE);
 	} else {
-		uint64_t a = pm_alloc(BUF_SIZE + 0x2000, 0x1000);
+		uint64_t a = pm_alloc(BUF_TOTAL_SIZE + 0x2000, 0x1000);
 		if (!a)
 			return -1;
 		buf_pa = a + 0x1000;
 		static const uint32_t src[] = { VMID_HLOS }, dst[] = { VMID_HLOS, VMID_MSS_MSA };
-		if (hyp_assign(buf_pa, BUF_SIZE, src, 1, dst, 2))
+		if (hyp_assign(buf_pa, BUF_TOTAL_SIZE, src, 1, dst, 2))
 			return -1;
 		if ((f = fopen(RMTFS_DIR "/.buffer", "w"))) {
-			fprintf(f, "%lld %llx\n", (long long)bt.tv_sec, (unsigned long long)buf_pa);
+			fprintf(f, "%lld %llx %u\n", (long long)bt.tv_sec,
+			        (unsigned long long)buf_pa, BUF_VERSION);
 			fclose(f);
 		}
+	}
+	return 0;
+}
+
+static int caller_window(uint32_t caller, uint64_t *out_base, uint32_t *out_max)
+{
+	if (caller < 1 || caller > NPARTS || !buf_pa)
+		return -1;
+	if (caller <= 4) {
+		*out_base = buf_pa;
+		*out_max = BUF_EFS_SIZE;
+	} else {
+		*out_base = buf_pa + BUF_EFS_SIZE;
+		*out_max = BUF_OEM_SIZE;
 	}
 	return 0;
 }
@@ -115,7 +136,8 @@ int rmtfs_init(void)
 		return -1;
 	if (qrtr_new_server(RMTFS_SERVICE, 1, 0, RMTFS_PORT))
 		return -1;
-	printf("rmtfs: serving at %u:%x, buffer %llx\n", QRTR_NODE_APPS, RMTFS_PORT, (unsigned long long)buf_pa);
+	printf("rmtfs: serving at %u:%x, buffer %llx (efs=%x oem=%x)\n",
+	       QRTR_NODE_APPS, RMTFS_PORT, (unsigned long long)buf_pa, BUF_EFS_SIZE, BUF_OEM_SIZE);
 	return 0;
 }
 
@@ -126,7 +148,9 @@ static void reply(const struct qrtr_hdr *h, struct qmi_buf *q)
 
 static int iovec(uint32_t caller, uint8_t dir, const uint8_t *v, uint16_t len)
 {
-	if (caller < 1 || caller > NPARTS)
+	uint64_t cbase = 0;
+	uint32_t cmax = 0;
+	if (caller_window(caller, &cbase, &cmax))
 		return -1;
 	unsigned idx = caller - 1;
 	int fd = fds[idx];
@@ -136,15 +160,16 @@ static int iovec(uint32_t caller, uint8_t dir, const uint8_t *v, uint16_t len)
 	if (len < hdr)
 		return -1;
 	unsigned n = (len - hdr) / 12;
-	static uint8_t tmp[BUF_SIZE];
+	static uint8_t tmp[BUF_EFS_SIZE];
 	for (unsigned i = 0; i < n; i++) {
 		uint32_t e[3];
 		memcpy(e, v + hdr + 12 * i, 12);
 		uint64_t off = (uint64_t)e[0] * SECTOR, bytes = (uint64_t)e[2] * SECTOR;
-		/* phys_offset: an address in the buffer (rmtfs_mem_ptr), or an offset into it */
-		uint64_t pa = e[1] >= (uint32_t)buf_pa ? (buf_pa & ~0xffffffffull) + e[1] : buf_pa + e[1];
-		if (pa < buf_pa || pa + bytes > buf_pa + BUF_SIZE || bytes > sizeof(tmp)) {
-			printf("rmtfs: iovec out of the buffer (%x %x %x)\n", e[0], e[1], e[2]);
+		/* phys_offset: an address in this caller's window, or a relative offset into it */
+		uint64_t pa = e[1] >= (uint32_t)cbase ? (cbase & ~0xffffffffull) + e[1] : cbase + e[1];
+		if (bytes > cmax || bytes > sizeof(tmp) || pa < cbase || pa + bytes > cbase + cmax) {
+			printf("rmtfs: iovec out of caller %u window (%x %x %x, base %llx max %x)\n",
+			       caller, e[0], e[1], e[2], (unsigned long long)cbase, cmax);
 			return -1;
 		}
 		if (dir == 0) {
@@ -206,11 +231,15 @@ void rmtfs_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		break;
 	case RMTFS_ALLOC_BUFF: {
 		uint32_t size = 0;
+		uint64_t cbase = 0;
+		uint32_t cmax = 0;
 		qmi_get_u32(&m, 2, &size);
-		printf("rmtfs: alloc %u bytes for %u -> %llx\n", size, caller, (unsigned long long)buf_pa);
-		if (size <= BUF_SIZE) {
+		int ok = (caller_window(caller, &cbase, &cmax) == 0 && size <= cmax);
+		printf("rmtfs: alloc %u bytes for caller %u -> %llx (max %x)%s\n",
+		       size, caller, (unsigned long long)cbase, cmax, ok ? "" : " REJECTED");
+		if (ok) {
 			qmi_tlv_result(&q, 0, 0);
-			qmi_tlv_u64(&q, 0x10, buf_pa);
+			qmi_tlv_u64(&q, 0x10, cbase);
 		} else {
 			qmi_tlv_result(&q, 1, 3);
 		}

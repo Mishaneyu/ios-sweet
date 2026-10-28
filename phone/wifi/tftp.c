@@ -6,6 +6,7 @@
  * ACK).
  */
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,9 +16,9 @@
 #include "link.h"
 #include "tftp.h"
 
-#define RO_PREFIX	"/readonly/firmware/image/"
-#define RW_PREFIX	"/readwrite/"
+#define FW_BASE_DIR	"/var/local/fw"
 #define FW_DIR		"/var/local/fw/modem"
+#define TFTP_DIR	"/var/local/fw/tftp"
 #define RW_DIR		"/var/local/fw/rw"
 
 enum { OP_RRQ = 1, OP_WRQ, OP_DATA, OP_ACK, OP_ERROR, OP_OACK };
@@ -36,6 +37,8 @@ int tftp_verbose = 0;
 
 void tftp_prepare(void)
 {
+	mkdir(FW_BASE_DIR, 0755);
+	mkdir(TFTP_DIR, 0755);
 	mkdir(RW_DIR, 0755);
 }
 
@@ -100,36 +103,152 @@ static void send_window(int i, uint32_t acked)
 		send_block(i, acked + 1 + k);
 }
 
+static const char *resolve_rel_path(const char *path, int *out_writable)
+{
+	static const struct {
+		const char *match;
+		size_t strip_len;
+		int writable;
+	} prefixes[] = {
+		{ "/readonly/firmware/image/",            25, 0 },
+		{ "/readonly/vendor/firmware_mnt/image/", 36, 0 },
+		{ "/readonly/vendor/firmware/",           26, 0 },
+		{ "/readonly/firmware/modem_pr/",         19, 0 }, /* keep modem_pr/... */
+		{ "/readonly/modem_pr/",                  10, 0 }, /* keep modem_pr/... */
+		{ "/readonly/",                           10, 0 },
+		{ "/readwrite/",                          11, 1 },
+		{ "/shared/",                              8, 1 },
+		{ "/hlos/",                                6, 1 },
+	};
+
+	if (!path || !*path || strstr(path, ".."))
+		return NULL;
+
+	const char *rel = NULL;
+	int writable = 0;
+	for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+		size_t mlen = strlen(prefixes[i].match);
+		if (!strncmp(path, prefixes[i].match, mlen)) {
+			rel = path + prefixes[i].strip_len;
+			writable = prefixes[i].writable;
+			break;
+		}
+	}
+	if (!rel) {
+		if (path[0] == '/')
+			return NULL;
+		rel = path;
+		writable = 0;
+	}
+	while (*rel == '/')
+		rel++;
+	if (!*rel || strstr(rel, "//"))
+		return NULL;
+	size_t rlen = strlen(rel);
+	if (rel[rlen - 1] == '/')
+		return NULL;
+	if (out_writable)
+		*out_writable = writable;
+	return rel;
+}
+
+static int try_open_ro(const char *dir, const char *sub)
+{
+	char p[512];
+	int n = snprintf(p, sizeof(p), "%s/%s", dir, sub);
+	if (n <= 0 || (size_t)n >= sizeof(p))
+		return -1;
+	int fd = open(p, O_RDONLY);
+	if (fd >= 0)
+		return fd;
+	size_t dlen = strlen(dir) + 1;
+	for (char *c = p + dlen; *c; c++)
+		*c = (char)tolower((unsigned char)*c);
+	return open(p, O_RDONLY);
+}
+
+static int mkdirs_for_file(char *fullpath, size_t prefix_len)
+{
+	for (char *s = fullpath + prefix_len; *s; s++) {
+		if (*s == '/') {
+			*s = '\0';
+			if (mkdir(fullpath, 0755) < 0 && errno != EEXIST) {
+				*s = '/';
+				return -1;
+			}
+			*s = '/';
+		}
+	}
+	return 0;
+}
+
+static int unlink_path(const char *path)
+{
+	int writable = 0;
+	const char *rel = resolve_rel_path(path, &writable);
+	if (!rel || !writable)
+		return -1;
+	char p[512];
+	int n = snprintf(p, sizeof(p), TFTP_DIR "/%s", rel);
+	if (n <= 0 || (size_t)n >= sizeof(p))
+		return -1;
+	if (unlink(p) == 0 || errno == ENOENT)
+		return 0;
+	return -1;
+}
+
 static int open_path(const char *path, int write)
 {
-	char p[256];
-	if (!strncmp(path, RO_PREFIX, strlen(RO_PREFIX))) {
-		const char *rest = path + strlen(RO_PREFIX);
-		const char *base = strrchr(rest, '/');
-		snprintf(p, sizeof(p), FW_DIR "/%s", base ? base + 1 : rest);
-		for (char *c = p + strlen(FW_DIR) + 1; *c; c++)
-			*c = (char)tolower((unsigned char)*c);
-		return write ? -1 : open(p, O_RDONLY);
+	int writable = 0;
+	const char *rel = resolve_rel_path(path, &writable);
+	if (!rel)
+		return -1;
+
+	if (write) {
+		if (!writable)
+			return -1;
+		char p[512];
+		int n = snprintf(p, sizeof(p), TFTP_DIR "/%s", rel);
+		if (n <= 0 || (size_t)n >= sizeof(p))
+			return -1;
+		mkdir(TFTP_DIR, 0755);
+		if (mkdirs_for_file(p, strlen(TFTP_DIR) + 1) < 0)
+			return -1;
+		return open(p, O_RDWR | O_CREAT | O_TRUNC, 0644);
 	}
-	if (!strncmp(path, RW_PREFIX, strlen(RW_PREFIX))) {
-		snprintf(p, sizeof(p), RW_DIR "/%s", path + strlen(RW_PREFIX));
-		for (char *c = p + strlen(RW_DIR) + 1; *c; c++)
-			if (*c == '/')
-				*c = '_';
-		return write ? open(p, O_RDWR | O_CREAT | O_TRUNC, 0644) : open(p, O_RDONLY);
+
+	int fd = try_open_ro(FW_DIR, rel);
+	if (fd >= 0)
+		return fd;
+	fd = try_open_ro(TFTP_DIR, rel);
+	if (fd >= 0)
+		return fd;
+
+	const char *base = strrchr(rel, '/');
+	if (base && base[1]) {
+		fd = try_open_ro(FW_DIR, base + 1);
+		if (fd >= 0)
+			return fd;
+		fd = try_open_ro(TFTP_DIR, base + 1);
+		if (fd >= 0)
+			return fd;
 	}
 	return -1;
 }
 
 static void request(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n, int write)
 {
-	char buf[512];
+	char buf[1024];
 	if (n > sizeof(buf) - 1)
 		n = sizeof(buf) - 1;
 	memcpy(buf, d, n);
 	buf[n] = 0;
 	const char *file = buf + 2, *end = buf + n;
 	const char *mode = file + strlen(file) + 1;
+	if (mode >= end) {
+		send_error(TFTP_PORT, h->src_node, h->src_port, 4, "bad request");
+		return;
+	}
 	int i;
 	for (i = 0; i < TFTP_XFERS && xf[i].used; i++)
 		;
@@ -139,22 +258,41 @@ static void request(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n, int 
 	}
 	struct xfer *x = &xf[i];
 	memset(x, 0, sizeof(*x));
+	x->fd = -1;
 	x->node = h->src_node;
 	x->port = h->src_port;
 	x->blksize = 512;
 	x->wsize = 1;
 	x->write = write;
+
+	const char *opts_start = mode + strlen(mode) + 1;
+	int is_unlink = 0;
+	for (const char *scan = opts_start; scan < end && *scan; ) {
+		const char * val_s = scan + strlen(scan) + 1;
+		if (val_s >= end)
+			break;
+		if (!strcmp(scan, "unlink"))
+			is_unlink = 1;
+		scan = val_s + strlen(val_s) + 1;
+	}
+
 	uint8_t oack[512];
 	size_t on = 2;
 	put16(oack, OP_OACK);
 	int nopts = 0;
 	char tsize_s[24] = "";
-	const char *o = mode < end ? mode + strlen(mode) + 1 : end;
-	x->fd = open_path(file, write);
-	struct stat st;
-	if (x->fd >= 0 && !fstat(x->fd, &st))
-		x->size = (uint64_t)st.st_size;
-	printf("tftp: %s \"%s\" (%s)%s", write ? "write" : "read", file, mode, x->fd < 0 ? " -> not found" : "");
+	const char *o = opts_start < end ? opts_start : end;
+	int unlink_rc = 0;
+	if (is_unlink) {
+		unlink_rc = unlink_path(file);
+		printf("tftp: unlink \"%s\" (%s)%s", file, mode, unlink_rc < 0 ? " -> failed" : "");
+	} else {
+		x->fd = open_path(file, write);
+		struct stat st;
+		if (x->fd >= 0 && !fstat(x->fd, &st))
+			x->size = (uint64_t)st.st_size;
+		printf("tftp: %s \"%s\" (%s)%s", write ? "write" : "read", file, mode, x->fd < 0 ? " -> not found" : "");
+	}
 	while (o < end && *o) {
 		const char *k = o, *v = o + strlen(o) + 1;
 		if (v >= end)
@@ -180,7 +318,7 @@ static void request(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n, int 
 			x->rsize = val;
 		else if (!strcmp(k, "seek"))
 			x->seek = val;
-		else if (!strcmp(k, "tsize")) {
+		else if (!strcmp(k, "tsize") && !write) {
 			snprintf(tsize_s, sizeof(tsize_s), "%llu", (unsigned long long)x->size);
 			echo = tsize_s;
 		}
@@ -194,6 +332,13 @@ static void request(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n, int 
 		o = v + strlen(v) + 1;
 	}
 	printf("\n");
+	if (is_unlink) {
+		if (unlink_rc < 0)
+			send_error(TFTP_PORT, h->src_node, h->src_port, 2, "access violation");
+		else
+			send_pkt(i, oack, (uint32_t)on);
+		return;
+	}
 	if (x->fd < 0) {
 		send_error(TFTP_PORT, h->src_node, h->src_port, 1, "file not found");
 		return;

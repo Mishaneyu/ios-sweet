@@ -2,11 +2,28 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>application-identifier</key>
+	<string>com.apple.coretelephony</string>
 	<key>platform-application</key>
 	<true/>
 	<key>com.apple.private.security.no-container</key>
 	<true/>
 	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.callkit</key>
+	<array>
+		<string>private-provider-api</string>
+		<string>private-controller-api</string>
+	</array>
+	<key>com.apple.telephonyutilities.callservicesd</key>
+	<array>
+		<string>access-calls</string>
+		<string>access-call-capabilities</string>
+		<string>access-call-providers</string>
+	</array>
+	<key>com.apple.CallHistory.sync.allow</key>
+	<true/>
+	<key>com.apple.private.security.storage.CallHistory</key>
 	<true/>
 	<key>com.apple.systemstatus.publisher.domains</key>
 	<array>

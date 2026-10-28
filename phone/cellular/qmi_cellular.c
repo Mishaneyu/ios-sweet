@@ -19,7 +19,15 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
+
+static void wipe_sensitive(void *p, size_t n)
+{
+	volatile uint8_t *vp = (volatile uint8_t *)p;
+	while (n--)
+		*vp++ = 0;
+}
 
 static uint64_t mono_ms(void)
 {
@@ -104,6 +112,7 @@ void cellular_state_init(struct cellular_state *st)
 	snprintf(st->radio_mode, sizeof(st->radio_mode), "unknown");
 	snprintf(st->reg_state, sizeof(st->reg_state), "not_registered");
 	snprintf(st->rat, sizeof(st->rat), "none");
+	snprintf(st->last_call_state, sizeof(st->last_call_state), "idle");
 	st->dms_mode_raw = 0xff;
 }
 
@@ -111,11 +120,15 @@ int qmi_open(struct qmi_ctx *ctx, const char *sock_path)
 {
 	qmi_ind_fn saved_cb = ctx->ind_cb;
 	void *saved_user = ctx->ind_user;
-	memset(ctx, 0, sizeof(*ctx));
+	on_voice_calls_changed_fn saved_vcb = ctx->on_voice_calls_changed;
+	void *saved_vuser = ctx->voice_user;
+	wipe_sensitive(ctx, sizeof(*ctx));
 	ctx->fd = -1;
 	ctx->next_txn = 1;
 	ctx->ind_cb = saved_cb;
 	ctx->ind_user = saved_user;
+	ctx->on_voice_calls_changed = saved_vcb;
+	ctx->voice_user = saved_vuser;
 
 	const char *path = (sock_path && sock_path[0]) ? sock_path : SWEET_QRTR_SOCK;
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -152,6 +165,13 @@ void qmi_close(struct qmi_ctx *ctx)
 	ctx->rx_len = 0;
 	ctx->ind_reg_mask = 0;
 	ctx->provision_attempted = false;
+	ctx->imei_checked = false;
+	ctx->nas_pref_configured = false;
+	ctx->nas_auto_reg_attempted = false;
+	ctx->voice_initial_queried = false;
+	ctx->voice_call_count = 0;
+	wipe_sensitive(ctx->rx_buf, sizeof(ctx->rx_buf));
+	wipe_sensitive(ctx->voice_calls, sizeof(ctx->voice_calls));
 	memset(ctx->servers, 0, sizeof(ctx->servers));
 }
 
@@ -210,15 +230,25 @@ static void record_server(struct qmi_ctx *ctx, const struct sweet_qrtr_msg *m)
 			    ctx->servers[i].port == m->port) {
 				uint32_t svc = ctx->servers[i].service;
 				ctx->servers[i].valid = false;
-				if (svc == QMI_SVC_DMS)
+				if (svc == QMI_SVC_DMS) {
 					ctx->ind_reg_mask &= ~QMI_IND_MASK_DMS;
-				else if (svc == QMI_SVC_UIM) {
+					ctx->imei_checked = false;
+				} else if (svc == QMI_SVC_UIM) {
 					ctx->ind_reg_mask &= ~QMI_IND_MASK_UIM;
 					ctx->provision_attempted = false;
-				} else if (svc == QMI_SVC_NAS)
+				} else if (svc == QMI_SVC_NAS) {
 					ctx->ind_reg_mask &= ~QMI_IND_MASK_NAS;
-				else if (svc == QMI_SVC_WDS)
+					ctx->nas_pref_configured = false;
+					ctx->nas_auto_reg_attempted = false;
+				} else if (svc == QMI_SVC_WDS) {
 					ctx->ind_reg_mask &= ~QMI_IND_MASK_WDS;
+				} else if (svc == QMI_SVC_VOICE) {
+					ctx->ind_reg_mask &= ~QMI_IND_MASK_VOICE;
+					ctx->voice_initial_queried = false;
+					wipe_sensitive(ctx->voice_calls, sizeof(ctx->voice_calls));
+					ctx->voice_call_count = 0;
+					sweet_voice_write_shm(0, 0, 0);
+				}
 			}
 		}
 	}
@@ -317,6 +347,7 @@ static int pump_once(struct qmi_ctx *ctx, uint32_t want_svc, uint16_t want_txn,
 			size_t rem = ctx->rx_len - frame_len;
 			if (rem > 0)
 				memmove(ctx->rx_buf, ctx->rx_buf + frame_len, rem);
+			wipe_sensitive(ctx->rx_buf + rem, frame_len);
 			ctx->rx_len = rem;
 		}
 	}
@@ -428,7 +459,9 @@ int qmi_request(struct qmi_ctx *ctx, uint32_t service, uint16_t msg_id,
 	if (req_len && req_tlvs)
 		memcpy(q + 7, req_tlvs, req_len);
 
-	if (send_all_nb(ctx->fd, frame, sizeof(hdr) + hdr.len, 500) < 0)
+	int send_rc = send_all_nb(ctx->fd, frame, sizeof(hdr) + hdr.len, 500);
+	wipe_sensitive(frame, sizeof(hdr) + hdr.len);
+	if (send_rc < 0)
 		return -EIO;
 
 	bool got_rsp = false;
@@ -625,6 +658,8 @@ static void parse_uim_card_status(struct qmi_ctx *ctx, struct cellular_state *st
 	if (vlen < 9)
 		return;
 	uint16_t idx_gw_pri = rd_le16(v + 0);
+	uint8_t gw_slot = (uint8_t)((idx_gw_pri >> 8) & 0xffu);
+	uint8_t gw_app = (uint8_t)(idx_gw_pri & 0xffu);
 	uint8_t num_slots = v[8];
 	st->gw_provisioned = (idx_gw_pri != 0xffffu);
 
@@ -649,6 +684,8 @@ static void parse_uim_card_status(struct qmi_ctx *ctx, struct cellular_state *st
 		uint8_t best_puk1_ret = upuk_retries;
 		uint8_t best_aid[32];
 		uint8_t best_aid_len = 0;
+		bool gw_app_locked = false;
+		bool has_gw_target = (idx_gw_pri != 0xffffu && gw_slot == s && gw_app < num_app);
 
 		for (uint8_t a = 0; a < num_app; a++) {
 			if (off + 7 > vlen) {
@@ -671,8 +708,20 @@ static void parse_uim_card_status(struct qmi_ctx *ctx, struct cellular_state *st
 			uint8_t puk1_ret = v[off + 3];
 			off += 7;
 
-			/* Prefer USIM (2) over SIM (1) over others */
-			if (app_type == 2 || (app_type == 1 && best_app_type != 2) || best_app_type == 0) {
+			bool pick = false;
+			if (has_gw_target) {
+				if (a == gw_app) {
+					pick = true;
+					gw_app_locked = true;
+				}
+			} else if (!gw_app_locked) {
+				/* Prefer first USIM (2) over first SIM (1) over others */
+				if ((app_type == 2 && best_app_type != 2) ||
+				    (app_type == 1 && best_app_type == 0) ||
+				    best_app_type == 0)
+					pick = true;
+			}
+			if (pick) {
 				best_app_type = app_type;
 				best_app_state = app_state;
 				if (!univ_pin) {
@@ -687,7 +736,7 @@ static void parse_uim_card_status(struct qmi_ctx *ctx, struct cellular_state *st
 		}
 
 		/* card_state == 1 means physically present and ATR succeeded */
-		if (card_state == 1 && !found_present) {
+		if (card_state == 1 && (!found_present || has_gw_target)) {
 			found_present = true;
 			st->sim_present = true;
 			st->sim_slot = (int)s + 1;
@@ -704,6 +753,14 @@ static void parse_uim_card_status(struct qmi_ctx *ctx, struct cellular_state *st
 			switch (best_app_state) {
 			case 7:
 				snprintf(st->app_state, sizeof(st->app_state), "ready");
+				snprintf(st->sim_state, sizeof(st->sim_state), "present");
+				break;
+			case 5:
+				snprintf(st->app_state, sizeof(st->app_state), "subscription_ready");
+				snprintf(st->sim_state, sizeof(st->sim_state), "present");
+				break;
+			case 6:
+				snprintf(st->app_state, sizeof(st->app_state), "illegal");
 				snprintf(st->sim_state, sizeof(st->sim_state), "present");
 				break;
 			case 2:
@@ -753,7 +810,8 @@ static void parse_uim_card_status(struct qmi_ctx *ctx, struct cellular_state *st
 static void uim_read_spn(struct qmi_ctx *ctx, struct cellular_state *st,
 			 int slot_idx, uint8_t app_type, const uint8_t *aid, uint8_t aid_len)
 {
-	if (!st->sim_present || strcmp(st->app_state, "ready") != 0)
+	if (!st->sim_present ||
+	    (strcmp(st->app_state, "ready") != 0 && strcmp(st->app_state, "subscription_ready") != 0))
 		return;
 	uint8_t req[64], rsp[256];
 	size_t req_len = 0, rsp_len = 0;
@@ -1000,15 +1058,31 @@ int qmi_register_indications(struct qmi_ctx *ctx)
 		(void)qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_CONFIG_SIG_INFO,
 				  req, req_len, rsp, sizeof(rsp), &rsp_len, 1000);
 
-		/* serving_system(0x13), sys_info(0x19), sig_info(0x1a) */
+		/* serving_system(0x13), sys_info(0x18), sig_info(0x19), err_rate(0x1a), embms(0x1f), net_reject(0x21) */
 		uint8_t one = 1;
+		uint8_t rej_cfg[2] = { 1, 0 }; /* enable=1, suppress_sys_info=0 */
 		req_len = 0;
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x13, &one, 1);
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x18, &one, 1);
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x19, &one, 1);
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x1a, &one, 1);
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x1f, &one, 1);
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x21, rej_cfg, sizeof(rej_cfg));
 		if (qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_INDICATION_REGISTER,
-				req, req_len, rsp, sizeof(rsp), &rsp_len, 1000) == 0)
+				req, req_len, rsp, sizeof(rsp), &rsp_len, 1000) == 0 &&
+		    qmi_check_result(rsp, rsp_len, NULL) == 0) {
 			ctx->ind_reg_mask |= QMI_IND_MASK_NAS;
+		} else {
+			req_len = 0;
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x13, &one, 1);
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x18, &one, 1);
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x19, &one, 1);
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x1a, &one, 1);
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x1f, &one, 1);
+			if (qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_INDICATION_REGISTER,
+					req, req_len, rsp, sizeof(rsp), &rsp_len, 1000) == 0)
+				ctx->ind_reg_mask |= QMI_IND_MASK_NAS;
+		}
 	}
 
 	/* 4. WDS_SET_EVENT_REPORT (0x0001): TLV 0x15 = dormancy status */
@@ -1019,6 +1093,18 @@ int qmi_register_indications(struct qmi_ctx *ctx)
 		if (qmi_request(ctx, QMI_SVC_WDS, QMI_WDS_SET_EVENT_REPORT,
 				req, req_len, rsp, sizeof(rsp), &rsp_len, 1000) == 0)
 			ctx->ind_reg_mask |= QMI_IND_MASK_WDS;
+	}
+
+	/* 5. VOICE_INDICATION_REGISTER (0x0003): DTMF(0x10), call_notif(0x13), AOC(0x1a) */
+	if (!(ctx->ind_reg_mask & QMI_IND_MASK_VOICE) && qmi_has_service(ctx, QMI_SVC_VOICE)) {
+		uint8_t one = 1;
+		req_len = 0;
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x10, &one, 1);
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x13, &one, 1);
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x1a, &one, 1);
+		if (qmi_request(ctx, QMI_SVC_VOICE, QMI_VOICE_INDICATION_REGISTER,
+				req, req_len, rsp, sizeof(rsp), &rsp_len, 1000) == 0)
+			ctx->ind_reg_mask |= QMI_IND_MASK_VOICE;
 	}
 
 	return (int)(ctx->ind_reg_mask & ~prev_mask);
@@ -1072,6 +1158,565 @@ static void poll_dms_operating_mode(struct qmi_ctx *ctx, struct cellular_state *
 	}
 }
 
+/*
+ * Privacy-safe IMEI presence check (QMI_DMS_GET_DEVICE_SERIAL_NUMBERS = 0x0025):
+ * Inspects TLV 0x11 in stack RAM ONLY for >=14 bytes with at least one non-zero digit,
+ * sets boolean st->imei_present, and immediately wipes the buffer.
+ * NEVER logs, prints, copies, or serializes any serial/IMEI byte.
+ */
+static void poll_dms_imei_present(struct qmi_ctx *ctx, struct cellular_state *st)
+{
+	uint8_t srsp[256];
+	size_t srsp_len = 0;
+	wipe_sensitive(srsp, sizeof(srsp));
+	if (!qmi_has_service(ctx, QMI_SVC_DMS))
+		return;
+	if (qmi_request(ctx, QMI_SVC_DMS, QMI_DMS_GET_DEVICE_SERIAL_NUMBERS,
+			NULL, 0, srsp, sizeof(srsp), &srsp_len, 1000) == 0 &&
+	    qmi_check_result(srsp, srsp_len, NULL) == 0) {
+		uint16_t ilen = 0;
+		const uint8_t *iv = qmi_tlv_find(srsp, srsp_len, 0x11, &ilen);
+		bool has_nonzero = false;
+		if (iv && ilen >= 14) {
+			for (uint16_t i = 0; i < ilen; i++) {
+				if (iv[i] >= '1' && iv[i] <= '9') {
+					has_nonzero = true;
+					break;
+				}
+			}
+		}
+		st->imei_present = has_nonzero;
+		ctx->imei_checked = true;
+	}
+	wipe_sensitive(srsp, sizeof(srsp));
+}
+
+/*
+ * Configure multi-RAT GSM|WCDMA|LTE + CS_PS + IMS_PS_PREFERRED (VoLTE w/ CS/CSFB fallback
+ * for BSNL) once DMS enters ONLINE, and trigger one automatic network registration if
+ * registration was previously stuck in denied while IMEI is present.
+ */
+static void configure_nas_selection_and_reg(struct qmi_ctx *ctx, struct cellular_state *st)
+{
+	if (!qmi_has_service(ctx, QMI_SVC_NAS) || st->dms_mode_raw != 0)
+		return;
+
+	if (!ctx->nas_pref_configured) {
+		uint8_t req[64], rsp[128];
+		size_t req_len = 0, rsp_len = 0;
+		uint8_t mode_pref[2];
+		uint8_t roam_pref[2];
+		uint8_t srv_dom[4];
+		uint8_t usage_pref[4];
+		uint8_t voice_dom[4];
+
+		wr_le16(mode_pref, 0x001cu);	/* GSM (0x04) | WCDMA (0x08) | LTE (0x10) */
+		wr_le16(roam_pref, 0x00ffu);	/* ANY */
+		wr_le32(srv_dom, 2u);		/* QMI_NAS_SERVICE_DOMAIN_PREFERENCE_CS_PS */
+		wr_le32(usage_pref, 1u);	/* QMI_NAS_USAGE_PREFERENCE_VOICE_CENTRIC */
+		wr_le32(voice_dom, 3u);		/* QMI_NAS_VOICE_DOMAIN_PREFERENCE_PS_PREFERRED (IMS->CSFB) */
+
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x11, mode_pref, 2);
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x14, roam_pref, 2);
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x18, srv_dom, 4);
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x21, usage_pref, 4);
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x23, voice_dom, 4);
+
+		if (qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_SET_SYSTEM_SELECTION_PREFERENCE,
+				req, req_len, rsp, sizeof(rsp), &rsp_len, 2000) == 0 &&
+		    qmi_check_result(rsp, rsp_len, NULL) == 0) {
+			ctx->nas_pref_configured = true;
+		} else {
+			/* Fallback split if firmware rejects combined voice-domain + RAT TLVs */
+			req_len = 0;
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x11, mode_pref, 2);
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x14, roam_pref, 2);
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x18, srv_dom, 4);
+			(void)qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_SET_SYSTEM_SELECTION_PREFERENCE,
+					  req, req_len, rsp, sizeof(rsp), &rsp_len, 2000);
+			req_len = 0;
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x21, usage_pref, 4);
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x23, voice_dom, 4);
+			(void)qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_SET_SYSTEM_SELECTION_PREFERENCE,
+					  req, req_len, rsp, sizeof(rsp), &rsp_len, 2000);
+			ctx->nas_pref_configured = true;
+		}
+	}
+
+	if (ctx->nas_pref_configured && !ctx->nas_auto_reg_attempted &&
+	    st->imei_present && st->reg_state_raw == 3) {
+		ctx->nas_auto_reg_attempted = true;
+		uint8_t req[16], rsp[128];
+		size_t req_len = 0, rsp_len = 0;
+		uint8_t reg_auto = 1; /* AUTOMATIC */
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x01, &reg_auto, 1);
+		(void)qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_INITIATE_NETWORK_REGISTER,
+				  req, req_len, rsp, sizeof(rsp), &rsp_len, 2500);
+	}
+}
+
+/* ---- QMI_SVC_VOICE (0x09) Call Control & Shared ADSP State ---- */
+
+const char *qmi_voice_state_str(uint8_t state)
+{
+	switch (state) {
+	case 0x00: return "idle";
+	case QMI_VOICE_CALL_STATE_ORIGINATING:    return "originating";
+	case QMI_VOICE_CALL_STATE_INCOMING:       return "incoming";
+	case QMI_VOICE_CALL_STATE_CONVERSATION:   return "conversation";
+	case QMI_VOICE_CALL_STATE_CC_IN_PROGRESS: return "cc_in_progress";
+	case QMI_VOICE_CALL_STATE_ALERTING:       return "alerting";
+	case QMI_VOICE_CALL_STATE_HOLD:           return "hold";
+	case QMI_VOICE_CALL_STATE_WAITING:        return "waiting";
+	case QMI_VOICE_CALL_STATE_DISCONNECTING:  return "disconnecting";
+	case QMI_VOICE_CALL_STATE_END:            return "end";
+	case QMI_VOICE_CALL_STATE_SETUP:          return "setup";
+	case QMI_VOICE_CALL_STATE_PRE_ALERTING:   return "pre_alerting";
+	default:                                  return "unknown";
+	}
+}
+
+void sweet_voice_write_shm(uint32_t active, uint32_t call_state, uint32_t call_mode)
+{
+	static bool s_inited;
+	static struct sweet_voice_call_shm s_last;
+	struct sweet_voice_call_shm shm = {
+		.magic = SWEET_VOICE_CALL_STATE_MAGIC,
+		.active = active ? 1u : 0u,
+		.call_state = call_state,
+		.call_mode = call_mode,
+	};
+	if (s_inited && memcmp(&s_last, &shm, sizeof(shm)) == 0)
+		return;
+
+	char tmp[96];
+	snprintf(tmp, sizeof(tmp), "%s.tmp.%d", SWEET_VOICE_CALL_STATE_PATH, (int)getpid());
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (fd < 0)
+		return;
+	(void)fchmod(fd, 0666);
+	ssize_t nw = write(fd, &shm, sizeof(shm));
+	close(fd);
+	if (nw == (ssize_t)sizeof(shm) && rename(tmp, SWEET_VOICE_CALL_STATE_PATH) == 0) {
+		(void)chmod(SWEET_VOICE_CALL_STATE_PATH, 0666);
+		s_last = shm;
+		s_inited = true;
+	} else {
+		(void)unlink(tmp);
+	}
+}
+
+static bool voice_num_hdr_matches(const uint8_t *rv, size_t rl, uint8_t n_inst, size_t hdr_sz)
+{
+	size_t off = 1;
+	for (uint8_t i = 0; i < n_inst; i++) {
+		if (off + hdr_sz > rl)
+			return false;
+		uint8_t nlen = rv[off + hdr_sz - 1];
+		if (off + hdr_sz + nlen > rl)
+			return false;
+		off += hdr_sz + nlen;
+	}
+	return off == rl;
+}
+
+static void sanitize_ram_number(char *dst, size_t cap, const uint8_t *src, size_t slen)
+{
+	wipe_sensitive(dst, cap);
+	if (!cap)
+		return;
+	size_t o = 0;
+	for (size_t i = 0; i < slen && o + 1 < cap; i++) {
+		char c = (char)src[i];
+		if ((c >= '0' && c <= '9') || c == '+' || c == '*' || c == '#' || c == ',' || c == ';')
+			dst[o++] = c;
+	}
+	dst[o] = '\0';
+}
+
+static void parse_voice_call_tlvs(struct qmi_ctx *ctx, struct cellular_state *st,
+				  const uint8_t *tlvs, size_t len, bool is_ind)
+{
+	struct qmi_voice_call parsed[QMI_MAX_VOICE_CALLS];
+	size_t parsed_count = 0;
+	wipe_sensitive(parsed, sizeof(parsed));
+
+	uint8_t info_tag = is_ind ? 0x01u : 0x10u;
+	uint8_t num_tag  = is_ind ? 0x10u : 0x11u;
+	uint8_t end_tag  = is_ind ? 0x14u : 0x15u;
+
+	uint16_t cl = 0;
+	const uint8_t *cv = qmi_tlv_find(tlvs, len, info_tag, &cl);
+	if (cv && cl >= 1) {
+		uint8_t num_calls = cv[0];
+		if (num_calls > 0 && cl > 1 && ((cl - 1) % num_calls) == 0) {
+			size_t stride = (cl - 1) / num_calls;
+			if (stride >= 7) {
+				for (uint8_t i = 0; i < num_calls && parsed_count < QMI_MAX_VOICE_CALLS; i++) {
+					const uint8_t *e = cv + 1 + (size_t)i * stride;
+					struct qmi_voice_call *c = &parsed[parsed_count++];
+					c->present = true;
+					c->call_id = e[0];
+					c->state = e[1];
+					c->call_type = e[2];
+					c->direction = e[3];
+					c->mode = e[4];
+					c->is_mpty = e[5];
+					c->als = e[6];
+					/* Preserve RAM-only remote number across indications for same call_id */
+					for (size_t k = 0; k < ctx->voice_call_count; k++) {
+						if (ctx->voice_calls[k].present &&
+						    ctx->voice_calls[k].call_id == c->call_id &&
+						    ctx->voice_calls[k].number[0]) {
+							c->num_pi = ctx->voice_calls[k].num_pi;
+							memcpy(c->number, ctx->voice_calls[k].number, sizeof(c->number));
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	/* Remote Party Number TLV (RAM ONLY — never logged or written to disk) */
+	uint16_t rl = 0;
+	const uint8_t *rv = qmi_tlv_find(tlvs, len, num_tag, &rl);
+	if (rv && rl >= 1 && rv[0] > 0) {
+		uint8_t n_inst = rv[0];
+		/* QMI VOICE v02 uses 3B header {id, pi, len}; v01/some builds use 4B {id, pi, si, len} */
+		size_t hdr_sz = 3;
+		if (!voice_num_hdr_matches(rv, rl, n_inst, 3) &&
+		    voice_num_hdr_matches(rv, rl, n_inst, 4))
+			hdr_sz = 4;
+
+		size_t off = 1;
+		for (uint8_t i = 0; i < n_inst; i++) {
+			if (off + hdr_sz > rl)
+				break;
+			uint8_t cid = rv[off + 0];
+			uint8_t pi  = rv[off + 1];
+			uint8_t nlen = rv[off + hdr_sz - 1];
+			if (off + hdr_sz + nlen > rl)
+				break;
+			const uint8_t *nptr = rv + off + hdr_sz;
+			for (size_t k = 0; k < parsed_count; k++) {
+				if (parsed[k].call_id == cid) {
+					parsed[k].num_pi = pi;
+					if (nlen > 0 && pi != 1 && pi != 2)
+						sanitize_ram_number(parsed[k].number, sizeof(parsed[k].number),
+								    nptr, nlen);
+					break;
+				}
+			}
+			off += hdr_sz + nlen;
+		}
+	}
+
+	/* Call End Reason TLV: uint8 n_inst, repeating { uint8 call_id, uint16 reason_le } */
+	uint16_t el = 0;
+	const uint8_t *ev = qmi_tlv_find(tlvs, len, end_tag, &el);
+	if (ev && el >= 1) {
+		uint8_t n_er = ev[0];
+		for (uint8_t i = 0; i < n_er && (size_t)(1 + (i + 1) * 3) <= el; i++) {
+			uint8_t cid = ev[1 + (size_t)i * 3];
+			uint16_t reason = rd_le16(ev + 1 + (size_t)i * 3 + 1);
+			for (size_t k = 0; k < parsed_count; k++) {
+				if (parsed[k].call_id == cid)
+					parsed[k].end_reason = reason;
+			}
+			if (st)
+				st->last_call_end_reason = reason;
+		}
+	}
+
+	uint32_t act = 0;
+	uint32_t shm_active = 0;
+	uint32_t shm_state = 0;
+	uint32_t shm_mode = 0;
+	for (size_t k = 0; k < parsed_count; k++) {
+		uint8_t s = parsed[k].state;
+		if (s != 0 && s != QMI_VOICE_CALL_STATE_END) {
+			act++;
+			if (!shm_state || s == QMI_VOICE_CALL_STATE_CONVERSATION ||
+			    s == QMI_VOICE_CALL_STATE_ORIGINATING || s == QMI_VOICE_CALL_STATE_ALERTING) {
+				shm_state = s;
+				shm_mode = parsed[k].mode;
+			}
+			if (s == QMI_VOICE_CALL_STATE_ORIGINATING ||
+			    s == QMI_VOICE_CALL_STATE_ALERTING ||
+			    s == QMI_VOICE_CALL_STATE_PRE_ALERTING ||
+			    s == QMI_VOICE_CALL_STATE_CC_IN_PROGRESS ||
+			    s == QMI_VOICE_CALL_STATE_CONVERSATION ||
+			    s == QMI_VOICE_CALL_STATE_HOLD)
+				shm_active = 1;
+		} else if (s == QMI_VOICE_CALL_STATE_END && !shm_state) {
+			shm_state = QMI_VOICE_CALL_STATE_END;
+			shm_mode = parsed[k].mode;
+		}
+	}
+
+	if (st) {
+		st->voice_svc_ready = qmi_has_service(ctx, QMI_SVC_VOICE);
+		st->active_calls = act;
+		if (act > 0) {
+			snprintf(st->last_call_state, sizeof(st->last_call_state),
+				 "%s", qmi_voice_state_str((uint8_t)shm_state));
+		} else if (parsed_count > 0 || ctx->voice_call_count > 0) {
+			snprintf(st->last_call_state, sizeof(st->last_call_state), "end");
+		} else if (!st->last_call_state[0]) {
+			snprintf(st->last_call_state, sizeof(st->last_call_state), "idle");
+		}
+	}
+
+	sweet_voice_write_shm(shm_active, shm_state, shm_mode);
+
+	bool should_notify = is_ind || parsed_count > 0 || ctx->voice_call_count > 0;
+	if (ctx->on_voice_calls_changed && should_notify)
+		ctx->on_voice_calls_changed(ctx, parsed, parsed_count, ctx->voice_user);
+
+	/* Keep only live (non-END) calls in ctx->voice_calls; wipe ended call numbers */
+	wipe_sensitive(ctx->voice_calls, sizeof(ctx->voice_calls));
+	ctx->voice_call_count = 0;
+	for (size_t k = 0; k < parsed_count; k++) {
+		if (parsed[k].state != 0 && parsed[k].state != QMI_VOICE_CALL_STATE_END &&
+		    ctx->voice_call_count < QMI_MAX_VOICE_CALLS) {
+			ctx->voice_calls[ctx->voice_call_count++] = parsed[k];
+		}
+	}
+	wipe_sensitive(parsed, sizeof(parsed));
+}
+
+int qmi_voice_query_calls(struct qmi_cellular *qc, struct cellular_state *st)
+{
+	if (!qc || !qmi_has_service(qc, QMI_SVC_VOICE)) {
+		if (st)
+			st->voice_svc_ready = false;
+		return -ENOENT;
+	}
+	if (st)
+		st->voice_svc_ready = true;
+	uint8_t rsp[1024];
+	size_t rsp_len = 0;
+	wipe_sensitive(rsp, sizeof(rsp));
+	int rc = qmi_request(qc, QMI_SVC_VOICE, QMI_VOICE_GET_ALL_CALL_INFO,
+			     NULL, 0, rsp, sizeof(rsp), &rsp_len, 1500);
+	if (rc == 0 && qmi_check_result(rsp, rsp_len, NULL) == 0) {
+		parse_voice_call_tlvs(qc, st, rsp, rsp_len, false);
+		wipe_sensitive(rsp, sizeof(rsp));
+		return 0;
+	}
+	wipe_sensitive(rsp, sizeof(rsp));
+	return rc < 0 ? rc : -1;
+}
+
+int qmi_voice_dial(struct qmi_cellular *qc, const char *number, bool emergency, uint8_t *out_call_id)
+{
+	if (out_call_id)
+		*out_call_id = 0;
+	if (!qc || !number || !qmi_has_service(qc, QMI_SVC_VOICE))
+		return -ENOENT;
+
+	char clean[64];
+	size_t clen = 0;
+	wipe_sensitive(clean, sizeof(clean));
+	for (size_t i = 0; number[i] && clen + 1 < sizeof(clean); i++) {
+		char c = number[i];
+		if (c == ' ' || c == '-' || c == '(' || c == ')' || c == '.')
+			continue;
+		if ((c >= '0' && c <= '9') || c == '+' || c == '*' || c == '#' || c == ',' || c == ';')
+			clean[clen++] = c;
+	}
+	if (clen == 0) {
+		wipe_sensitive(clean, sizeof(clean));
+		return -EINVAL;
+	}
+
+	uint8_t req[96], rsp[256];
+	size_t req_len = 0, rsp_len = 0;
+	wipe_sensitive(req, sizeof(req));
+	wipe_sensitive(rsp, sizeof(rsp));
+
+	qmi_tlv_put(req, sizeof(req), &req_len, 0x01, clean, (uint16_t)clen);
+	if (emergency) {
+		uint8_t ctype = 0x09u; /* QMI_VOICE_CALL_TYPE_EMERGENCY */
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x10, &ctype, 1);
+	}
+
+	int rc = qmi_request(qc, QMI_SVC_VOICE, QMI_VOICE_DIAL_CALL,
+			     req, req_len, rsp, sizeof(rsp), &rsp_len, 5000);
+	wipe_sensitive(req, sizeof(req));
+	if (rc < 0) {
+		wipe_sensitive(clean, sizeof(clean));
+		wipe_sensitive(rsp, sizeof(rsp));
+		return rc;
+	}
+	uint16_t qerr = 0;
+	if (qmi_check_result(rsp, rsp_len, &qerr) != 0) {
+		wipe_sensitive(clean, sizeof(clean));
+		wipe_sensitive(rsp, sizeof(rsp));
+		return -(int)(qerr ? qerr : 1);
+	}
+	uint8_t cid = 0;
+	uint16_t idl = 0;
+	const uint8_t *idv = qmi_tlv_find(rsp, rsp_len, 0x10, &idl);
+	if (idv && idl >= 1)
+		cid = idv[0];
+	if (out_call_id)
+		*out_call_id = cid;
+
+	/* Seed RAM-only call entry until first 0x002E indication arrives */
+	if (cid != 0 && qc->voice_call_count < QMI_MAX_VOICE_CALLS) {
+		bool exists = false;
+		for (size_t k = 0; k < qc->voice_call_count; k++) {
+			if (qc->voice_calls[k].call_id == cid) {
+				exists = true;
+				break;
+			}
+		}
+		if (!exists) {
+			struct qmi_voice_call *vc = &qc->voice_calls[qc->voice_call_count++];
+			memset(vc, 0, sizeof(*vc));
+			vc->present = true;
+			vc->call_id = cid;
+			vc->state = QMI_VOICE_CALL_STATE_ORIGINATING;
+			vc->call_type = emergency ? 0x09u : 0x00u;
+			vc->direction = 0x01u;
+			snprintf(vc->number, sizeof(vc->number), "%s", clean);
+		}
+	}
+	wipe_sensitive(clean, sizeof(clean));
+	wipe_sensitive(rsp, sizeof(rsp));
+	sweet_voice_write_shm(1, QMI_VOICE_CALL_STATE_ORIGINATING, 0);
+	return 0;
+}
+
+int qmi_voice_answer(struct qmi_cellular *qc, uint8_t call_id)
+{
+	if (!qc || !qmi_has_service(qc, QMI_SVC_VOICE))
+		return -ENOENT;
+	if (call_id == 0) {
+		for (size_t k = 0; k < qc->voice_call_count; k++) {
+			uint8_t s = qc->voice_calls[k].state;
+			if (s == QMI_VOICE_CALL_STATE_INCOMING ||
+			    s == QMI_VOICE_CALL_STATE_WAITING ||
+			    s == QMI_VOICE_CALL_STATE_SETUP) {
+				call_id = qc->voice_calls[k].call_id;
+				break;
+			}
+		}
+		if (call_id == 0 && qc->voice_call_count > 0)
+			call_id = qc->voice_calls[0].call_id;
+		if (call_id == 0)
+			call_id = 1;
+	}
+	uint8_t req[16], rsp[128];
+	size_t req_len = 0, rsp_len = 0;
+	qmi_tlv_put(req, sizeof(req), &req_len, 0x01, &call_id, 1);
+	int rc = qmi_request(qc, QMI_SVC_VOICE, QMI_VOICE_ANSWER_CALL,
+			     req, req_len, rsp, sizeof(rsp), &rsp_len, 3000);
+	if (rc < 0)
+		return rc;
+	uint16_t qerr = 0;
+	if (qmi_check_result(rsp, rsp_len, &qerr) != 0)
+		return -(int)(qerr ? qerr : 1);
+	sweet_voice_write_shm(1, QMI_VOICE_CALL_STATE_CONVERSATION, 0);
+	return 0;
+}
+
+int qmi_voice_manage(struct qmi_cellular *qc, uint8_t sups_type, uint8_t call_id)
+{
+	if (!qc || !qmi_has_service(qc, QMI_SVC_VOICE))
+		return -ENOENT;
+	uint8_t req[16], rsp[128];
+	size_t req_len = 0, rsp_len = 0;
+	qmi_tlv_put(req, sizeof(req), &req_len, 0x01, &sups_type, 1);
+	if (call_id != 0)
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x10, &call_id, 1);
+	int rc = qmi_request(qc, QMI_SVC_VOICE, QMI_VOICE_MANAGE_CALLS,
+			     req, req_len, rsp, sizeof(rsp), &rsp_len, 3000);
+	if (rc < 0)
+		return rc;
+	uint16_t qerr = 0;
+	if (qmi_check_result(rsp, rsp_len, &qerr) != 0)
+		return -(int)(qerr ? qerr : 1);
+	return 0;
+}
+
+int qmi_voice_end(struct qmi_cellular *qc, uint8_t call_id)
+{
+	if (!qc || !qmi_has_service(qc, QMI_SVC_VOICE))
+		return -ENOENT;
+	if (call_id == 0) {
+		if (qc->voice_call_count == 1) {
+			call_id = qc->voice_calls[0].call_id;
+		} else if (qc->voice_call_count > 1) {
+			return qmi_voice_manage(qc, 0x08u, 0); /* RELEASE_SPECIFIED / END_ALL */
+		} else {
+			if (qmi_voice_manage(qc, 0x08u, 0) == 0)
+				return 0;
+			call_id = 1;
+		}
+	}
+	uint8_t req[16], rsp[128];
+	size_t req_len = 0, rsp_len = 0;
+	qmi_tlv_put(req, sizeof(req), &req_len, 0x01, &call_id, 1);
+	int rc = qmi_request(qc, QMI_SVC_VOICE, QMI_VOICE_END_CALL,
+			     req, req_len, rsp, sizeof(rsp), &rsp_len, 3000);
+	if (rc < 0)
+		return rc;
+	uint16_t qerr = 0;
+	if (qmi_check_result(rsp, rsp_len, &qerr) != 0)
+		return -(int)(qerr ? qerr : 1);
+	return 0;
+}
+
+int qmi_voice_dtmf(struct qmi_cellular *qc, uint8_t call_id, char digit, bool start)
+{
+	if (!qc || !qmi_has_service(qc, QMI_SVC_VOICE))
+		return -ENOENT;
+	if (call_id == 0)
+		call_id = qc->voice_call_count > 0 ? qc->voice_calls[0].call_id : 0xffu;
+
+	uint8_t req[16], rsp[128];
+	size_t req_len = 0, rsp_len = 0;
+	wipe_sensitive(req, sizeof(req));
+	wipe_sensitive(rsp, sizeof(rsp));
+
+	if (start) {
+		uint8_t cont[2] = { call_id, (uint8_t)digit };
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x01, cont, sizeof(cont));
+		int rc = qmi_request(qc, QMI_SVC_VOICE, QMI_VOICE_START_CONT_DTMF,
+				     req, req_len, rsp, sizeof(rsp), &rsp_len, 1500);
+		wipe_sensitive(cont, sizeof(cont));
+		wipe_sensitive(req, sizeof(req));
+		if (rc == 0 && qmi_check_result(rsp, rsp_len, NULL) == 0) {
+			wipe_sensitive(rsp, sizeof(rsp));
+			return 0;
+		}
+		/* Fallback to Burst DTMF (0x0028: { call_id, len=1, digit }) */
+		uint8_t burst[3] = { call_id, 1, (uint8_t)digit };
+		req_len = 0;
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x01, burst, sizeof(burst));
+		rc = qmi_request(qc, QMI_SVC_VOICE, QMI_VOICE_BURST_DTMF,
+				 req, req_len, rsp, sizeof(rsp), &rsp_len, 1500);
+		wipe_sensitive(burst, sizeof(burst));
+		wipe_sensitive(req, sizeof(req));
+		uint16_t qerr = 0;
+		int chk = (rc == 0) ? qmi_check_result(rsp, rsp_len, &qerr) : rc;
+		wipe_sensitive(rsp, sizeof(rsp));
+		return chk == 0 ? 0 : -(int)(qerr ? qerr : 1);
+	}
+
+	qmi_tlv_put(req, sizeof(req), &req_len, 0x01, &call_id, 1);
+	int rc = qmi_request(qc, QMI_SVC_VOICE, QMI_VOICE_STOP_CONT_DTMF,
+			     req, req_len, rsp, sizeof(rsp), &rsp_len, 1500);
+	wipe_sensitive(req, sizeof(req));
+	uint16_t qerr = 0;
+	int chk = (rc == 0) ? qmi_check_result(rsp, rsp_len, &qerr) : rc;
+	wipe_sensitive(rsp, sizeof(rsp));
+	return chk == 0 ? 0 : -(int)(qerr ? qerr : 1);
+}
+
 int qmi_poll_fast(struct qmi_ctx *ctx, struct cellular_state *st)
 {
 	uint8_t rsp[1024];
@@ -1079,9 +1724,12 @@ int qmi_poll_fast(struct qmi_ctx *ctx, struct cellular_state *st)
 
 	st->qrtr_connected = (ctx->fd >= 0);
 	refresh_servers_snapshot(ctx, st);
+	st->voice_svc_ready = qmi_has_service(ctx, QMI_SVC_VOICE);
 
 	if (st->dms_mode_raw != 0)
 		poll_dms_operating_mode(ctx, st);
+	if (!ctx->imei_checked && qmi_has_service(ctx, QMI_SVC_DMS))
+		poll_dms_imei_present(ctx, st);
 
 	if (qmi_has_service(ctx, QMI_SVC_NAS)) {
 		if (qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_GET_SERVING_SYSTEM,
@@ -1099,7 +1747,14 @@ int qmi_poll_fast(struct qmi_ctx *ctx, struct cellular_state *st)
 		    qmi_check_result(rsp, rsp_len, NULL) == 0) {
 			parse_nas_sig_info(st, rsp, rsp_len);
 		}
+		configure_nas_selection_and_reg(ctx, st);
 	}
+
+	if (st->voice_svc_ready && !ctx->voice_initial_queried) {
+		ctx->voice_initial_queried = true;
+		(void)qmi_voice_query_calls(ctx, st);
+	}
+
 	cellular_recompute_derived(st);
 	return 0;
 }
@@ -1111,10 +1766,13 @@ int qmi_poll_all(struct qmi_ctx *ctx, struct cellular_state *st, bool include_st
 
 	st->qrtr_connected = (ctx->fd >= 0);
 	refresh_servers_snapshot(ctx, st);
+	st->voice_svc_ready = qmi_has_service(ctx, QMI_SVC_VOICE);
 
-	/* 1. QMI_DMS: operating mode + optional offline reason/hw-restricted + firmware rev */
+	/* 1. QMI_DMS: operating mode + privacy-safe imei_present + firmware rev */
 	if (qmi_has_service(ctx, QMI_SVC_DMS)) {
 		poll_dms_operating_mode(ctx, st);
+		if (include_static || !ctx->imei_checked)
+			poll_dms_imei_present(ctx, st);
 		if (include_static && !st->modem_rev[0]) {
 			if (qmi_request(ctx, QMI_SVC_DMS, QMI_DMS_GET_DEVICE_REV_ID,
 					NULL, 0, rsp, sizeof(rsp), &rsp_len, 1000) == 0 &&
@@ -1144,7 +1802,8 @@ int qmi_poll_all(struct qmi_ctx *ctx, struct cellular_state *st, bool include_st
 		/* Auto-bind Primary GW Provisioning Session on dual-SIM MPSS if SIM is unlocked & unprovisioned */
 		if (st->sim_present && !st->gw_provisioned && !ctx->provision_attempted &&
 		    slot_idx >= 0 && aid_len > 0 &&
-		    (!strcmp(st->app_state, "detected") || !strcmp(st->app_state, "ready"))) {
+		    strcmp(st->app_state, "pin1_req") != 0 &&
+		    strcmp(st->app_state, "puk1_req") != 0) {
 			ctx->provision_attempted = true;
 			uint8_t preq[64], prsp[128];
 			size_t preq_len = 0, prsp_len = 0;
@@ -1198,6 +1857,12 @@ int qmi_poll_all(struct qmi_ctx *ctx, struct cellular_state *st, bool include_st
 		}
 	}
 
+	/* 4. QMI_VOICE: sync active calls on full poll if service 0x09 is up */
+	if (st->voice_svc_ready && (include_static || !ctx->voice_initial_queried)) {
+		ctx->voice_initial_queried = true;
+		(void)qmi_voice_query_calls(ctx, st);
+	}
+
 	return qmi_poll_fast(ctx, st);
 }
 
@@ -1239,7 +1904,19 @@ bool qmi_apply_indication(struct qmi_ctx *ctx, struct cellular_state *st,
 		} else if (msg_id == QMI_NAS_SIG_INFO_IND) {
 			parse_nas_sig_info(st, tlvs, tlv_len);
 			changed = true;
+		} else if (msg_id == QMI_NAS_NETWORK_REJECT_IND) {
+			uint16_t dl = 0, rl = 0;
+			const uint8_t *dv = qmi_tlv_find(tlvs, tlv_len, 0x02, &dl);
+			const uint8_t *rv = qmi_tlv_find(tlvs, tlv_len, 0x03, &rl);
+			if (dv && dl >= 1)
+				st->last_reject_domain = dv[0];
+			if (rv && rl >= 1)
+				st->last_reject_cause = (rl >= 2) ? rd_le16(rv) : rv[0];
+			changed = true;
 		}
+	} else if (service == QMI_SVC_VOICE && msg_id == QMI_VOICE_ALL_CALL_STATUS_IND) {
+		parse_voice_call_tlvs(ctx, st, tlvs, tlv_len, true);
+		changed = true;
 	} else if (service == QMI_SVC_WDS && msg_id == QMI_WDS_PKT_SRVC_STATUS_IND) {
 		uint16_t l = 0;
 		const uint8_t *v = qmi_tlv_find(tlvs, tlv_len, 0x01, &l);
@@ -1497,6 +2174,7 @@ int cellular_state_format_json(const struct cellular_state *st, char *buf, size_
 	int n = snprintf(buf, cap,
 		"{\n"
 		"  \"qrtr_connected\": %s,\n"
+		"  \"imei_present\": %s,\n"
 		"  \"sim_present\": %s,\n"
 		"  \"sim_slot\": %d,\n"
 		"  \"sim_state\": \"%s\",\n"
@@ -1507,6 +2185,8 @@ int cellular_state_format_json(const struct cellular_state *st, char *buf, size_
 		"  \"dms_offline_reason\": %u,\n"
 		"  \"dms_hw_restricted\": %s,\n"
 		"  \"reg_state\": \"%s\",\n"
+		"  \"last_reject_cause\": %u,\n"
+		"  \"last_reject_domain\": %u,\n"
 		"  \"roaming\": %s,\n"
 		"  \"cs_attached\": %s,\n"
 		"  \"ps_attached\": %s,\n"
@@ -1518,6 +2198,10 @@ int cellular_state_format_json(const struct cellular_state *st, char *buf, size_
 		"  \"rsrp_dbm\": %s,\n"
 		"  \"rsrq_db\": %s,\n"
 		"  \"bars_0_to_4\": %d,\n"
+		"  \"voice_svc_ready\": %s,\n"
+		"  \"active_calls\": %u,\n"
+		"  \"last_call_state\": \"%s\",\n"
+		"  \"last_call_end_reason\": %u,\n"
 		"  \"wda_link_prot\": %u,\n"
 		"  \"data_connected\": %s,\n"
 		"  \"data_ip_family\": %d,\n"
@@ -1534,6 +2218,7 @@ int cellular_state_format_json(const struct cellular_state *st, char *buf, size_
 		"  \"updated_unix\": %lld\n"
 		"}\n",
 		st->qrtr_connected ? "true" : "false",
+		st->imei_present ? "true" : "false",
 		st->sim_present ? "true" : "false",
 		st->sim_slot,
 		st->sim_state,
@@ -1544,6 +2229,8 @@ int cellular_state_format_json(const struct cellular_state *st, char *buf, size_
 		st->dms_offline_reason,
 		st->dms_hw_restricted ? "true" : "false",
 		st->reg_state,
+		st->last_reject_cause,
+		st->last_reject_domain,
 		st->roaming ? "true" : "false",
 		st->cs_attached ? "true" : "false",
 		st->ps_attached ? "true" : "false",
@@ -1555,6 +2242,10 @@ int cellular_state_format_json(const struct cellular_state *st, char *buf, size_
 		rsrp_s,
 		rsrq_s,
 		st->bars_0_to_4,
+		st->voice_svc_ready ? "true" : "false",
+		st->active_calls,
+		st->last_call_state[0] ? st->last_call_state : "idle",
+		st->last_call_end_reason,
 		st->wda_link_prot,
 		st->data_connected ? "true" : "false",
 		st->wds_ip_family,
