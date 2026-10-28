@@ -7,6 +7,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -24,14 +25,24 @@
 
 enum { RMTFS_OPEN = 1, RMTFS_CLOSE, RMTFS_RW_IOVEC, RMTFS_ALLOC_BUFF, RMTFS_GET_DEV_ERROR, RMTFS_FORCE_SYNC_IND };
 
-static const struct { const char *path, *file; } parts[] = {
-	{ "/boot/modem_fs1", "modemst1.img" },
-	{ "/boot/modem_fs2", "modemst2.img" },
-	{ "/boot/modem_fsg", "fsg.img" },
-	{ "/boot/modem_fsc", "fsc.img" },
+static const struct {
+	const char *path;
+	const char *file;
+	bool optional;
+	bool read_only;
+} parts[] = {
+	{ "/boot/modem_fs1",   "modemst1.img",    false, false },
+	{ "/boot/modem_fs2",   "modemst2.img",    false, false },
+	{ "/boot/modem_fsg",   "fsg.img",         false, false },
+	{ "/boot/modem_fsc",   "fsc.img",         false, false },
+	{ "/oppo/oem_partion", "oppostanvbk.img", true,  true  },
+	{ "/oem/nvbk/static",  "oppostanvbk.img", true,  true  },
+	{ "/oem/nvbk/dynamic", "oppodycnvbk.img", true,  false },
 };
 #define NPARTS (sizeof(parts) / sizeof(parts[0]))
-static int fds[NPARTS] = { -1, -1, -1, -1 };
+static int fds[NPARTS] = { -1, -1, -1, -1, -1, -1, -1 };
+static bool eff_ro[NPARTS];
+static bool ro_warned[NPARTS];
 static uint64_t buf_pa;
 
 int rmtfs_prepare(void)
@@ -41,11 +52,26 @@ int rmtfs_prepare(void)
 			continue;
 		char p[128];
 		snprintf(p, sizeof(p), RMTFS_DIR "/%s", parts[i].file);
-		fds[i] = open(p, O_RDWR);
+		eff_ro[i] = parts[i].read_only;
+		fds[i] = open(p, parts[i].read_only ? O_RDONLY : O_RDWR);
+		if (fds[i] < 0 && parts[i].optional && !parts[i].read_only &&
+		    (errno == EACCES || errno == EROFS)) {
+			fds[i] = open(p, O_RDONLY);
+			if (fds[i] >= 0)
+				eff_ro[i] = true;
+		}
 		if (fds[i] < 0) {
+			if (parts[i].optional && errno == ENOENT) {
+				fds[i] = -1;
+				printf("rmtfs: optional %s not present\n", p);
+				continue;
+			}
 			printf("rmtfs: %s: %s\n", p, strerror(errno));
 			return -1;
 		}
+		if (parts[i].optional)
+			printf("rmtfs: mapped \"%s\" -> %s%s\n",
+			       parts[i].path, p, eff_ro[i] ? " (ro)" : "");
 	}
 	if (buf_pa)
 		return 0;
@@ -102,8 +128,13 @@ static int iovec(uint32_t caller, uint8_t dir, const uint8_t *v, uint16_t len)
 {
 	if (caller < 1 || caller > NPARTS)
 		return -1;
-	int fd = fds[caller - 1];
+	unsigned idx = caller - 1;
+	int fd = fds[idx];
+	if (fd < 0)
+		return -1;
 	unsigned hdr = (len % 12 == 1) ? 1 : (len % 12 == 2) ? 2 : 4;
+	if (len < hdr)
+		return -1;
 	unsigned n = (len - hdr) / 12;
 	static uint8_t tmp[BUF_SIZE];
 	for (unsigned i = 0; i < n; i++) {
@@ -121,14 +152,21 @@ static int iovec(uint32_t caller, uint8_t dir, const uint8_t *v, uint16_t len)
 			if (r < (ssize_t)bytes)
 				memset(tmp + (r > 0 ? r : 0), 0, bytes - (r > 0 ? r : 0));
 			pm_wr(pa, tmp, bytes);
+		} else if (eff_ro[idx]) {
+			if (!ro_warned[idx]) {
+				ro_warned[idx] = true;
+				printf("rmtfs: ignoring write to read-only %s (sectors %u+%u)\n",
+				       parts[idx].file, e[0], e[2]);
+			}
+			continue;
 		} else {
 			pm_rd(pa, tmp, bytes);
 			if (pwrite(fd, tmp, bytes, (off_t)off) != (ssize_t)bytes)
 				return -1;
 		}
-		printf("rmtfs: %s %s sectors %u+%u\n", dir ? "write" : "read", parts[caller - 1].file, e[0], e[2]);
+		printf("rmtfs: %s %s sectors %u+%u\n", dir ? "write" : "read", parts[idx].file, e[0], e[2]);
 	}
-	if (dir)
+	if (dir && !eff_ro[idx])
 		fsync(fd);
 	return 0;
 }
@@ -151,7 +189,7 @@ void rmtfs_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			memcpy(path, p, l < 63 ? l : 63);
 		unsigned i;
 		for (i = 0; i < NPARTS; i++)
-			if (!strcmp(path, parts[i].path))
+			if (fds[i] >= 0 && !strcmp(path, parts[i].path))
 				break;
 		printf("rmtfs: open \"%s\" -> %d\n", path, i < NPARTS ? (int)i + 1 : -1);
 		if (i < NPARTS) {

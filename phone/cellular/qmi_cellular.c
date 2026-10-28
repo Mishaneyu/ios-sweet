@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -149,6 +150,8 @@ void qmi_close(struct qmi_ctx *ctx)
 		ctx->fd = -1;
 	}
 	ctx->rx_len = 0;
+	ctx->ind_reg_mask = 0;
+	ctx->provision_attempted = false;
 	memset(ctx->servers, 0, sizeof(ctx->servers));
 }
 
@@ -204,8 +207,19 @@ static void record_server(struct qmi_ctx *ctx, const struct sweet_qrtr_msg *m)
 		for (int i = 0; i < QMI_MAX_SERVERS; i++) {
 			if (ctx->servers[i].valid &&
 			    ctx->servers[i].node == m->node &&
-			    ctx->servers[i].port == m->port)
+			    ctx->servers[i].port == m->port) {
+				uint32_t svc = ctx->servers[i].service;
 				ctx->servers[i].valid = false;
+				if (svc == QMI_SVC_DMS)
+					ctx->ind_reg_mask &= ~QMI_IND_MASK_DMS;
+				else if (svc == QMI_SVC_UIM) {
+					ctx->ind_reg_mask &= ~QMI_IND_MASK_UIM;
+					ctx->provision_attempted = false;
+				} else if (svc == QMI_SVC_NAS)
+					ctx->ind_reg_mask &= ~QMI_IND_MASK_NAS;
+				else if (svc == QMI_SVC_WDS)
+					ctx->ind_reg_mask &= ~QMI_IND_MASK_WDS;
+			}
 		}
 	}
 }
@@ -543,7 +557,8 @@ void cellular_recompute_derived(struct cellular_state *st)
 	}
 
 	/* Compute 0..4 signal bars from LTE/NR RSRP (primary) or RSSI (fallback) */
-	if (!st->sim_present || st->reg_state_raw != 1) {
+	if (!st->sim_present || st->reg_state_raw != 1 ||
+	    (st->dms_mode_raw != 0 && st->dms_mode_raw != 0xff)) {
 		st->bars_0_to_4 = 0;
 		return;
 	}
@@ -575,16 +590,26 @@ void cellular_recompute_derived(struct cellular_state *st)
 	}
 }
 
-int qmi_dms_set_operating_mode(struct qmi_ctx *ctx, uint8_t mode)
+int qmi_dms_set_operating_mode_ex(struct qmi_ctx *ctx, uint8_t mode, uint16_t *out_qmi_err)
 {
 	uint8_t req[8], rsp[256];
 	size_t req_len = 0, rsp_len = 0;
+	if (out_qmi_err)
+		*out_qmi_err = 0;
 	qmi_tlv_put(req, sizeof(req), &req_len, 0x01, &mode, 1);
 	int rc = qmi_request(ctx, QMI_SVC_DMS, QMI_DMS_SET_OPERATING_MODE,
 			     req, req_len, rsp, sizeof(rsp), &rsp_len, 3000);
-	if (rc < 0)
+	if (rc < 0) {
+		if (out_qmi_err)
+			*out_qmi_err = 0xffffu;
 		return rc;
-	return qmi_check_result(rsp, rsp_len, NULL);
+	}
+	return qmi_check_result(rsp, rsp_len, out_qmi_err);
+}
+
+int qmi_dms_set_operating_mode(struct qmi_ctx *ctx, uint8_t mode)
+{
+	return qmi_dms_set_operating_mode_ex(ctx, mode, NULL);
 }
 
 /* Parse UIM Card Status TLV 0x10 (shared by UIM_GET_CARD_STATUS and UIM_STATUS_CHANGE_IND) */
@@ -938,19 +963,31 @@ int qmi_register_indications(struct qmi_ctx *ctx)
 {
 	uint8_t req[64], rsp[128];
 	size_t req_len = 0, rsp_len = 0;
+	uint32_t prev_mask = ctx->ind_reg_mask;
 
-	/* 1. UIM_EVENT_REG (0x002e): bit 0 = card status change */
-	if (qmi_has_service(ctx, QMI_SVC_UIM)) {
+	/* 1. DMS_SET_EVENT_REPORT (0x0001): TLV 0x13 = report_op_mode (1) */
+	if (!(ctx->ind_reg_mask & QMI_IND_MASK_DMS) && qmi_has_service(ctx, QMI_SVC_DMS)) {
+		uint8_t one = 1;
+		req_len = 0;
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x13, &one, 1);
+		if (qmi_request(ctx, QMI_SVC_DMS, QMI_DMS_SET_EVENT_REPORT,
+				req, req_len, rsp, sizeof(rsp), &rsp_len, 1000) == 0)
+			ctx->ind_reg_mask |= QMI_IND_MASK_DMS;
+	}
+
+	/* 2. UIM_EVENT_REG (0x002e): bit 0 = card status change */
+	if (!(ctx->ind_reg_mask & QMI_IND_MASK_UIM) && qmi_has_service(ctx, QMI_SVC_UIM)) {
 		uint8_t mask[4];
 		wr_le32(mask, 0x00000001u);
 		req_len = 0;
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x01, mask, 4);
-		(void)qmi_request(ctx, QMI_SVC_UIM, QMI_UIM_EVENT_REG,
-				  req, req_len, rsp, sizeof(rsp), &rsp_len, 1000);
+		if (qmi_request(ctx, QMI_SVC_UIM, QMI_UIM_EVENT_REG,
+				req, req_len, rsp, sizeof(rsp), &rsp_len, 1000) == 0)
+			ctx->ind_reg_mask |= QMI_IND_MASK_UIM;
 	}
 
-	/* 2. NAS_CONFIG_SIG_INFO (0x0050): LTE RSRP thresholds [-122, -105, -95, -85] dBm */
-	if (qmi_has_service(ctx, QMI_SVC_NAS)) {
+	/* 3. NAS_CONFIG_SIG_INFO (0x0050) + NAS_INDICATION_REGISTER (0x0003) */
+	if (!(ctx->ind_reg_mask & QMI_IND_MASK_NAS) && qmi_has_service(ctx, QMI_SVC_NAS)) {
 		/* TLV 0x13: LTE RSRP thresholds (uint8 len=4, int16[4]) */
 		uint8_t lte_th[1 + 8];
 		lte_th[0] = 4;
@@ -963,16 +1000,28 @@ int qmi_register_indications(struct qmi_ctx *ctx)
 		(void)qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_CONFIG_SIG_INFO,
 				  req, req_len, rsp, sizeof(rsp), &rsp_len, 1000);
 
-		/* 3. NAS_INDICATION_REGISTER (0x0003): serving_system(0x13), sys_info(0x19), sig_info(0x1a) */
+		/* serving_system(0x13), sys_info(0x19), sig_info(0x1a) */
 		uint8_t one = 1;
 		req_len = 0;
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x13, &one, 1);
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x19, &one, 1);
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x1a, &one, 1);
-		(void)qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_INDICATION_REGISTER,
-				  req, req_len, rsp, sizeof(rsp), &rsp_len, 1000);
+		if (qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_INDICATION_REGISTER,
+				req, req_len, rsp, sizeof(rsp), &rsp_len, 1000) == 0)
+			ctx->ind_reg_mask |= QMI_IND_MASK_NAS;
 	}
-	return 0;
+
+	/* 4. WDS_SET_EVENT_REPORT (0x0001): TLV 0x15 = dormancy status */
+	if (!(ctx->ind_reg_mask & QMI_IND_MASK_WDS) && qmi_has_service(ctx, QMI_SVC_WDS)) {
+		uint8_t one = 1;
+		req_len = 0;
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x15, &one, 1);
+		if (qmi_request(ctx, QMI_SVC_WDS, QMI_WDS_SET_EVENT_REPORT,
+				req, req_len, rsp, sizeof(rsp), &rsp_len, 1000) == 0)
+			ctx->ind_reg_mask |= QMI_IND_MASK_WDS;
+	}
+
+	return (int)(ctx->ind_reg_mask & ~prev_mask);
 }
 
 static void refresh_servers_snapshot(const struct qmi_ctx *ctx, struct cellular_state *st)
@@ -993,6 +1042,36 @@ static void refresh_servers_snapshot(const struct qmi_ctx *ctx, struct cellular_
 	}
 }
 
+static void poll_dms_operating_mode(struct qmi_ctx *ctx, struct cellular_state *st)
+{
+	uint8_t rsp[256];
+	size_t rsp_len = 0;
+	if (!qmi_has_service(ctx, QMI_SVC_DMS))
+		return;
+	if (qmi_request(ctx, QMI_SVC_DMS, QMI_DMS_GET_OPERATING_MODE,
+			NULL, 0, rsp, sizeof(rsp), &rsp_len, 1000) == 0 &&
+	    qmi_check_result(rsp, rsp_len, NULL) == 0) {
+		uint16_t ml = 0;
+		const uint8_t *mv = qmi_tlv_find(rsp, rsp_len, 0x01, &ml);
+		if (mv && ml >= 1) {
+			st->dms_mode_raw = mv[0];
+			snprintf(st->radio_mode, sizeof(st->radio_mode), "%s", dms_mode_str(mv[0]));
+		}
+		uint16_t ol = 0;
+		const uint8_t *ov = qmi_tlv_find(rsp, rsp_len, 0x10, &ol);
+		if (ov && ol >= 2) {
+			st->has_dms_offline_reason = true;
+			st->dms_offline_reason = rd_le16(ov);
+		} else {
+			st->has_dms_offline_reason = false;
+			st->dms_offline_reason = 0;
+		}
+		uint16_t hl = 0;
+		const uint8_t *hv = qmi_tlv_find(rsp, rsp_len, 0x11, &hl);
+		st->dms_hw_restricted = (hv && hl >= 1 && hv[0] != 0);
+	}
+}
+
 int qmi_poll_fast(struct qmi_ctx *ctx, struct cellular_state *st)
 {
 	uint8_t rsp[1024];
@@ -1000,6 +1079,9 @@ int qmi_poll_fast(struct qmi_ctx *ctx, struct cellular_state *st)
 
 	st->qrtr_connected = (ctx->fd >= 0);
 	refresh_servers_snapshot(ctx, st);
+
+	if (st->dms_mode_raw != 0)
+		poll_dms_operating_mode(ctx, st);
 
 	if (qmi_has_service(ctx, QMI_SVC_NAS)) {
 		if (qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_GET_SERVING_SYSTEM,
@@ -1030,18 +1112,9 @@ int qmi_poll_all(struct qmi_ctx *ctx, struct cellular_state *st, bool include_st
 	st->qrtr_connected = (ctx->fd >= 0);
 	refresh_servers_snapshot(ctx, st);
 
-	/* 1. QMI_DMS: operating mode + firmware revision string */
+	/* 1. QMI_DMS: operating mode + optional offline reason/hw-restricted + firmware rev */
 	if (qmi_has_service(ctx, QMI_SVC_DMS)) {
-		if (qmi_request(ctx, QMI_SVC_DMS, QMI_DMS_GET_OPERATING_MODE,
-				NULL, 0, rsp, sizeof(rsp), &rsp_len, 1000) == 0 &&
-		    qmi_check_result(rsp, rsp_len, NULL) == 0) {
-			uint16_t ml = 0;
-			const uint8_t *mv = qmi_tlv_find(rsp, rsp_len, 0x01, &ml);
-			if (mv && ml >= 1) {
-				st->dms_mode_raw = mv[0];
-				snprintf(st->radio_mode, sizeof(st->radio_mode), "%s", dms_mode_str(mv[0]));
-			}
-		}
+		poll_dms_operating_mode(ctx, st);
 		if (include_static && !st->modem_rev[0]) {
 			if (qmi_request(ctx, QMI_SVC_DMS, QMI_DMS_GET_DEVICE_REV_ID,
 					NULL, 0, rsp, sizeof(rsp), &rsp_len, 1000) == 0 &&
@@ -1133,7 +1206,17 @@ bool qmi_apply_indication(struct qmi_ctx *ctx, struct cellular_state *st,
 			  const uint8_t *tlvs, size_t tlv_len)
 {
 	bool changed = false;
-	if (service == QMI_SVC_UIM && msg_id == QMI_UIM_STATUS_CHANGE_IND) {
+	if (service == QMI_SVC_DMS && msg_id == QMI_DMS_EVENT_REPORT_IND) {
+		uint16_t ml = 0;
+		const uint8_t *mv = qmi_tlv_find(tlvs, tlv_len, 0x14, &ml);
+		if (mv && ml >= 1) {
+			st->dms_mode_raw = mv[0];
+			snprintf(st->radio_mode, sizeof(st->radio_mode), "%s", dms_mode_str(mv[0]));
+			if (mv[0] == 0)
+				st->dms_offline_reason = 0;
+			changed = true;
+		}
+	} else if (service == QMI_SVC_UIM && msg_id == QMI_UIM_STATUS_CHANGE_IND) {
 		uint16_t cl = 0;
 		const uint8_t *cv = qmi_tlv_find(tlvs, tlv_len, 0x10, &cl);
 		if (cv && cl > 0) {
@@ -1278,6 +1361,43 @@ int qmi_wds_stop_session(struct qmi_ctx *ctx, struct cellular_state *st)
 	return rc;
 }
 
+static bool contains_icase(const char *hay, const char *needle)
+{
+	if (!hay || !needle || !needle[0])
+		return false;
+	size_t nlen = strlen(needle);
+	for (size_t i = 0; hay[i]; i++) {
+		size_t j = 0;
+		while (j < nlen && hay[i + j] &&
+		       tolower((unsigned char)hay[i + j]) == tolower((unsigned char)needle[j]))
+			j++;
+		if (j == nlen)
+			return true;
+	}
+	return false;
+}
+
+const char *qmi_resolve_fallback_apn(const struct cellular_state *st)
+{
+	const char *plmn_op = lookup_plmn_fallback(st->mcc, st->mnc);
+	const char *cands[4] = { st->operator_name, st->spn_name, st->home_name, plmn_op };
+	for (int i = 0; i < 4; i++) {
+		const char *s = cands[i];
+		if (!s || !s[0])
+			continue;
+		if (contains_icase(s, "bsnl"))
+			return "bsnlnet";
+		if (contains_icase(s, "jio"))
+			return "jionet";
+		if (contains_icase(s, "airtel"))
+			return "airtelgprs.com";
+		if (contains_icase(s, "vodafone") || contains_icase(s, "idea") ||
+		    !strcasecmp(s, "vi") || !strncasecmp(s, "vi ", 3))
+			return "www";
+	}
+	return NULL;
+}
+
 int qmi_wds_test_session(struct qmi_ctx *ctx, struct cellular_state *st,
 			 const char *apn, bool keep_up)
 {
@@ -1306,6 +1426,18 @@ int qmi_wds_test_session(struct qmi_ctx *ctx, struct cellular_state *st,
 	int rc = wds_try_start_family(ctx, st, apn, 4);
 	if (rc != 0)
 		rc = wds_try_start_family(ctx, st, apn, 6);
+
+	/* If no explicit APN was configured and default attach profile failed, retry carrier APN */
+	if (rc != 0 && (!apn || !apn[0])) {
+		const char *fb_apn = qmi_resolve_fallback_apn(st);
+		if (fb_apn && fb_apn[0]) {
+			rc = wds_try_start_family(ctx, st, fb_apn, 4);
+			if (rc != 0)
+				rc = wds_try_start_family(ctx, st, fb_apn, 6);
+			if (rc == 0 && !st->data_apn[0])
+				snprintf(st->data_apn, sizeof(st->data_apn), "%s", fb_apn);
+		}
+	}
 
 	if (rc == 0 && !keep_up) {
 		/* Keep the discovered runtime settings in st for JSON output, but release call */
@@ -1372,6 +1504,8 @@ int cellular_state_format_json(const struct cellular_state *st, char *buf, size_
 		"  \"app_state\": \"%s\",\n"
 		"  \"gw_provisioned\": %s,\n"
 		"  \"radio_mode\": \"%s\",\n"
+		"  \"dms_offline_reason\": %u,\n"
+		"  \"dms_hw_restricted\": %s,\n"
 		"  \"reg_state\": \"%s\",\n"
 		"  \"roaming\": %s,\n"
 		"  \"cs_attached\": %s,\n"
@@ -1407,6 +1541,8 @@ int cellular_state_format_json(const struct cellular_state *st, char *buf, size_
 		st->app_state,
 		st->gw_provisioned ? "true" : "false",
 		st->radio_mode,
+		st->dms_offline_reason,
+		st->dms_hw_restricted ? "true" : "false",
 		st->reg_state,
 		st->roaming ? "true" : "false",
 		st->cs_attached ? "true" : "false",

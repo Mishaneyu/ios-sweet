@@ -37,6 +37,8 @@ extern "C" {
 #define QMI_FLG_IND	0x04u
 
 /* QMI DMS message IDs (NOTE: serial/IMEI/MSISDN messages intentionally excluded) */
+#define QMI_DMS_SET_EVENT_REPORT	0x0001u
+#define QMI_DMS_EVENT_REPORT_IND	0x0001u
 #define QMI_DMS_GET_DEVICE_REV_ID	0x0023u
 #define QMI_DMS_GET_OPERATING_MODE	0x002du
 #define QMI_DMS_SET_OPERATING_MODE	0x002eu
@@ -66,6 +68,7 @@ extern "C" {
 #define QMI_WDA_SET_DATA_FORMAT		0x0020u
 #define QMI_WDA_GET_DATA_FORMAT		0x0021u
 #define QMI_DPM_OPEN_PORT		0x0020u
+#define QMI_WDS_SET_EVENT_REPORT	0x0001u
 #define QMI_WDS_START_NET_IFACE		0x0020u
 #define QMI_WDS_STOP_NET_IFACE		0x0021u
 #define QMI_WDS_GET_PKT_SRVC_STATUS	0x0022u
@@ -97,6 +100,9 @@ struct cellular_state {
 
 	uint8_t  dms_mode_raw;
 	char     radio_mode[32];	/* "online", "low_power", "offline", ... */
+	bool     has_dms_offline_reason;
+	uint16_t dms_offline_reason;	/* QMI_DMS_GET_OPERATING_MODE TLV 0x10 bitmask */
+	bool     dms_hw_restricted;	/* QMI_DMS_GET_OPERATING_MODE TLV 0x11 */
 	char     modem_rev[96];		/* firmware build ID string only (no serials) */
 
 	uint8_t  reg_state_raw;		/* 0=not_reg, 1=registered, 2=searching, 3=denied, 4=unknown */
@@ -147,6 +153,11 @@ struct qmi_ctx;
 typedef void (*qmi_ind_fn)(struct qmi_ctx *ctx, uint32_t service, uint16_t msg_id,
 			   const uint8_t *tlvs, size_t tlv_len, void *user);
 
+#define QMI_IND_MASK_DMS	(1u << 0)
+#define QMI_IND_MASK_UIM	(1u << 1)
+#define QMI_IND_MASK_NAS	(1u << 2)
+#define QMI_IND_MASK_WDS	(1u << 3)
+
 struct qmi_ctx {
 	int                  fd;
 	uint16_t             next_txn;
@@ -156,6 +167,7 @@ struct qmi_ctx {
 	qmi_ind_fn           ind_cb;
 	void                *ind_user;
 	bool                 provision_attempted;
+	uint32_t             ind_reg_mask;
 };
 
 /* Connection & framing */
@@ -181,6 +193,7 @@ int qmi_request(struct qmi_ctx *ctx, uint32_t service, uint16_t msg_id,
 void cellular_state_init(struct cellular_state *st);
 void cellular_recompute_derived(struct cellular_state *st);
 int  qmi_dms_set_operating_mode(struct qmi_ctx *ctx, uint8_t mode);
+int  qmi_dms_set_operating_mode_ex(struct qmi_ctx *ctx, uint8_t mode, uint16_t *out_qmi_err);
 int  qmi_register_indications(struct qmi_ctx *ctx);
 int  qmi_poll_all(struct qmi_ctx *ctx, struct cellular_state *st, bool include_static);
 int  qmi_poll_fast(struct qmi_ctx *ctx, struct cellular_state *st);
@@ -189,6 +202,7 @@ bool qmi_apply_indication(struct qmi_ctx *ctx, struct cellular_state *st,
 			  const uint8_t *tlvs, size_t tlv_len);
 
 /* Stage 7B WDS / WDA packet data session bring-up / test */
+const char *qmi_resolve_fallback_apn(const struct cellular_state *st);
 int  qmi_wds_test_session(struct qmi_ctx *ctx, struct cellular_state *st,
 			  const char *apn, bool keep_up);
 int  qmi_wds_stop_session(struct qmi_ctx *ctx, struct cellular_state *st);

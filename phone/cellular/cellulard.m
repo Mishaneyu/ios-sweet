@@ -531,10 +531,22 @@ static NSString *sim_status_string(const struct cellular_state *st)
 	return @"kCTSIMSupportSIMStatusInserted";
 }
 
+static BOOL is_radio_off(const struct cellular_state *st)
+{
+	if (g_airplane_mode)
+		return YES;
+	if (st->dms_mode_raw == 0)
+		return NO;
+	if (st->dms_mode_raw == 0xff && st->reg_state_raw == 1)
+		return NO;
+	if (st->dms_mode_raw != 0xff)
+		return YES;
+	return NO;
+}
+
 static NSString *reg_status_string(const struct cellular_state *st)
 {
-	if (!st->sim_present || g_airplane_mode || !strcmp(st->radio_mode, "low_power") ||
-	    !strcmp(st->radio_mode, "offline"))
+	if (!st->sim_present || is_radio_off(st))
 		return @"kCTRegistrationStatusNotRegistered";
 	switch (st->reg_state_raw) {
 	case 1:
@@ -573,7 +585,7 @@ static id build_signal_info(const struct cellular_state *st)
 	if (!cls)
 		return nil;
 	id info = [[cls alloc] init];
-	int bars = (st->sim_present && st->reg_state_raw == 1) ? st->bars_0_to_4 : 0;
+	int bars = (st->sim_present && !is_radio_off(st) && st->reg_state_raw == 1) ? st->bars_0_to_4 : 0;
 	ct_set(info, @"bars", @(bars));
 	ct_set(info, @"displayBars", @(bars));
 	ct_set(info, @"maxDisplayBars", @(4));
@@ -613,7 +625,7 @@ static id build_data_status(const struct cellular_state *st)
 	if (!cls)
 		return nil;
 	id ds = [[cls alloc] init];
-	BOOL attached = st->sim_present && st->reg_state_raw == 1 && st->ps_attached;
+	BOOL attached = st->sim_present && !is_radio_off(st) && st->reg_state_raw == 1 && st->ps_attached;
 	/* CoreTelephony indicator table: 0=none, 2=EDGE, 3=3G, 7=LTE, 11=5G */
 	int ind = 0, rtech = 0;
 	if (attached) {
@@ -641,7 +653,7 @@ static id build_data_status_basic(const struct cellular_state *st)
 	if (!cls)
 		return nil;
 	id ds = [[cls alloc] init];
-	BOOL attached = st->sim_present && st->reg_state_raw == 1 && st->ps_attached;
+	BOOL attached = st->sim_present && !is_radio_off(st) && st->reg_state_raw == 1 && st->ps_attached;
 	ct_set(ds, @"attached", @(attached));
 	ct_set(ds, @"hasIndicator", @(attached));
 	ct_set(ds, @"inHomeCountry", @(!st->roaming));
@@ -680,10 +692,9 @@ static void publish_system_status(const struct cellular_state *st)
 	if (!g_st_publisher)
 		return;
 	@try {
-		NSString *op = st->operator_name[0] ? [NSString stringWithUTF8String:st->operator_name] : @"";
+		NSString *op = st->operator_name[0] ? [NSString stringWithUTF8String:st->operator_name] : @"Carrier";
 		BOOL simPresent = st->sim_present;
-		BOOL radioOff = g_airplane_mode || !strcmp(st->radio_mode, "low_power") ||
-				!strcmp(st->radio_mode, "offline");
+		BOOL radioOff = is_radio_off(st);
 		NSUInteger bars = (simPresent && !radioOff && st->reg_state_raw == 1)
 				  ? (NSUInteger)st->bars_0_to_4 : 0;
 
@@ -692,6 +703,8 @@ static void publish_system_status(const struct cellular_state *st)
 		if (simPresent && !radioOff) {
 			if (st->reg_state_raw == 1)
 				svcState = 2;
+			else if (st->dms_mode_raw == 0 && st->reg_state_raw == 2)
+				svcState = 1;
 			else if (st->reg_state_raw == 2)
 				svcState = 1;
 		}
@@ -1181,10 +1194,74 @@ static void trigger_qmi_radio_power(bool online);
 {
 	(void)ctx;
 	struct cellular_state st = snapshot_state();
+	const char *fb = qmi_resolve_fallback_apn(&st);
 	NSString *apn = st.data_apn[0] ? [NSString stringWithUTF8String:st.data_apn]
-			: (g_configured_apn[0] ? [NSString stringWithUTF8String:g_configured_apn] : @"internet");
+			: (g_configured_apn[0] ? [NSString stringWithUTF8String:g_configured_apn]
+			   : (fb ? [NSString stringWithUTF8String:fb] : @"internet"));
 	if (completion)
 		completion(@[ @{ @"apn": apn } ], nil);
+}
+
+/* -- Stewie, Capabilities, PNR, Private Network & Voicemail Interfaces -- */
+
+- (void)getStewieSupport:(void (^)(id, NSError *))completion
+{
+	Class cls = NSClassFromString(@"CTStewieSupport");
+	id obj = cls ? [[cls alloc] init] : nil;
+	ct_set(obj, @"status", @(NO));
+	ct_set(obj, @"hwSupport", @(NO));
+	if (completion)
+		completion(obj, nil);
+}
+
+- (void)getPhoneServicesDeviceInfo:(void (^)(NSDictionary *, NSError *))completion
+{
+	if (completion)
+		completion(@{}, nil);
+}
+
+- (void)getPNRSupportStatus:(id)ctx completion:(void (^)(id, NSError *))completion
+{
+	(void)ctx;
+	Class cls = NSClassFromString(@"CTPNRSupportStatus");
+	id obj = cls ? [[cls alloc] init] : nil;
+	ct_set(obj, @"supportType", @(0));
+	if (completion)
+		completion(obj, nil);
+}
+
+- (void)getPrivateNetworkCapabilitiesForContext:(id)ctx completion:(void (^)(id, NSError *))completion
+{
+	(void)ctx;
+	Class cls = NSClassFromString(@"CTPrivateNetworkCapabilities");
+	id obj = cls ? [[cls alloc] init] : nil;
+	ct_set(obj, @"isPrivateNetworkSIM", @(NO));
+	ct_set(obj, @"isPrivateNetworkPreferredOverWifi", @(NO));
+	ct_set(obj, @"isPrivateNetworkModeEnabled", @(NO));
+	ct_set(obj, @"hideDataRoaming", @(NO));
+	if (completion)
+		completion(obj, nil);
+}
+
+- (void)getVoicemailCallInDetails:(id)ctx completion:(void (^)(NSDictionary *, NSError *))completion
+{
+	(void)ctx;
+	if (completion)
+		completion(@{}, nil);
+}
+
+- (void)context:(id)ctx getCapability:(NSString *)cap completion:(void (^)(BOOL, NSDictionary *, NSError *))completion
+{
+	(void)ctx; (void)cap;
+	if (completion)
+		completion(NO, @{}, nil);
+}
+
+- (void)getVoicemailInfo:(id)ctx completion:(void (^)(BOOL, NSNumber *, NSString *, NSError *))completion
+{
+	(void)ctx;
+	if (completion)
+		completion(NO, @(0), @"", nil);
 }
 
 - (void)copyCarrierBundleVersion:(id)ctx completion:(void (^)(NSString *, NSError *))completion
@@ -1817,6 +1894,29 @@ static dispatch_source_t g_qrtr_read_src;
 static dispatch_source_t g_poll_timer;
 static struct qmi_ctx g_qmi;
 static unsigned g_poll_ticks;
+static uint64_t g_last_online_try_ms;
+static int g_online_attempts;
+static uint8_t g_last_logged_dms_mode = 0xfe;
+static uint64_t g_last_wds_try_ms;
+
+static uint64_t cell_mono_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000ull);
+}
+
+static uint32_t core_srv_mask(const struct qmi_ctx *ctx)
+{
+	uint32_t m = 0;
+	if (qmi_has_service(ctx, QMI_SVC_DMS)) m |= QMI_IND_MASK_DMS;
+	if (qmi_has_service(ctx, QMI_SVC_UIM)) m |= QMI_IND_MASK_UIM;
+	if (qmi_has_service(ctx, QMI_SVC_NAS)) m |= QMI_IND_MASK_NAS;
+	if (qmi_has_service(ctx, QMI_SVC_WDS)) m |= QMI_IND_MASK_WDS;
+	return m;
+}
+
+static void try_connect_and_sync(void);
 
 static void commit_and_publish(const struct cellular_state *next, bool force_broadcast)
 {
@@ -1825,6 +1925,8 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 	char prev_sim_st[32], prev_op[64], prev_reg[32], prev_rat[16];
 	int prev_bars = g_state.bars_0_to_4;
 	bool prev_ps = g_state.ps_attached;
+	bool prev_data = g_state.data_connected;
+	uint8_t prev_dms = g_state.dms_mode_raw;
 	snprintf(prev_sim_st, sizeof(prev_sim_st), "%s", g_state.sim_state);
 	snprintf(prev_op, sizeof(prev_op), "%s", g_state.operator_name);
 	snprintf(prev_reg, sizeof(prev_reg), "%s", g_state.reg_state);
@@ -1837,19 +1939,23 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 	bool sim_changed = force_broadcast || (prev_sim != next->sim_present) ||
 			   (strcmp(prev_sim_st, next->sim_state) != 0);
 	bool any_changed = sim_changed ||
+			   (prev_dms != next->dms_mode_raw) ||
 			   (prev_bars != next->bars_0_to_4) ||
 			   (prev_ps != next->ps_attached) ||
+			   (prev_data != next->data_connected) ||
 			   (strcmp(prev_op, next->operator_name) != 0) ||
 			   (strcmp(prev_reg, next->reg_state) != 0) ||
 			   (strcmp(prev_rat, next->rat) != 0);
 
 	if (any_changed) {
-		clog("state: sim=%s(slot %d,%s) mode=%s reg=%s rat=%s plmn=%s-%s op='%s' rsrp=%d bars=%d/4 ps=%d",
+		clog("state: sim=%s(slot %d,%s) mode=%s(%u,off=0x%04x,hw=%d) reg=%s rat=%s plmn=%s-%s op='%s' rsrp=%d bars=%d/4 ps=%d data=%d",
 		     next->sim_present ? "yes" : "no",
-		     next->sim_slot, next->app_state, next->radio_mode,
+		     next->sim_slot, next->app_state, next->radio_mode, next->dms_mode_raw,
+		     next->dms_offline_reason, next->dms_hw_restricted ? 1 : 0,
 		     next->reg_state, next->rat, next->mcc, next->mnc,
 		     next->operator_name, next->has_rsrp ? next->rsrp_dbm : 0,
-		     next->bars_0_to_4, next->ps_attached ? 1 : 0);
+		     next->bars_0_to_4, next->ps_attached ? 1 : 0,
+		     next->data_connected ? 1 : 0);
 		publish_system_status(next);
 		broadcast_ct_notifications(next, sim_changed);
 	}
@@ -1867,6 +1973,9 @@ static void on_qmi_indication(struct qmi_ctx *ctx, uint32_t service, uint16_t ms
 
 static void teardown_qrtr_source(void)
 {
+	g_last_online_try_ms = 0;
+	g_online_attempts = 0;
+	g_last_logged_dms_mode = 0xfe;
 	if (g_qrtr_read_src) {
 		dispatch_source_cancel(g_qrtr_read_src);
 		g_qrtr_read_src = nil;
@@ -1875,24 +1984,88 @@ static void teardown_qrtr_source(void)
 	}
 }
 
+static void ensure_dms_online_if_needed(struct cellular_state *cur)
+{
+	if (!qmi_has_service(&g_qmi, QMI_SVC_DMS))
+		return;
+	if (cur->dms_mode_raw == 0) {
+		g_online_attempts = 0;
+		g_last_logged_dms_mode = 0;
+		return;
+	}
+	if (cur->dms_mode_raw == 0xff)
+		return;
+
+	if (g_last_logged_dms_mode != cur->dms_mode_raw) {
+		g_last_logged_dms_mode = cur->dms_mode_raw;
+		clog("DMS non-online: mode='%s' (%u) offline_reason=0x%04x(valid=%d) hw_restricted=%d",
+		     cur->radio_mode, cur->dms_mode_raw,
+		     cur->dms_offline_reason, cur->has_dms_offline_reason ? 1 : 0,
+		     cur->dms_hw_restricted ? 1 : 0);
+	}
+
+	if (g_airplane_mode || g_online_attempts >= 6)
+		return;
+	uint64_t now_ms = cell_mono_ms();
+	if (g_last_online_try_ms != 0 && (now_ms - g_last_online_try_ms) < 10000ull)
+		return;
+
+	g_online_attempts++;
+	g_last_online_try_ms = now_ms;
+	uint16_t qerr = 0;
+	int mrc = qmi_dms_set_operating_mode_ex(&g_qmi, 0x00, &qerr);
+	clog("QMI_DMS_SET_OPERATING_MODE(ONLINE) attempt %d/6 from '%s'(%u, off_reason=0x%04x, hw=%d) -> rc=%d qmi_err=0x%04x",
+	     g_online_attempts, cur->radio_mode, cur->dms_mode_raw,
+	     cur->dms_offline_reason, cur->dms_hw_restricted ? 1 : 0, mrc, qerr);
+	if (mrc != 0 && cur->dms_mode_raw == 6) {
+		/* persistent_low_power sometimes requires transition via LOW_POWER (1) first */
+		uint16_t lperr = 0;
+		int lprc = qmi_dms_set_operating_mode_ex(&g_qmi, 0x01, &lperr);
+		if (lprc == 0) {
+			usleep(100000);
+			mrc = qmi_dms_set_operating_mode_ex(&g_qmi, 0x00, &qerr);
+			clog("QMI_DMS_SET_OPERATING_MODE(LP->ONLINE) retry -> rc=%d qmi_err=0x%04x", mrc, qerr);
+		}
+	}
+	if (mrc == 0) {
+		usleep(200000);
+		(void)qmi_poll_all(&g_qmi, cur, !cur->modem_rev[0]);
+		if (cur->dms_mode_raw == 0)
+			g_online_attempts = 0;
+	}
+}
+
 static void try_connect_and_sync(void)
 {
+	bool just_connected = false;
 	if (g_qmi.fd < 0) {
 		g_qmi.ind_cb = on_qmi_indication;
 		if (qmi_open(&g_qmi, SWEET_QRTR_SOCK) < 0)
 			return;
+		just_connected = true;
+		g_last_online_try_ms = 0;
+		g_online_attempts = 0;
+		g_last_logged_dms_mode = 0xfe;
 		clog("connected to %s (fd %d)", SWEET_QRTR_SOCK, g_qmi.fd);
 
 		int fd_copy = g_qmi.fd;
 		dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,
 							       (uintptr_t)fd_copy, 0, g_qmi_queue);
 		dispatch_source_set_event_handler(src, ^{
+			uint32_t before_srv = core_srv_mask(&g_qmi);
 			if (qmi_drain_rx(&g_qmi, 0) < 0) {
 				clog("QRTR socket disconnected; will retry");
 				teardown_qrtr_source();
 				struct cellular_state cur = snapshot_state();
 				cur.qrtr_connected = false;
 				commit_and_publish(&cur, false);
+				return;
+			}
+			uint32_t after_srv = core_srv_mask(&g_qmi);
+			if ((after_srv & ~before_srv) != 0) {
+				clog("late QMI services arrived (mask 0x%x -> 0x%x); syncing immediately",
+				     before_srv, after_srv);
+				try_connect_and_sync();
 			}
 		});
 		dispatch_source_set_cancel_handler(src, ^{
@@ -1902,51 +2075,65 @@ static void try_connect_and_sync(void)
 		dispatch_resume(src);
 
 		(void)qmi_sync_servers(&g_qmi, 600);
-		if (qmi_has_service(&g_qmi, QMI_SVC_DMS)) {
-			struct cellular_state cur = snapshot_state();
-			(void)qmi_poll_all(&g_qmi, &cur, true);
-			if (!g_airplane_mode && cur.dms_mode_raw != 0 && cur.dms_mode_raw != 0xff) {
-				clog("bringing QMI_DMS from '%s' (%u) -> ONLINE", cur.radio_mode, cur.dms_mode_raw);
-				(void)qmi_dms_set_operating_mode(&g_qmi, 0x00);
-				usleep(200000);
-			}
-		}
-		(void)qmi_register_indications(&g_qmi);
-		struct cellular_state init_st = snapshot_state();
-		(void)qmi_poll_all(&g_qmi, &init_st, true);
-		commit_and_publish(&init_st, true);
-		if (fn_notify_post)
-			fn_notify_post("kCTDaemonReadyLocalNotification");
-		return;
 	}
 
-	/* Connected: periodic 5s backup poll (full UIM+NAS every 3rd tick = 15s) */
+	/* Dynamically register indications as DMS/UIM/NAS/WDS become available */
+	int new_ind = qmi_register_indications(&g_qmi);
+	if (new_ind > 0)
+		clog("registered QMI indications: +0x%x (mask=0x%x)", new_ind, g_qmi.ind_reg_mask);
+
 	g_poll_ticks++;
 	struct cellular_state cur = snapshot_state();
-	if ((g_poll_ticks % 3) == 0 || !qmi_has_service(&g_qmi, QMI_SVC_NAS)) {
-		(void)qmi_poll_all(&g_qmi, &cur, false);
+	bool need_full = just_connected || ((g_poll_ticks % 3) == 0) ||
+			 !cur.sim_present || (cur.dms_mode_raw != 0) ||
+			 !cur.modem_rev[0] || !qmi_has_service(&g_qmi, QMI_SVC_NAS);
+	if (need_full) {
+		(void)qmi_poll_all(&g_qmi, &cur, just_connected || !cur.modem_rev[0]);
 	} else {
 		(void)qmi_poll_fast(&g_qmi, &cur);
 	}
 
+	/* Ensure DMS operating mode reaches ONLINE when AirplaneMode is off */
+	ensure_dms_online_if_needed(&cur);
+
+	/* Re-run indication registration in case new services appeared during poll */
+	new_ind = qmi_register_indications(&g_qmi);
+	if (new_ind > 0)
+		clog("registered QMI indications: +0x%x (mask=0x%x)", new_ind, g_qmi.ind_reg_mask);
+
 	/* Stage 7B optional packet data session bring-up when gated on */
 	if (g_enable_wds_data && g_cellular_data_enabled && !g_airplane_mode &&
-	    cur.sim_present && cur.reg_state_raw == 1 && cur.ps_attached && !cur.data_connected) {
-		int wrc = qmi_wds_test_session(&g_qmi, &cur, g_configured_apn, true);
-		clog("WDS auto-session bring-up -> rc=%d ip='%s' gw='%s' dns='%s' mtu=%u",
-		     wrc, cur.data_ip, cur.data_gateway, cur.data_dns1, cur.data_mtu);
+	    cur.dms_mode_raw == 0 && cur.sim_present && cur.reg_state_raw == 1 &&
+	    cur.ps_attached && !cur.data_connected) {
+		uint64_t now_ms = cell_mono_ms();
+		if (g_last_wds_try_ms == 0 || (now_ms - g_last_wds_try_ms) >= 15000ull) {
+			g_last_wds_try_ms = now_ms;
+			int wrc = qmi_wds_test_session(&g_qmi, &cur, g_configured_apn, true);
+			clog("WDS auto-session bring-up (cfg_apn='%s') -> rc=%d apn='%s' ip='%s' gw='%s' dns='%s' mtu=%u end=%u/%u",
+			     g_configured_apn, wrc, cur.data_apn, cur.data_ip,
+			     cur.data_gateway, cur.data_dns1, cur.data_mtu,
+			     cur.wds_end_reason_type, cur.wds_end_reason);
+		}
 	}
 
-	commit_and_publish(&cur, false);
+	commit_and_publish(&cur, just_connected);
+	if (just_connected && fn_notify_post)
+		fn_notify_post("kCTDaemonReadyLocalNotification");
 }
 
 static void trigger_qmi_radio_power(bool online)
 {
 	dispatch_async(g_qmi_queue, ^{
+		g_online_attempts = 0;
+		g_last_online_try_ms = 0;
+		g_last_logged_dms_mode = 0xfe;
 		if (g_qmi.fd >= 0 && qmi_has_service(&g_qmi, QMI_SVC_DMS)) {
-			(void)qmi_dms_set_operating_mode(&g_qmi, online ? 0x00 : 0x01);
+			uint16_t qerr = 0;
+			int mrc = qmi_dms_set_operating_mode_ex(&g_qmi, online ? 0x00 : 0x01, &qerr);
+			clog("AirplaneMode radio power -> %s: rc=%d qmi_err=0x%04x",
+			     online ? "ONLINE" : "LOW_POWER", mrc, qerr);
 			struct cellular_state cur = snapshot_state();
-			(void)qmi_poll_all(&g_qmi, &cur, false);
+			(void)qmi_poll_all(&g_qmi, &cur, !cur.modem_rev[0]);
 			commit_and_publish(&cur, false);
 		}
 	});
