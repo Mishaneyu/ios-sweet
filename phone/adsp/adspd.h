@@ -28,11 +28,13 @@
 #define ADSP_CARVEOUT_SIZE          0x01e00000ULL /* 30 MiB */
 
 /*
- * Uncached <4 GiB HLOS DRAM audio DMA pool right after wland's 16 MiB pool
- * (0xE0000000..0xE1000000). LPASS Q6 uses 32-bit IOVA + (cb_idx << 32)
- * where SID 0x1b21 maps via (1ULL << 32).
+ * Uncached <4 GiB HLOS DRAM audio DMA pool in 0xC0000000..0xC0800000 (inside
+ * the 64 MiB 0xC0000000..0xC4000000 window left untouched by XNU >=0x100000000,
+ * sweet_gpu.c 0xC4000000..0xE0000000 / 0xE1000000..0x100000000, and wland
+ * 0xE0000000..0xE1000000). LPASS Q6 uses 32-bit IOVA + (cb_idx << 32) where
+ * SID 0x1b21 maps via (1ULL << 32) through our apps_smmu Stage-1 L1 page table.
  */
-#define ADSP_DMA_PA                 0xE1000000ULL
+#define ADSP_DMA_PA                 0xC0000000ULL
 #define ADSP_DMA_PERIODS            8u
 #define ADSP_DMA_PERIOD_ALLOC       4096u
 #define ADSP_DMA_TOTAL_BYTES        (ADSP_DMA_PERIODS * ADSP_DMA_PERIOD_ALLOC) /* 32768 B */
@@ -40,21 +42,25 @@
 #define ADSP_PCM_PERIOD_BYTES       (ADSP_PCM_PERIOD_FRAMES * HAKIOS_AUDIO_FRAME) /* 3840 B */
 #define ADSP_DSP_IOVA_HIGH          0x00000001u
 
+/* 4 KiB ARMv8-A Stage-1 Level-1 page table (1 GiB blocks) for apps_smmu */
+#define ADSP_SMMU_PT_PA             0xC0008000ULL
+#define ADSP_SMMU_PT_SIZE           0x00001000ULL
+
 /*
  * FastRPC static PD ("audiopd") & reverse-RPC buffers in <4 GiB unmanaged DRAM:
- *   - 0xE1010000..0xE1014000 (16 KiB): sync CREATE_STATIC / listener_init2 page
- *   - 0xE1014000..0xE1024000 (64 KiB): async adsp_listener_next2 reverse-RPC page
- *   - 0xE1400000..0xE1800000 (4 MiB, 4 MiB-aligned per live.dtb adsp_region):
+ *   - 0xC0010000..0xC0014000 (16 KiB): sync CREATE_STATIC / listener_init2 page
+ *   - 0xC0014000..0xC0024000 (64 KiB): async adsp_listener_next2 reverse-RPC page
+ *   - 0xC0400000..0xC0800000 (4 MiB, 4 MiB-aligned per live.dtb adsp_region):
  *     remote heap hyp_assigned to {HLOS, MSS_MSA, SSC_Q6, ADSP_Q6} RWX (2 MiB passed
  *     to FASTRPC_INIT_CREATE_STATIC as pure 32-bit PA).
  *   adsprpc-smd (SID 0x1b23) maps invoke pages via cb=3 -> (3ULL << 32).
  */
 #define ADSP_FASTRPC_CB_HIGH        0x00000003u
-#define ADSP_FASTRPC_MSG_PA         0xE1010000ULL
+#define ADSP_FASTRPC_MSG_PA         0xC0010000ULL
 #define ADSP_FASTRPC_MSG_SIZE       0x00004000ULL
-#define ADSP_FASTRPC_LST_PA         0xE1014000ULL
+#define ADSP_FASTRPC_LST_PA         0xC0014000ULL
 #define ADSP_FASTRPC_LST_SIZE       0x00010000ULL
-#define ADSP_FASTRPC_HEAP_PA        0xE1400000ULL
+#define ADSP_FASTRPC_HEAP_PA        0xC0400000ULL
 #define ADSP_FASTRPC_HEAP_HYP_SIZE  0x00400000ULL
 #define ADSP_FASTRPC_HEAP_SIZE      0x00200000ULL
 
@@ -166,6 +172,7 @@ void     smp2p_adsp_service(void);
 int      adsp_pas_boot(void);
 int      adsp_pas_shutdown(void);
 int      adsp_smmu_setup(void);
+void     adsp_smmu_check_fault(const char *tag);
 int      adsp_hyp_assign_fastrpc_heap(void);
 
 void     tlmm_setup_quat_mi2s(void);

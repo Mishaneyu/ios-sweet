@@ -2204,6 +2204,7 @@ fastrpc_call_sync(bool kernel, uint32_t tid, uint64_t ctx, uint32_t handle,
 		(void)adsp_glink_poll(5);
 	}
 	frpc_sync_wait.waiting = false;
+	adsp_smmu_check_fault("fastrpc");
 	if (!frpc_sync_wait.done) {
 		adsp_log("fastrpc: timeout waiting for ctx=0x%llx (sc=0x%x)",
 		    (unsigned long long)ctx, sc);

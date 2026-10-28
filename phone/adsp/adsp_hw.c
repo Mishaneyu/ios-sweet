@@ -1129,11 +1129,17 @@ adsp_pas_boot(void)
 	return -1;
 }
 
-/* ---- apps_smmu@0x15000000 S1-bypass stream for SID 0x1b21 ---- */
+/* ---- apps_smmu@0x15000000 VMSAv8-64 Stage-1 stream for SID 0x1b20..0x1b2f ---- */
 
-#define SMMU_CB_CBAR  0x0001f000u
-#define SMMU_CB_CBA2R 0x00000001u
-#define SMMU_CB_SCTLR 0x000000e0u /* M=0 (translation disabled / identity PA) */
+#define GCC_AUDIO_TBU_GDSC_PA 0x0017d040ULL /* hlos1_vote_aggre_noc_mmu_audio_tbu_gdsc */
+#define SMMU_CB_CBAR          0x00010000u   /* CBAR_TYPE_S2_BYPASS (Stage-1 translate) */
+#define SMMU_CB_CBA2R         0x00000001u   /* VA64 (AArch64 VMSAv8-64) */
+/* M=1 (Stage-1 MMU on) | CFRE=1 (abort cleanly, never stall NOC) | HUPCF=1; CFCFG=0, CFIE=0 */
+#define SMMU_CB_SCTLR_S1      0x00000121u
+/* T0SZ=28 (36-bit IA: 0x0_00000000..0xF_FFFFFFFF -> 64x 1 GiB L1 entries), NC walks, OSH, 4KB, EPD1=1 */
+#define SMMU_CB_TCR_S1        (28u | (2u << 12) | (1u << 23))
+/* MAIR0: Attr0=0x44 (Normal Outer/Inner Non-Cacheable), Attr1=0xff (Normal WBWA) */
+#define SMMU_CB_MAIR0_S1      0x0000ff44u
 
 static bool
 smmu_sid_matches(uint32_t smr, uint32_t sid, uint32_t mask)
@@ -1144,19 +1150,58 @@ smmu_sid_matches(uint32_t smr, uint32_t sid, uint32_t mask)
 	return ((id ^ sid) & ~(m | mask) & 0x7fffu) == 0;
 }
 
+void
+adsp_smmu_check_fault(const char *tag)
+{
+	uint64_t s = APPS_SMMU_PA, cbp;
+	uint32_t id1, psize, npage, fsr, fsynr0, far_lo, far_hi;
+
+	if (!g_status.smmu_configured || g_status.smmu_cb < 0) {
+		return;
+	}
+	id1 = rd32(s + 0x24);
+	psize = (id1 >> 31) ? 0x10000u : 0x1000u;
+	npage = 1u << (((id1 >> 28) & 7u) + 1u);
+	cbp = s + (uint64_t)npage * psize + (uint64_t)g_status.smmu_cb * psize;
+	fsr = rd32(cbp + 0x58);
+	if (fsr != 0) {
+		fsynr0 = rd32(cbp + 0x68);
+		far_lo = rd32(cbp + 0x60);
+		far_hi = rd32(cbp + 0x64);
+		adsp_log("smmu: %s CB%d FAULT FSR=0x%08x FSYNR0=0x%08x FAR=0x%x:%08x",
+		    tag ? tag : "check", g_status.smmu_cb, fsr, fsynr0, far_hi, far_lo);
+		wr32(cbp + 0x58, fsr);
+	}
+}
+
 int
 adsp_smmu_setup(void)
 {
 	static const uint8_t z[4096];
+	uint64_t l1[512];
 	uint64_t s = APPS_SMMU_PA, gr1, cbp;
-	uint32_t id0 = rd32(s + 0x20), id1 = rd32(s + 0x24);
-	uint32_t nsmr = id0 & 0xffu, ncb = id1 & 0xffu;
-	uint32_t psize = (id1 >> 31) ? 0x10000u : 0x1000u;
-	uint32_t npage = 1u << (((id1 >> 28) & 7u) + 1u);
+	uint32_t gdsc, id0, id1, id2, nsmr, ncb, psize, npage, tcr2;
 	uint64_t used_cb[4] = { 0 };
-	int free_smr = -1, free_cb = -1;
+	int free_smr = -1, free_cb = -1, existing_smr = -1;
 
-	/* Zero our <4 GiB audio DMA pool and FastRPC invoke pages first */
+	/* Vote ON adsp_tbu@0x1519d000 GDSC (clear SW_COLLAPSE bit 0) before touching SMMU/DMA */
+	gdsc = rd32(GCC_AUDIO_TBU_GDSC_PA);
+	if (gdsc & 1u) {
+		wr32(GCC_AUDIO_TBU_GDSC_PA, gdsc & ~1u);
+		for (int w = 0; w < 200 && !(rd32(GCC_AUDIO_TBU_GDSC_PA) & 0x80000000u); w++) {
+			usleep(10);
+		}
+	}
+
+	id0 = rd32(s + 0x20);
+	id1 = rd32(s + 0x24);
+	id2 = rd32(s + 0x28);
+	nsmr = id0 & 0xffu;
+	ncb = id1 & 0xffu;
+	psize = (id1 >> 31) ? 0x10000u : 0x1000u;
+	npage = 1u << (((id1 >> 28) & 7u) + 1u);
+
+	/* Zero <4 GiB audio DMA pool and FastRPC invoke pages */
 	for (uint64_t o = 0; o < ADSP_DMA_TOTAL_BYTES; o += sizeof(z)) {
 		(void)pm_wr(ADSP_DMA_PA + o, z, sizeof(z));
 	}
@@ -1166,6 +1211,25 @@ adsp_smmu_setup(void)
 	for (uint64_t o = 0; o < ADSP_FASTRPC_LST_SIZE; o += sizeof(z)) {
 		(void)pm_wr(ADSP_FASTRPC_LST_PA + o, z, sizeof(z));
 	}
+
+	/*
+	 * Build 4 KiB VMSAv8-64 Stage-1 Level-1 page table at ADSP_SMMU_PT_PA (0xC0008000):
+	 * LPASS Q6 encodes Stream ID cb (1 for audio 0x1b21, 3..5 for adsprpc-smd 0x1b23..0x1b25)
+	 * in bits [35:32] of the 36-bit bus address ((cb << 32) | pa32). With S1 bypass (M=0),
+	 * MMU-500 emitted 0x3_xxxxxxxx (15+ GiB) straight onto GEM_NOC, causing a NOC DECERR -> TZ
+	 * warm reset! Mapping 1 GiB blocks for c=0..15, g=2..3 (0x80000000..0xFFFFFFFF) strips
+	 * bits [35:32] cleanly whether QSB strips them or passes all 36 bits to apps_smmu.
+	 */
+	memset(l1, 0, sizeof(l1));
+	for (unsigned c = 0; c < 16u; c++) {
+		for (unsigned g = 2u; g <= 3u; g++) {
+			uint64_t out_pa = (uint64_t)g << 30;
+			/* Valid L1 1 GiB Block (0b01) | AttrIndx=0 (NC) | AP=0b01 (RW all) | SH=OSH | AF=1 */
+			l1[(c << 2) | g] = out_pa | (1ULL << 10) | (2ULL << 8) | (1ULL << 6) | 1ULL;
+		}
+	}
+	(void)pm_wr(ADSP_SMMU_PT_PA, l1, sizeof(l1));
+	__asm__ volatile("dsb sy" ::: "memory");
 
 	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
 		uint32_t smr = rd32(s + 0x800 + 4 * i);
@@ -1181,24 +1245,24 @@ adsp_smmu_setup(void)
 			uint32_t c = s2cr & 0xffu;
 			used_cb[c / 64] |= 1ULL << (c % 64);
 		}
-		if (smmu_sid_matches(smr, ADSP_AUDIO_SMMU_SID, ADSP_AUDIO_SMMU_MASK)) {
-			uint32_t c = s2cr & 0xffu;
-			cbp = s + (uint64_t)npage * psize + (uint64_t)c * psize;
-			adsp_log("smmu: SMR%u (0x%08x) already covers SID 0x%x -> CB%u (SCTLR=0x%08x)",
-			    i, smr, ADSP_AUDIO_SMMU_SID, c, rd32(cbp));
-			g_status.smmu_configured = true;
-			g_status.smmu_cb = (int)c;
-			return 0;
+		if (smmu_sid_matches(smr, ADSP_AUDIO_SMMU_SID, ADSP_AUDIO_SMMU_MASK) &&
+		    ((s2cr >> 16) & 3u) == 0) {
+			existing_smr = (int)i;
+			free_smr = (int)i;
+			free_cb = (int)(s2cr & 0xffu);
+			break;
 		}
 	}
 
-	for (uint32_t c = 0; c < ncb && c < 256; c++) {
-		cbp = s + (uint64_t)npage * psize + (uint64_t)c * psize;
-		if (!(used_cb[c / 64] & (1ULL << (c % 64))) &&
-		    !(rd32(cbp) & 1u) &&
-		    rd32(s + psize + 4 * c) == 0) {
-			free_cb = (int)c;
-			break;
+	if (free_cb < 0) {
+		for (uint32_t c = 0; c < ncb && c < 256; c++) {
+			cbp = s + (uint64_t)npage * psize + (uint64_t)c * psize;
+			if (!(used_cb[c / 64] & (1ULL << (c % 64))) &&
+			    !(rd32(cbp) & 1u) &&
+			    rd32(s + psize + 4 * c) == 0) {
+				free_cb = (int)c;
+				break;
+			}
 		}
 	}
 	if (free_smr < 0 || free_cb < 0) {
@@ -1209,26 +1273,38 @@ adsp_smmu_setup(void)
 
 	gr1 = s + psize;
 	cbp = s + (uint64_t)npage * psize + (uint64_t)free_cb * psize;
-	wr32(cbp + 0x58, 0xffffffffu);
-	wr32(cbp + 0x20, 0);
-	wr32(cbp + 0x24, 0);
-	wr32(cbp + 0x30, 0);
-	wr32(cbp + 0x10, 0);
-	wr32(cbp + 0x38, 0);
-	wr32(cbp + 0x3c, 0);
+	tcr2 = ((id2 >> 4) & 7u) | (7u << 15); /* PASize=OAS | TCR2_SEP_UPSTREAM */
+
+	wr32(cbp, 0); /* Disable CB while updating translation tables */
+	wr32(cbp + 0x58, 0xffffffffu); /* Clear FSR */
 	wr32(gr1 + 0x800 + 4 * (uint64_t)free_cb, SMMU_CB_CBA2R);
 	wr32(gr1 + 4 * (uint64_t)free_cb, SMMU_CB_CBAR);
-	wr32(cbp, SMMU_CB_SCTLR);
-	wr32(s + 0xc00 + 4 * (uint64_t)free_smr, (uint32_t)free_cb);
-	wr32(s + 0x800 + 4 * (uint64_t)free_smr,
-	    (1u << 31) | (ADSP_AUDIO_SMMU_MASK << 16) | ADSP_AUDIO_SMMU_SID);
+	wr32(cbp + 0x20, (uint32_t)(ADSP_SMMU_PT_PA & 0xffffffffu));
+	wr32(cbp + 0x24, ((uint32_t)(ADSP_SMMU_PT_PA >> 32) & 0xffffu) | ((uint32_t)free_cb << 16));
+	wr32(cbp + 0x28, 0);
+	wr32(cbp + 0x2c, 0);
+	wr32(cbp + 0x38, SMMU_CB_MAIR0_S1);
+	wr32(cbp + 0x3c, 0);
+	wr32(cbp + 0x10, tcr2);
+	wr32(cbp + 0x30, SMMU_CB_TCR_S1);
+	wr32(cbp + 0x600, (uint32_t)free_cb); /* CBn_TLBIASID */
+	wr32(cbp, SMMU_CB_SCTLR_S1);
+	if (existing_smr < 0) {
+		wr32(s + 0xc00 + 4 * (uint64_t)free_smr, (uint32_t)free_cb);
+		wr32(s + 0x800 + 4 * (uint64_t)free_smr,
+		    (1u << 31) | (ADSP_AUDIO_SMMU_MASK << 16) | ADSP_AUDIO_SMMU_SID);
+	}
 	wr32(s + 0x70, 0); /* sTLBGSYNC */
+	for (int i = 0; i < 50 && (rd32(s + 0x74) & 1u); i++) {
+		usleep(1000);
+	}
 
 	g_status.smmu_configured = true;
 	g_status.smmu_cb = free_cb;
-	adsp_log("smmu: mapped SID 0x%x (mask 0x%x) -> SMR%d / CB%d (S1 bypass, DMA PA 0x%llx)",
+	adsp_log("smmu: mapped SID 0x%x (mask 0x%x) -> SMR%d / CB%d (S1 L1@0x%llx SCTLR=0x%08x TCR=0x%08x TCR2=0x%08x GDSC=0x%08x)",
 	    ADSP_AUDIO_SMMU_SID, ADSP_AUDIO_SMMU_MASK, free_smr, free_cb,
-	    (unsigned long long)ADSP_DMA_PA);
+	    (unsigned long long)ADSP_SMMU_PT_PA, rd32(cbp), rd32(cbp + 0x30),
+	    rd32(cbp + 0x10), rd32(GCC_AUDIO_TBU_GDSC_PA));
 	return 0;
 }
 

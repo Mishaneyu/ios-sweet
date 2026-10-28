@@ -21,8 +21,10 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "adspd.h"
@@ -265,24 +267,42 @@ escape_jetsam_and_bg(void)
 	(void)setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_IMPORTANT);
 }
 
+static bool
+qrtr_sock_is_live(void)
+{
+	struct sockaddr_un sun;
+	int s, rc;
+
+	s = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (s < 0) {
+		return false;
+	}
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_family = AF_UNIX;
+	strncpy(sun.sun_path, QRTR_MUX_SOCK_PATH, sizeof(sun.sun_path) - 1);
+	rc = connect(s, (struct sockaddr *)&sun, sizeof(sun));
+	close(s);
+	return rc == 0;
+}
+
 static void
 wait_for_wland_qrtr(void)
 {
-	if (access(QRTR_MUX_SOCK_PATH, F_OK) == 0) {
-		adsp_log("coexist: %s already up", QRTR_MUX_SOCK_PATH);
+	if (qrtr_sock_is_live()) {
+		adsp_log("coexist: %s already listening", QRTR_MUX_SOCK_PATH);
 		return;
 	}
-	adsp_log("coexist: waiting up to 12s for %s so wland finishes MPSS boot first...",
+	adsp_log("coexist: waiting up to 20s for live %s so wland finishes MPSS boot first...",
 	    QRTR_MUX_SOCK_PATH);
-	for (int i = 0; i < 120 && !g_stop_requested; i++) {
-		if (access(QRTR_MUX_SOCK_PATH, F_OK) == 0) {
-			adsp_log("coexist: %s ready after %d ms", QRTR_MUX_SOCK_PATH, i * 100);
-			delay_ms(200);
+	for (int i = 0; i < 200 && !g_stop_requested; i++) {
+		if (qrtr_sock_is_live()) {
+			adsp_log("coexist: %s live after %d ms", QRTR_MUX_SOCK_PATH, i * 100);
+			delay_ms(400);
 			return;
 		}
 		delay_ms(100);
 	}
-	adsp_log("coexist: proceeding without %s after 12s timeout", QRTR_MUX_SOCK_PATH);
+	adsp_log("coexist: proceeding without live %s after 20s timeout", QRTR_MUX_SOCK_PATH);
 }
 
 static int
