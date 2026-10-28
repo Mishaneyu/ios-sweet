@@ -68,6 +68,7 @@
 #define ADM_CMD_DEVICE_CLOSE_V5                 0x00010327u
 #define ADM_CMDRSP_DEVICE_OPEN_V5               0x00010329u
 #define ADM_TOPOLOGY_NONE                       0x00010312u
+#define ADM_DEFAULT_COPP_TOPOLOGY               0x00010314u
 
 /* ---- Q6ASM ---- */
 #define ASM_SESSION_ID                          1u
@@ -88,6 +89,7 @@
 #define ASM_DEFAULT_POPP_TOPOLOGY               0x00010be4u
 #define ASM_TOPOLOGY_NONE                       0x00010c68u
 #define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2      0x00010da5u
+#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V4      0x0001320cu
 
 /* ---- Q6Voice (MVM / CVS / CVP, techpack/audio/include/dsp/q6voice.h) ---- */
 #define VSS_IMVM_CMD_CREATE_PASSIVE_CTL_SESSION 0x000110ffu
@@ -136,6 +138,7 @@ struct apr_hdr {
 static struct {
 	bool     waiting;
 	uint32_t want_token;
+	uint32_t expect_opcode;
 	bool     done;
 	uint32_t rsp_opcode;
 	uint32_t basic_status;
@@ -206,6 +209,7 @@ apr_call_ex(uint8_t svc, uint16_t src_port, uint16_t dst_port, uint32_t opcode,
 	memset(&sync_wait, 0, sizeof(sync_wait));
 	sync_wait.waiting = true;
 	sync_wait.want_token = tok;
+	sync_wait.expect_opcode = expect_rsp_op;
 
 	if (apr_send_raw(svc, src_port, dst_port, tok, opcode, payload, payload_size) != 0) {
 		sync_wait.waiting = false;
@@ -230,7 +234,9 @@ apr_call_ex(uint8_t svc, uint16_t src_port, uint16_t dst_port, uint32_t opcode,
 			return -(int)sync_wait.basic_status;
 		}
 		if (expect_rsp_op != 0 && expect_rsp_op != APR_BASIC_RSP_RESULT) {
-			/* Basic ACK arrived with status 0 */
+			adsp_log("apr: svc=%u op=0x%x got basic ACK without 0x%x",
+			    svc, opcode, expect_rsp_op);
+			return -1;
 		}
 	} else if (expect_rsp_op != 0 && sync_wait.rsp_opcode != expect_rsp_op) {
 		adsp_log("apr: unexpected rsp 0x%x for op 0x%x", sync_wait.rsp_opcode, opcode);
@@ -301,6 +307,16 @@ adsp_apr_rx(const uint8_t *data, uint32_t len)
 	}
 
 	if (sync_wait.waiting && h.token == sync_wait.want_token) {
+		if (h.opcode == APR_BASIC_RSP_RESULT && body_bytes >= 8) {
+			uint32_t bstat = 0;
+			memcpy(&bstat, body + 4, 4);
+			if (bstat == 0 && sync_wait.expect_opcode != 0 &&
+			    sync_wait.expect_opcode != APR_BASIC_RSP_RESULT) {
+				/* Intermediate APR_BASIC_RSP_RESULT(status=0); keep waiting for CMDRSP */
+				return;
+			}
+			sync_wait.basic_status = bstat;
+		}
 		sync_wait.rsp_opcode = h.opcode;
 		sync_wait.src_port = h.src_port;
 		memset(sync_wait.words, 0, sizeof(sync_wait.words));
@@ -308,9 +324,6 @@ adsp_apr_rx(const uint8_t *data, uint32_t len)
 			size_t cp = body_bytes < sizeof(sync_wait.words) ?
 			    body_bytes : sizeof(sync_wait.words);
 			memcpy(sync_wait.words, body, cp);
-		}
-		if (h.opcode == APR_BASIC_RSP_RESULT && body_bytes >= 8) {
-			sync_wait.basic_status = sync_wait.words[1];
 		}
 		sync_wait.done = true;
 		return;
@@ -655,6 +668,14 @@ fill_period_pcm(int16_t *dst_stereo, uint32_t frames)
 static int
 q6_open_media_stream(void)
 {
+	/*
+	 * Match stock RMX1931 msm_pcm_playback_prepare + adm_open (LEGACY_PCM_MODE):
+	 *   1) ASM_STREAM_CMD_OPEN_WRITE_V3: mode_flags=0, topo=0x10be4, fmt=PCM_V4(0x1320c)
+	 *   2) ADM_CMD_DEVICE_OPEN_V5: flags=0x0000 (NOT 0x0200 ULLPP!), topo=0x10314
+	 *   3) ADM_CMD_MATRIX_MAP_ROUTINGS_V5: matrix=AUDIO_RX(0), session=1 -> copp_id
+	 *   4) ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2: fmt_blk_size=24, sample_word_size=16
+	 *   5) ASM_SESSION_CMD_RUN_V2 + prime 8 x 20 ms DMA buffers
+	 */
 	struct {
 		uint16_t flags;
 		uint16_t mode_of_operation;
@@ -666,11 +687,11 @@ q6_open_media_stream(void)
 		uint32_t sample_rate;
 		uint8_t  dev_channel_mapping[8];
 	} __attribute__((packed)) adm_open = {
-		.flags               = 0x0200u, /* legacy stream bit */
-		.mode_of_operation   = 1u,      /* playback */
+		.flags               = 0x0000u, /* LEGACY COPP routed through MtMx */
+		.mode_of_operation   = 1u,      /* ADM_PATH_PLAYBACK */
 		.endpoint_id_1       = AFE_PORT_ID_QUATERNARY_MI2S_RX,
 		.endpoint_id_2       = 0xffffu,
-		.topology_id         = ADM_TOPOLOGY_NONE,
+		.topology_id         = ADM_DEFAULT_COPP_TOPOLOGY,
 		.dev_num_channel     = HAKIOS_AUDIO_CHANNELS,
 		.bit_width           = 16u,
 		.sample_rate         = HAKIOS_AUDIO_RATE,
@@ -686,8 +707,8 @@ q6_open_media_stream(void)
 		.mode_flags         = 0u,
 		.sink_endpoint_type = 0u,
 		.bits_per_sample    = 16u,
-		.postproc_topo_id   = ASM_TOPOLOGY_NONE,
-		.dec_fmt_id         = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2,
+		.postproc_topo_id   = ASM_DEFAULT_POPP_TOPOLOGY,
+		.dec_fmt_id         = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V4,
 	};
 	struct {
 		uint32_t matrix_id;
@@ -708,15 +729,37 @@ q6_open_media_stream(void)
 		uint16_t bits_per_sample;
 		uint32_t sample_rate;
 		uint16_t is_signed;
-		uint16_t reserved;
+		uint16_t sample_word_size;
 		uint8_t  channel_mapping[8];
-	} __attribute__((packed)) fmt = {
-		.fmt_blk_size    = 20u,
-		.num_channels    = HAKIOS_AUDIO_CHANNELS,
-		.bits_per_sample = 16u,
-		.sample_rate     = HAKIOS_AUDIO_RATE,
-		.is_signed       = 1u,
-		.channel_mapping = { 1, 2, 0, 0, 0, 0, 0, 0 },
+		uint16_t endian;
+		uint16_t mode;
+	} __attribute__((packed)) fmt_v4 = {
+		.fmt_blk_size     = 24u,
+		.num_channels     = HAKIOS_AUDIO_CHANNELS,
+		.bits_per_sample  = 16u,
+		.sample_rate      = HAKIOS_AUDIO_RATE,
+		.is_signed        = 1u,
+		.sample_word_size = 16u,
+		.channel_mapping  = { 1, 2, 0, 0, 0, 0, 0, 0 },
+		.endian           = 0u,
+		.mode             = 0u,
+	};
+	struct {
+		uint32_t fmt_blk_size;
+		uint16_t num_channels;
+		uint16_t bits_per_sample;
+		uint32_t sample_rate;
+		uint16_t is_signed;
+		uint16_t sample_word_size;
+		uint8_t  channel_mapping[8];
+	} __attribute__((packed)) fmt_v2 = {
+		.fmt_blk_size     = 20u,
+		.num_channels     = HAKIOS_AUDIO_CHANNELS,
+		.bits_per_sample  = 16u,
+		.sample_rate      = HAKIOS_AUDIO_RATE,
+		.is_signed        = 1u,
+		.sample_word_size = 16u,
+		.channel_mapping  = { 1, 2, 0, 0, 0, 0, 0, 0 },
 	};
 	struct {
 		uint32_t flags;
@@ -724,6 +767,7 @@ q6_open_media_stream(void)
 		uint32_t time_msw;
 	} __attribute__((packed)) run_cmd = { 0, 0, 0 };
 	uint32_t words[4] = { 0 };
+	bool use_pcm_v4 = true;
 
 	if (g_status.asm_stream_up) {
 		return 0;
@@ -732,27 +776,32 @@ q6_open_media_stream(void)
 		return -1;
 	}
 
-	if (apr_call(APR_SVC_ADM, AFE_PORT_ID_QUATERNARY_MI2S_RX, ADM_CMD_DEVICE_OPEN_V5,
-	    &adm_open, sizeof(adm_open), ADM_CMDRSP_DEVICE_OPEN_V5, words) != 0) {
-		adsp_log("q6adm: ADM_CMD_DEVICE_OPEN_V5 failed");
-		return -1;
-	}
-	if (words[0] != 0) {
-		adsp_log("q6adm: ADM_CMDRSP_DEVICE_OPEN_V5 status=0x%x", words[0]);
-		return -1;
-	}
-	g_status.adm_copp_id = (int)(words[1] & 0xffffu);
-	g_status.adm_copp_up = true;
-
 	if (apr_call(APR_SVC_ASM, ASM_PORT_ID, ASM_STREAM_CMD_OPEN_WRITE_V3,
 	    &asm_open, sizeof(asm_open), 0, NULL) != 0) {
-		asm_open.postproc_topo_id = ASM_DEFAULT_POPP_TOPOLOGY;
+		use_pcm_v4 = false;
+		asm_open.dec_fmt_id = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2;
 		if (apr_call(APR_SVC_ASM, ASM_PORT_ID, ASM_STREAM_CMD_OPEN_WRITE_V3,
 		    &asm_open, sizeof(asm_open), 0, NULL) != 0) {
 			adsp_log("q6asm: ASM_STREAM_CMD_OPEN_WRITE_V3 failed");
 			return -1;
 		}
 	}
+
+	if (apr_call(APR_SVC_ADM, AFE_PORT_ID_QUATERNARY_MI2S_RX, ADM_CMD_DEVICE_OPEN_V5,
+	    &adm_open, sizeof(adm_open), ADM_CMDRSP_DEVICE_OPEN_V5, words) != 0 || words[0] != 0) {
+		adm_open.topology_id = ADM_TOPOLOGY_NONE;
+		memset(words, 0, sizeof(words));
+		if (apr_call(APR_SVC_ADM, AFE_PORT_ID_QUATERNARY_MI2S_RX, ADM_CMD_DEVICE_OPEN_V5,
+		    &adm_open, sizeof(adm_open), ADM_CMDRSP_DEVICE_OPEN_V5, words) != 0 || words[0] != 0) {
+			adsp_log("q6adm: ADM_CMD_DEVICE_OPEN_V5 failed status=0x%x", words[0]);
+			(void)apr_call(APR_SVC_ASM, ASM_PORT_ID, ASM_STREAM_CMD_CLOSE, NULL, 0, 0, NULL);
+			return -1;
+		}
+	}
+	g_status.adm_copp_id = (int)(words[1] & 0xffffu);
+	g_status.adm_copp_up = true;
+	adsp_log("q6adm: opened COPP %d on 0x1006 (flags=0x%x topo=0x%x)",
+	    g_status.adm_copp_id, adm_open.flags, adm_open.topology_id);
 
 	route.copp_id = (uint16_t)g_status.adm_copp_id;
 	if (apr_call(APR_SVC_ADM, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5,
@@ -761,10 +810,18 @@ q6_open_media_stream(void)
 		return -1;
 	}
 
-	if (apr_call(APR_SVC_ASM, ASM_PORT_ID, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2,
-	    &fmt, sizeof(fmt), 0, NULL) != 0) {
-		adsp_log("q6asm: MEDIA_FMT_UPDATE_V2 failed");
-		return -1;
+	if (use_pcm_v4) {
+		if (apr_call(APR_SVC_ASM, ASM_PORT_ID, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2,
+		    &fmt_v4, sizeof(fmt_v4), 0, NULL) != 0) {
+			adsp_log("q6asm: MEDIA_FMT_UPDATE_V2 (v4) failed");
+			return -1;
+		}
+	} else {
+		if (apr_call(APR_SVC_ASM, ASM_PORT_ID, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2,
+		    &fmt_v2, sizeof(fmt_v2), 0, NULL) != 0) {
+			adsp_log("q6asm: MEDIA_FMT_UPDATE_V2 (v2) failed");
+			return -1;
+		}
 	}
 
 	if (apr_call(APR_SVC_ASM, ASM_PORT_ID, ASM_SESSION_CMD_RUN_V2,
@@ -783,8 +840,8 @@ q6_open_media_stream(void)
 
 	g_status.asm_stream_up = true;
 	snprintf(g_status.state, sizeof(g_status.state), "streaming");
-	adsp_log("q6asm: stereo 48kHz stream running (copp=%d, 8x20ms DMA primed)",
-	    g_status.adm_copp_id);
+	adsp_log("q6asm: stereo 48kHz stream running (copp=%d fmt=0x%x, 8x20ms DMA primed)",
+	    g_status.adm_copp_id, asm_open.dec_fmt_id);
 	adsp_status_write();
 	return 0;
 }
@@ -798,8 +855,9 @@ q6_close_media_stream(void)
 		g_status.asm_stream_up = false;
 	}
 	if (g_status.adm_copp_up) {
-		(void)apr_call(APR_SVC_ADM, (uint16_t)g_status.adm_copp_id,
-		    ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 0, NULL);
+		(void)apr_call_ex(APR_SVC_ADM, AFE_PORT_ID_QUATERNARY_MI2S_RX,
+		    (uint16_t)g_status.adm_copp_id, ADM_CMD_DEVICE_CLOSE_V5,
+		    NULL, 0, 0, NULL, NULL, 2000);
 		g_status.adm_copp_up = false;
 	}
 }

@@ -1169,13 +1169,14 @@ adsp_smmu_check_fault(const char *tag)
 	npage = 1u << (((id1 >> 28) & 7u) + 1u);
 	cbp = s + (uint64_t)npage * psize + (uint64_t)g_status.smmu_cb * psize;
 	fsr = rd32(cbp + 0x58);
-	if (fsr != 0) {
+	/* Mask with ARM SMMUv2 FSR_FAULT (0xc00001fe); bit 10 (0x400) is read-only FORMAT=0b10 */
+	if ((fsr & 0xc00001feu) != 0) {
 		fsynr0 = rd32(cbp + 0x68);
 		far_lo = rd32(cbp + 0x60);
 		far_hi = rd32(cbp + 0x64);
 		adsp_log("smmu: %s CB%d FAULT FSR=0x%08x FSYNR0=0x%08x FAR=0x%x:%08x",
 		    tag ? tag : "check", g_status.smmu_cb, fsr, fsynr0, far_hi, far_lo);
-		wr32(cbp + 0x58, fsr);
+		wr32(cbp + 0x58, fsr & 0xc00001feu);
 	}
 }
 
