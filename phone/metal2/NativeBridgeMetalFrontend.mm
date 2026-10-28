@@ -399,18 +399,61 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
 @end
 
 // ---- libraries, functions, states ----
-@interface NBLibrary : NBObject
+@interface NBLibrary : NBObject {
+ @public
+ uint8_t _libraryHash[CC_SHA256_DIGEST_LENGTH];
+}
 @property(nonatomic) NmbLibrary *handle;
+- (void)computeLibraryHash:(const void *)bytes length:(size_t)length;
 @end
-@interface NBFunction : NBObject
+@interface NBFunction : NBObject {
+ @public
+ uint8_t _bitCodeHash[CC_SHA256_DIGEST_LENGTH];
+}
 @property(nonatomic) NmbFunction *handle;
 @property(nonatomic,copy) NSString *name;
 @property(nonatomic) MTLFunctionOptions options;
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
+- (void)computeBitCodeHashWithLibrary:(const uint8_t *)libHash
+                         originalName:(const char *)origName
+                      specializedName:(const char *)specName
+                            constants:(const NmbConstant *)constants
+                                count:(size_t)count;
 @end
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
+- (void)computeBitCodeHashWithLibrary:(const uint8_t *)libHash
+                         originalName:(const char *)origName
+                      specializedName:(const char *)specName
+                            constants:(const NmbConstant *)constants
+                                count:(size_t)count {
+ std::vector<uint8_t> buf;
+ buf.reserve(128+count*24);
+ auto append=[&](const void *p,size_t n){if(p && n){const uint8_t *b=(const uint8_t *)p;buf.insert(buf.end(),b,b+n);}};
+ append(libHash,CC_SHA256_DIGEST_LENGTH);
+ if(origName)append(origName,strlen(origName)+1);
+ if(specName)append(specName,strlen(specName)+1);
+ const uint64_t meta[2]={(uint64_t)_functionType,(uint64_t)_options};
+ append(meta,sizeof meta);
+ for(size_t i=0;i<count;i++) {
+  const uint64_t cmeta[3]={constants[i].type,constants[i].index,constants[i].length};
+  append(cmeta,sizeof cmeta);
+  if(constants[i].name)append(constants[i].name,strlen(constants[i].name)+1);
+  append(constants[i].bytes,(size_t)constants[i].length);
+ }
+ CC_SHA256(buf.data(),(CC_LONG)buf.size(),_bitCodeHash);
+}
+- (const void *)bitCodeHash {return _bitCodeHash;}
+- (const void *)baseFunctionHash {return _bitCodeHash;}
+- (const void *)functionConstantSpecializationHash {return _bitCodeHash;}
+- (NSUInteger)bitCodeFileSize {return 0;}
+- (NSData *)bitcodeData {return nil;}
+- (NSDictionary *)functionConstantsDictionary {return @{};}
+- (NSArray *)vertexAttributes {return @[];}
+- (NSArray *)stageInputAttributes {return @[];}
+- (NSInteger)patchControlPointCount {return 0;}
+- (MTLPatchType)patchType {return MTLPatchTypeNone;}
 @end
 // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
 @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
@@ -453,6 +496,16 @@ static uint64_t constantBytes(uint64_t type) {
 static std::string quartzCoreCallers();
 @implementation NBLibrary
 - (void)dealloc {nmb_library_release(_handle);}
+- (void)computeLibraryHash:(const void *)bytes length:(size_t)length {
+ if(bytes && length) {
+  CC_SHA256(bytes,(CC_LONG)(length>0x40000000u?0x40000000u:length),_libraryHash);
+ } else {
+  const uintptr_t tag=(uintptr_t)self;
+  CC_SHA256(&tag,(CC_LONG)sizeof tag,_libraryHash);
+ }
+}
+- (const void *)libraryId {return _libraryHash;}
+- (NSData *)bitCodeWithHash:(const void *)hash {(void)hash;return nil;}
 - (id<MTLFunction>)makeFunctionWithName:(NSString *)name specializedName:(NSString *)specializedName options:(MTLFunctionOptions)options
                          constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
  if(!name){if(error)*error=nbError(@"a function name is required");return nil;}
@@ -507,6 +560,7 @@ static std::string quartzCoreCallers();
  }
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=specializedName.length?specializedName:name;function.options=options;
  function.functionType=(MTLFunctionType)nmb_function_type(handle);function.constantsText=text;
+ [function computeBitCodeHashWithLibrary:_libraryHash originalName:name.UTF8String specializedName:sname constants:constants.data() count:constants.size()];
  if(error)*error=nil;return (id<MTLFunction>)function;
 }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
@@ -569,6 +623,7 @@ static std::string quartzCoreCallers();
  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
  if(!handle)return nil;
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+ [function computeBitCodeHashWithLibrary:_libraryHash originalName:name.UTF8String specializedName:nullptr constants:nullptr count:0];
  return (id<MTLFunction>)function;
 }
 @end
@@ -2056,14 +2111,14 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg);
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;[library computeLibraryHash:bytes length:size];if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;[library computeLibraryHash:bytes.bytes length:bytes.length];if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
  if(!url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
@@ -2369,7 +2424,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
 // Bare AIR bitcode (no metallib wrapper), which Metal itself refuses: for the bridge's own fixtures only.
 extern "C" id native_bridge_metal_library_with_air(const void *bytes,size_t length) {
  NmbLibrary *handle=gDevice?nmb_library_new(gDevice,bytes,length,true):nullptr;if(!handle)return nil;
- NBLibrary *library=[NBLibrary new];library.handle=handle;return library;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;[library computeLibraryHash:bytes length:length];return library;
 }
 extern "C" bool native_bridge_metal_shader_cache_stats(NmbShaderCacheStats *out) {
  return gDevice && nmb_device_shader_cache_stats(gDevice,out);
