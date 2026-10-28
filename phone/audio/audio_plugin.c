@@ -1,15 +1,20 @@
 /*
  * SPDX-License-Identifier: APSL-2.0
  *
- * HakiosAudio.driver: CoreAudio HAL AudioServerPlugIn for iOS 16 on RMX1931 / SWEET.
+ * HakiosAudio.driver: CoreAudio HAL AudioServerPlugIn for iOS 16 & iOS 26
+ * (D22AP / D421AP) on RMX1931 / SWEET.
  * Adapted from HackiOS userland/src/audio_plugin.c (https://github.com/oosexgang/hackios-xnu-kernel).
  *
- * Presents the four built-in devices expected by D22AP's VirtualAudio.plugin routing tables:
- *   - "Speaker"   stereo 48 kHz output -> /dev/hakios-audio (+ HAKIOS_AUDIO_SET_VOLUME ioctl),
- *                 plus silent stereo reference input
- *   - "Hawking"   silent mono input required by D22AP's 'vhaw' companion route
- *   - "Actuator"  mono 48 kHz Taptic Engine waveform output -> /dev/hakios-haptic (AW8697 LRA)
- *   - "Codec"     mono 48 kHz built-in microphone ('imic') -> /dev/hakios-mic (or silence)
+ * Presents the five built-in devices expected by D421AP's VirtualAudio.plugin
+ * routing tables:
+ *   - "Speaker"        stereo 48 kHz output -> /tmp/sweet-audio.shm (adspd) +
+ *                      /dev/hakios-audio (+ HAKIOS_AUDIO_SET_VOLUME ioctl),
+ *                      plus silent stereo reference input
+ *   - "Hawking"        silent mono input required by 'vhaw' companion route
+ *   - "Actuator"       mono 48 kHz Taptic Engine waveform -> /dev/hakios-haptic
+ *   - "Codec"          4-ch 48 kHz built-in microphone ('mc01'..'mc04') ->
+ *                      /tmp/sweet-audio.shm mic_pcm or /dev/hakios-mic
+ *   - "Baseband Voice" mono 48 kHz cellular call route (signals adspd MVM/CVS/CVP)
  */
 #include <CoreFoundation/CoreFoundation.h>
 #if __has_include(<CoreAudioTypes/CoreAudioTypes.h>)
@@ -19,15 +24,17 @@
 #endif
 #include <errno.h>
 #include <fcntl.h>
-#include <math.h>
-#include <sys/ioctl.h>
 #include <mach/mach_time.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "hakios.audio.h"
@@ -177,10 +184,12 @@ enum {
 	OBJECT_CODEC, OBJECT_CODEC_INPUT,
 	OBJECT_SPEAKER_VOLUME,
 	OBJECT_CODEC_SOURCE,
-	OBJECT_LAST = OBJECT_CODEC_SOURCE
+	OBJECT_BASEBAND_VOICE, OBJECT_BASEBAND_VOICE_OUTPUT, OBJECT_BASEBAND_VOICE_INPUT,
+	OBJECT_LAST = OBJECT_BASEBAND_VOICE_INPUT
 };
 
 #define VOLUME_RANGE_DB   48.0
+#define CODEC_CHANNELS    4
 
 struct device {
 	AudioObjectID object;
@@ -197,23 +206,36 @@ static struct device devices[] = {
 	  .input = OBJECT_SPEAKER_INPUT, .output_channels = HAKIOS_AUDIO_CHANNELS, .input_channels = 2 },
 	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
 	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1 },
-	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = 1 },
+	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = CODEC_CHANNELS },
+	{ .object = OBJECT_BASEBAND_VOICE, .uid = CFSTR("Baseband Voice"),
+	  .output = OBJECT_BASEBAND_VOICE_OUTPUT, .input = OBJECT_BASEBAND_VOICE_INPUT,
+	  .output_channels = 1, .input_channels = 1 },
 };
 #define DEVICES             (sizeof(devices) / sizeof(devices[0]))
 
 #define TRANSPORT_BUILT_IN  'bltn'
-#define MIC_SOURCE          'imic'
+#define MIC_SOURCE_LEGACY   'imic'
+#define MIC_SOURCE_1        'mc01'
+#define MIC_SOURCE_2        'mc02'
+#define MIC_SOURCE_3        'mc03'
+#define MIC_SOURCE_4        'mc04'
 #define MANUFACTURER        CFSTR("sweet")
 #define TIMESTAMP_PERIOD    16384
+#define VALUE_MAX_WORDS     16
 
 static AudioServerPlugInHostRef host;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int sink = -1;
 static unsigned sink_open_tries;
+static struct sweet_audio_shm *shm_ptr;
+static UInt64 shm_last_try;
+static UInt64 retry_interval_ticks;
 static Float64 ticks_per_frame;
 static UInt64 written, refused;
 static Boolean inactive[OBJECT_LAST + 1];
 static Float32 volume = 1.0f;
+static UInt32 mic_source = MIC_SOURCE_1;
+static uint32_t mic_read_pos;
 
 static void
 say(const char *format, ...)
@@ -234,19 +256,6 @@ say(const char *format, ...)
 	(void)write(2, line, (size_t)n);
 }
 
-static int
-ensure_sink_fd(void)
-{
-	if (sink >= 0) {
-		return sink;
-	}
-	if (sink_open_tries < 16) {
-		sink_open_tries++;
-		sink = open(HAKIOS_AUDIO_DEVICE, O_WRONLY);
-	}
-	return sink;
-}
-
 static Float32
 scalar_to_db(Float32 scalar)
 {
@@ -261,17 +270,141 @@ db_to_scalar(Float32 db)
 	return scalar < 0 ? 0 : scalar > 1 ? 1 : scalar;
 }
 
+static uint32_t
+volume_to_q16(Float32 scalar)
+{
+	Float32 db;
+	long q16;
+
+	if (scalar <= 0.0f) {
+		return 0;
+	}
+	if (scalar >= 1.0f) {
+		return 65536u;
+	}
+	db = scalar_to_db(scalar);
+	q16 = lroundf(powf(10.0f, db / 20.0f) * 65536.0f);
+	if (q16 < 0) {
+		return 0;
+	}
+	if (q16 > 65536L) {
+		return 65536u;
+	}
+	return (uint32_t)q16;
+}
+
+static struct sweet_audio_shm *
+ensure_shm(void)
+{
+	struct sweet_audio_shm *mapped;
+	struct stat st;
+	UInt64 now;
+	int fd;
+
+	mapped = __atomic_load_n(&shm_ptr, __ATOMIC_ACQUIRE);
+	if (mapped != NULL) {
+		if (__atomic_load_n(&mapped->magic, __ATOMIC_ACQUIRE) == SWEET_AUDIO_SHM_MAGIC &&
+		    mapped->version == SWEET_AUDIO_SHM_VERSION) {
+			return mapped;
+		}
+		return NULL;
+	}
+
+	now = mach_absolute_time();
+	if (shm_last_try != 0 && now - shm_last_try < retry_interval_ticks) {
+		return NULL;
+	}
+	shm_last_try = now;
+
+	fd = open(SWEET_AUDIO_SHM_PATH, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		return NULL;
+	}
+	if (fstat(fd, &st) != 0 || (size_t)st.st_size < sizeof(struct sweet_audio_shm)) {
+		close(fd);
+		return NULL;
+	}
+	mapped = mmap(NULL, sizeof(struct sweet_audio_shm), PROT_READ | PROT_WRITE,
+	    MAP_SHARED, fd, 0);
+	close(fd);
+	if (mapped == MAP_FAILED) {
+		return NULL;
+	}
+	if (__atomic_load_n(&mapped->magic, __ATOMIC_ACQUIRE) != SWEET_AUDIO_SHM_MAGIC ||
+	    mapped->version != SWEET_AUDIO_SHM_VERSION) {
+		munmap(mapped, sizeof(struct sweet_audio_shm));
+		return NULL;
+	}
+
+	__atomic_store_n(&mapped->volume_q16, volume_to_q16(volume), __ATOMIC_RELEASE);
+	__atomic_store_n(&mapped->speaker_running, devices[0].running != 0 ? 1u : 0u, __ATOMIC_RELEASE);
+	__atomic_store_n(&mapped->baseband_voice_io, devices[4].running != 0 ? 1u : 0u, __ATOMIC_RELEASE);
+	__atomic_store_n(&mapped->codec_mic_source, mic_source, __ATOMIC_RELEASE);
+	__atomic_store_n(&shm_ptr, mapped, __ATOMIC_RELEASE);
+	say("sweet: audio: attached %s (vol_q16=%u)\n", SWEET_AUDIO_SHM_PATH,
+	    (unsigned)volume_to_q16(volume));
+	return mapped;
+}
+
+static void
+shm_write_speaker(const int16_t *samples, UInt32 frames)
+{
+	struct sweet_audio_shm *s = ensure_shm();
+	uint32_t w, r, mask, i;
+
+	if (s == NULL || samples == NULL || frames == 0) {
+		return;
+	}
+	mask = SWEET_AUDIO_RING_FRAMES - 1u;
+	w = __atomic_load_n(&s->write_frames, __ATOMIC_RELAXED);
+	r = __atomic_load_n(&s->read_frames, __ATOMIC_ACQUIRE);
+	if (w - r > SWEET_AUDIO_RING_FRAMES) {
+		w = r;
+	}
+	if (frames > SWEET_AUDIO_RING_FRAMES) {
+		samples += (size_t)(frames - SWEET_AUDIO_RING_FRAMES) * HAKIOS_AUDIO_CHANNELS;
+		frames = SWEET_AUDIO_RING_FRAMES;
+	}
+	for (i = 0; i < frames; i++) {
+		uint32_t idx = ((w + i) & mask) * HAKIOS_AUDIO_CHANNELS;
+		s->pcm[idx] = samples[i * 2];
+		s->pcm[idx + 1] = samples[i * 2 + 1];
+	}
+	__atomic_store_n(&s->write_frames, w + frames, __ATOMIC_RELEASE);
+}
+
+static int
+ensure_sink_fd(void)
+{
+	if (sink >= 0) {
+		return sink;
+	}
+	if (sink_open_tries < 16) {
+		sink_open_tries++;
+		sink = open(HAKIOS_AUDIO_DEVICE, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	}
+	return sink;
+}
+
 static void
 volume_to_kernel(void)
 {
 	struct hakios_audio_volume v = { (uint32_t)lround(-scalar_to_db(volume) * 8), volume <= 0 };
+	struct sweet_audio_shm *s = ensure_shm();
+	uint32_t q16 = volume_to_q16(volume);
 	int fd = ensure_sink_fd();
 
-	if (fd < 0 || ioctl(fd, HAKIOS_AUDIO_SET_VOLUME, &v) < 0) {
-		say("sweet: audio: volume %.3f ioctl failed (%s)\n", volume, strerror(errno));
+	if (s != NULL) {
+		__atomic_store_n(&s->volume_q16, q16, __ATOMIC_RELEASE);
+	}
+	if (fd >= 0 && ioctl(fd, HAKIOS_AUDIO_SET_VOLUME, &v) == 0) {
+		say("sweet: audio: volume %.3f (%s-%.1f dB, q16=%u)\n",
+		    volume, v.muted ? "muted, " : "", v.below / 8.0, (unsigned)q16);
 		return;
 	}
-	say("sweet: audio: volume %.3f (%s-%.1f dB)\n", volume, v.muted ? "muted, " : "", v.below / 8.0);
+	say("sweet: audio: volume %.3f (%s-%.1f dB, q16=%u, shm=%s)\n",
+	    volume, v.muted ? "muted, " : "", v.below / 8.0, (unsigned)q16,
+	    s != NULL ? "ok" : "pending");
 }
 
 static struct device *
@@ -302,6 +435,14 @@ format_of(AudioObjectID stream)
 		.mChannelsPerFrame = channels,
 		.mBitsPerChannel = 16,
 	};
+}
+
+static bool
+valid_mic_source(UInt32 item)
+{
+	return item == MIC_SOURCE_1 || item == MIC_SOURCE_2 ||
+	    item == MIC_SOURCE_3 || item == MIC_SOURCE_4 ||
+	    item == MIC_SOURCE_LEGACY;
 }
 
 static HRESULT
@@ -338,10 +479,13 @@ initialize(__unused AudioServerPlugInDriverRef drv, AudioServerPlugInHostRef the
 	host = the_host;
 	mach_timebase_info(&timebase);
 	ticks_per_frame = 1e9 * timebase.denom / timebase.numer / HAKIOS_AUDIO_RATE;
-	sink = open(HAKIOS_AUDIO_DEVICE, O_WRONLY);
+	retry_interval_ticks = (UInt64)(0.25e9 * timebase.denom / timebase.numer);
+	sink = open(HAKIOS_AUDIO_DEVICE, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 	sink_open_tries = 1;
-	say("sweet: audio: HakiosAudio initialized (%s: %s)\n",
-	    HAKIOS_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open");
+	(void)ensure_shm();
+	say("sweet: audio: HakiosAudio initialized (D421AP 5-device HAL, %s: %s, shm: %s)\n",
+	    HAKIOS_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open",
+	    shm_ptr != NULL ? "attached" : "waiting");
 	return 0;
 }
 
@@ -377,7 +521,7 @@ struct value {
 	bool empty;
 	bool string;
 	union {
-		UInt32 words[4];
+		UInt32 words[VALUE_MAX_WORDS];
 		Float64 number;
 		Float32 decimal;
 		CFStringRef string;
@@ -396,7 +540,12 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 
 	memset(&v, 0, sizeof(v));
 #define WORD(x)   (v.u.words[0] = (x), v.size = sizeof(UInt32))
-#define LIST(x)   (v.u.words[v.size / sizeof(UInt32)] = (x), v.size += sizeof(UInt32))
+#define LIST(x)   do { \
+	if (v.size / sizeof(UInt32) < VALUE_MAX_WORDS) { \
+		v.u.words[v.size / sizeof(UInt32)] = (x); \
+		v.size += sizeof(UInt32); \
+	} \
+} while (0)
 #define STRING(x) (v.u.string = (x), v.string = true, v.size = sizeof(CFStringRef))
 #define FLOAT(x)  (v.u.decimal = (x), v.size = sizeof(Float32))
 	if (object == OBJECT_SPEAKER_VOLUME) {
@@ -458,13 +607,34 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			WORD(0);
 			break;
 		case kAudioSelectorControlPropertyCurrentItem:
+			WORD(mic_source);
+			break;
 		case kAudioSelectorControlPropertyAvailableItems:
-			WORD(MIC_SOURCE);
+			LIST(MIC_SOURCE_1);
+			LIST(MIC_SOURCE_2);
+			LIST(MIC_SOURCE_3);
+			LIST(MIC_SOURCE_4);
 			break;
 		case kAudioSelectorControlPropertyItemName:
-			if (qualifier_size == sizeof(UInt32) && qualifier != NULL &&
-			    *(const UInt32 *)qualifier == MIC_SOURCE) {
-				STRING(CFSTR("Bottom"));
+			if (qualifier_size == sizeof(UInt32) && qualifier != NULL) {
+				switch (*(const UInt32 *)qualifier) {
+				case MIC_SOURCE_1:
+				case MIC_SOURCE_LEGACY:
+					STRING(CFSTR("Bottom"));
+					break;
+				case MIC_SOURCE_2:
+					STRING(CFSTR("Front"));
+					break;
+				case MIC_SOURCE_3:
+					STRING(CFSTR("Back"));
+					break;
+				case MIC_SOURCE_4:
+					STRING(CFSTR("Bottom 2"));
+					break;
+				default:
+					STRING(CFSTR(""));
+					break;
+				}
 			} else {
 				STRING(CFSTR(""));
 			}
@@ -545,7 +715,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		case kAudioDevicePropertyDeviceCanBeDefaultDevice:
 		case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
-			WORD(d->output != 0);
+			WORD(d->object == OBJECT_SPEAKER ? 1 : 0);
 			break;
 		case kAudioDevicePropertyDeviceIsRunning:
 			WORD(d->running != 0);
@@ -586,7 +756,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		case kAudioDevicePropertyPreferredChannelsForStereo:
 			v.u.words[0] = 1;
-			v.u.words[1] = 2;
+			v.u.words[1] = (d->output_channels >= 2 || d->input_channels >= 2) ? 2 : 1;
 			v.size = 2 * sizeof(UInt32);
 			break;
 		case kAudioDevicePropertyZeroTimeStampPeriod:
@@ -709,7 +879,8 @@ get_property_data(AudioServerPlugInDriverRef drv, AudioObjectID object, pid_t cl
 	if (v.size > room) {
 		if (address->mSelector != kAudioObjectPropertyOwnedObjects &&
 		    address->mSelector != kAudioDevicePropertyStreams &&
-		    address->mSelector != kAudioPlugInPropertyDeviceList) {
+		    address->mSelector != kAudioPlugInPropertyDeviceList &&
+		    address->mSelector != kAudioSelectorControlPropertyAvailableItems) {
 			return kAudioHardwareBadPropertySizeError;
 		}
 		v.size = room - room % sizeof(UInt32);
@@ -758,9 +929,33 @@ set_property_data(AudioServerPlugInDriverRef drv, AudioObjectID object, pid_t cl
 		return 0;
 	}
 	if (object == OBJECT_CODEC_SOURCE) {
-		return size == sizeof(UInt32) ?
-		    (*(const UInt32 *)data == MIC_SOURCE ? 0 : kAudioHardwareIllegalOperationError) :
-		    kAudioHardwareBadPropertySizeError;
+		AudioObjectPropertyAddress changed = {
+			kAudioSelectorControlPropertyCurrentItem, kAudioObjectPropertyScopeGlobal, 0
+		};
+		struct sweet_audio_shm *s;
+		UInt32 wanted;
+
+		if (size != sizeof(UInt32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		wanted = *(const UInt32 *)data;
+		if (!valid_mic_source(wanted)) {
+			return kAudioHardwareIllegalOperationError;
+		}
+		if (wanted == MIC_SOURCE_LEGACY) {
+			wanted = MIC_SOURCE_1;
+		}
+		pthread_mutex_lock(&lock);
+		mic_source = wanted;
+		s = ensure_shm();
+		if (s != NULL) {
+			__atomic_store_n(&s->codec_mic_source, mic_source, __ATOMIC_RELEASE);
+		}
+		pthread_mutex_unlock(&lock);
+		if (host != NULL) {
+			host->PropertiesChanged(host, OBJECT_CODEC_SOURCE, 1, &changed);
+		}
+		return 0;
 	}
 	if (address->mSelector == kAudioStreamPropertyIsActive) {
 		if (size != sizeof(UInt32)) {
@@ -788,7 +983,7 @@ set_property_data(AudioServerPlugInDriverRef drv, AudioObjectID object, pid_t cl
 	}
 }
 
-/* ---- Codec microphone (/dev/hakios-mic, optional) ---- */
+/* ---- Codec 4-channel microphone (/tmp/sweet-audio.shm or /dev/hakios-mic) ---- */
 
 static int mic = -1;
 static UInt64 mic_frames, mic_heard;
@@ -796,8 +991,13 @@ static UInt64 mic_frames, mic_heard;
 static void
 codec_open(void)
 {
-	mic = open("/dev/hakios-mic", O_RDONLY | O_NONBLOCK);
+	struct sweet_audio_shm *s = ensure_shm();
+
+	mic = open("/dev/hakios-mic", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 	mic_frames = mic_heard = 0;
+	if (s != NULL) {
+		mic_read_pos = __atomic_load_n(&s->mic_write_frames, __ATOMIC_ACQUIRE);
+	}
 }
 
 static void
@@ -812,11 +1012,44 @@ codec_close(void)
 static void
 codec_read(int16_t *samples, UInt32 frames)
 {
-	ssize_t got = mic >= 0 ? read(mic, samples, (size_t)frames * 2) : -1;
-	UInt32 have = got > 0 ? (UInt32)got / 2 : 0;
+	struct sweet_audio_shm *s = ensure_shm();
+	UInt32 have = 0;
 
+	if (s != NULL) {
+		uint32_t mw = __atomic_load_n(&s->mic_write_frames, __ATOMIC_ACQUIRE);
+		uint32_t avail = mw - mic_read_pos;
+		if (avail > SWEET_AUDIO_MIC_RING_FRAMES) {
+			mic_read_pos = mw;
+			avail = 0;
+		}
+		if (avail > 0) {
+			uint32_t take = avail < frames ? avail : frames;
+			uint32_t mask = SWEET_AUDIO_MIC_RING_FRAMES - 1u;
+			for (uint32_t i = 0; i < take; i++) {
+				uint32_t idx = ((mic_read_pos + i) & mask) * CODEC_CHANNELS;
+				memcpy(&samples[i * CODEC_CHANNELS], &s->mic_pcm[idx],
+				    CODEC_CHANNELS * sizeof(int16_t));
+			}
+			mic_read_pos += take;
+			have = take;
+		}
+	}
+	if (have == 0 && mic >= 0) {
+		int16_t mono[512];
+		UInt32 want = frames < 512 ? frames : 512;
+		ssize_t got = read(mic, mono, (size_t)want * sizeof(int16_t));
+		if (got > 0) {
+			have = (UInt32)got / sizeof(int16_t);
+			for (UInt32 i = 0; i < have; i++) {
+				for (UInt32 ch = 0; ch < CODEC_CHANNELS; ch++) {
+					samples[i * CODEC_CHANNELS + ch] = mono[i];
+				}
+			}
+		}
+	}
 	if (have < frames) {
-		memset(samples + have, 0, (size_t)(frames - have) * 2);
+		memset(&samples[have * CODEC_CHANNELS], 0,
+		    (size_t)(frames - have) * CODEC_CHANNELS * sizeof(int16_t));
 	}
 	mic_frames += frames;
 	mic_heard += have;
@@ -826,6 +1059,7 @@ static OSStatus
 start_io(__unused AudioServerPlugInDriverRef drv, AudioObjectID object, __unused UInt32 client)
 {
 	struct device *d = device_of(object);
+	struct sweet_audio_shm *s;
 
 	if (d == NULL || object != d->object) {
 		return kAudioHardwareBadObjectError;
@@ -834,11 +1068,20 @@ start_io(__unused AudioServerPlugInDriverRef drv, AudioObjectID object, __unused
 	if (d->running++ == 0) {
 		d->anchor = mach_absolute_time();
 		d->periods = 0;
-		if (d->output != 0) {
+		if (d->object == OBJECT_SPEAKER) {
 			written = refused = 0;
-		}
-		if (d->object == OBJECT_CODEC) {
+			s = ensure_shm();
+			if (s != NULL) {
+				__atomic_store_n(&s->speaker_running, 1u, __ATOMIC_RELEASE);
+			}
+		} else if (d->object == OBJECT_CODEC) {
 			codec_open();
+		} else if (d->object == OBJECT_BASEBAND_VOICE) {
+			s = ensure_shm();
+			if (s != NULL) {
+				__atomic_store_n(&s->baseband_voice_io, 1u, __ATOMIC_RELEASE);
+			}
+			say("sweet: audio: Baseband Voice IO started\n");
 		}
 	}
 	pthread_mutex_unlock(&lock);
@@ -849,14 +1092,26 @@ static OSStatus
 stop_io(__unused AudioServerPlugInDriverRef drv, AudioObjectID object, __unused UInt32 client)
 {
 	struct device *d = device_of(object);
+	struct sweet_audio_shm *s;
 
 	if (d == NULL || object != d->object) {
 		return kAudioHardwareBadObjectError;
 	}
 	pthread_mutex_lock(&lock);
 	if (d->running != 0 && --d->running == 0) {
-		if (d->object == OBJECT_CODEC) {
+		if (d->object == OBJECT_SPEAKER) {
+			s = ensure_shm();
+			if (s != NULL) {
+				__atomic_store_n(&s->speaker_running, 0u, __ATOMIC_RELEASE);
+			}
+		} else if (d->object == OBJECT_CODEC) {
 			codec_close();
+		} else if (d->object == OBJECT_BASEBAND_VOICE) {
+			s = ensure_shm();
+			if (s != NULL) {
+				__atomic_store_n(&s->baseband_voice_io, 0u, __ATOMIC_RELEASE);
+			}
+			say("sweet: audio: Baseband Voice IO stopped\n");
 		}
 	}
 	pthread_mutex_unlock(&lock);
@@ -919,7 +1174,7 @@ actuator_write(const int16_t *samples, UInt32 frames)
 	}
 	if (haptic < 0 && haptic_open_tries < 16) {
 		haptic_open_tries++;
-		haptic = open("/dev/hakios-haptic", O_WRONLY | O_NONBLOCK);
+		haptic = open("/dev/hakios-haptic", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 	}
 	if (haptic >= 0) {
 		(void)write(haptic, samples, (size_t)frames * 2);
@@ -947,8 +1202,10 @@ do_io_operation(__unused AudioServerPlugInDriverRef drv, __unused AudioObjectID 
 		memset(buffer, 0, (size_t)frames * 2 * d->input_channels);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
 		actuator_write(buffer, frames);
-	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
+	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_SPEAKER_OUTPUT) {
 		int fd = ensure_sink_fd();
+
+		shm_write_speaker(buffer, frames);
 		if (fd < 0 || write(fd, buffer, (size_t)frames * HAKIOS_AUDIO_FRAME) < 0) {
 			refused += frames;
 		}

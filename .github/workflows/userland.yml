@@ -102,10 +102,11 @@ jobs:
           done
           ls -la work/dxb/xnu/bsd/dev/
 
-      - name: Build wland, cellular, gpu/pmem, media/audio, store, and phone/tools
+      - name: Build wland, cellular, adsp, gpu/pmem, media/audio, store, and phone/tools
         run: |
           sh phone/wifi/build.sh
           sh phone/cellular/build.sh
+          sh phone/adsp/build.sh
           sh phone/gpu/build.sh
           sh phone/media/build.sh
           sh phone/audio/build.sh
@@ -239,6 +240,7 @@ jobs:
           cp phone/metal2/out/m2vtest dist-userland/bin/
           cp phone/wifi/out/wland dist-userland/bin/
           cp phone/cellular/out/* dist-userland/bin/
+          cp phone/adsp/out/* dist-userland/bin/
           cp phone/gpu/out/gpu phone/gpu/out/pmem dist-userland/bin/
           cp phone/tools/out/* dist-userland/bin/
           cp work/userland/stage/* dist-userland/bin/ 2>/dev/null || true

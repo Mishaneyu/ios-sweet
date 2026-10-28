@@ -45,9 +45,11 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <os/lock.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -746,6 +748,40 @@ sb_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 	}
 }
 
+static int sb_ringer_token = -1;
+
+static void *
+sb_ringer_unmute_thread(__unused void *arg)
+{
+	int tok = -1;
+
+	sleep(2);
+	if (notify_register_check("com.apple.springboard.ringerstate", &tok) == 0) {
+		sb_ringer_token = tok;
+		(void)notify_set_state(tok, 1);
+	}
+	(void)notify_post("com.apple.springboard.ringerstate");
+	say("sweet: SpringBoard: com.apple.springboard.ringerstate -> 1 (+2s)\n");
+
+	sleep(8);
+	if (sb_ringer_token >= 0) {
+		(void)notify_set_state(sb_ringer_token, 1);
+	}
+	(void)notify_post("com.apple.springboard.ringerstate");
+	say("sweet: SpringBoard: com.apple.springboard.ringerstate -> 1 (+10s)\n");
+	return NULL;
+}
+
+static void
+sb_start_ringer_unmute(void)
+{
+	pthread_t thr;
+
+	if (pthread_create(&thr, NULL, sb_ringer_unmute_thread, NULL) == 0) {
+		(void)pthread_detach(thr);
+	}
+}
+
 /* ---- backboardd (iOS 26+): -[CBBacklightNode getBacklightCalibration:] ---- */
 
 static IMP orig_get_backlight_calib;
@@ -814,5 +850,6 @@ sweet_sysfix_init(void)
 	} else if (strcmp(name, "SpringBoard") == 0) {
 		_dyld_register_func_for_add_image(sb_image_added);
 		sb_image_added(NULL, 0);
+		sb_start_ringer_unmute();
 	}
 }
