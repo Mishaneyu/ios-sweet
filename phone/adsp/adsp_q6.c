@@ -772,6 +772,17 @@ detect_voice_call_wanted(bool *out_speakerphone)
 		char buf[256];
 		ssize_t n = read(fd, buf, sizeof(buf) - 1);
 		close(fd);
+		if (n >= 16) {
+			uint32_t magic = 0, v_active = 0;
+			memcpy(&magic, buf, 4);
+			memcpy(&v_active, buf + 4, 4);
+			if (magic == 0x53575643u /* 'SWVC' from cellulard */) {
+				if (v_active != 0) {
+					active = true;
+				}
+				n = 0;
+			}
+		}
 		if (n > 0) {
 			buf[n] = '\0';
 			if (strstr(buf, "\"speaker\":true") != NULL ||
