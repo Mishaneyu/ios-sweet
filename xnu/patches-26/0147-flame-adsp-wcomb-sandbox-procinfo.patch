@@ -1,0 +1,75 @@
+From 3d540b646091be0293e35b39ee97328f9cb2ebd8 Mon Sep 17 00:00:00 2001
+From: XNU 26 Rebase <rebase@local>
+Date: Wed, 28 Oct 2026 02:54:56 +0000
+Subject: [PATCH] 0147: flame: map SM8150 ADSP carve-out write-combining and
+ grant sandbox proc-info
+
+---
+ bsd/dev/sweet_pmem.c  | 12 ++++++++----
+ bsd/kern/sweet_amfi.c | 16 ++++++++++++----
+ 2 files changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index e5faf4d..c7fb5dd 100644
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -101,18 +101,22 @@ static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
+  * windows use ml_io_map_unmappable: kernel_map, freed by ml_io_unmap.
+  */
+ /*
+- * SM8150 MPSS carve-out (0x8dc00000..0x97c00000, 160 MiB, 2 MiB aligned):
+- * lies inside /chosen dram-base..dram-size, so VM_WIMG_WCOMB maps it as
++ * SM8150 MPSS (0x8dc00000..0x97c00000, 160 MiB) and pil_adsp_region
++ * (0x9b200000..0x9d000000, 30 MiB) carve-outs are both 2 MiB aligned and
++ * lie inside /chosen dram-base..dram-size, so VM_WIMG_WCOMB maps them as
+  * Normal Non-Cacheable Write-Combining instead of strongly-ordered Device
+- * memory, dropping wland's 158 MiB MPSS load from ~96 s to < 0.1 s.
++ * memory, dropping MPSS load from ~96 s to < 0.1 s and ADSP load to < 15 ms.
+  */
+ #define PMEM_MPSS_PA    0x8dc00000ULL
+ #define PMEM_MPSS_END   0x97c00000ULL
++#define PMEM_ADSP_PA    0x9b200000ULL
++#define PMEM_ADSP_END   0x9d000000ULL
+ 
+ static inline bool
+ pm_is_wcomb(uint64_t pa)
+ {
+-	return pa >= PMEM_MPSS_PA && pa < PMEM_MPSS_END;
++	return (pa >= PMEM_MPSS_PA && pa < PMEM_MPSS_END) ||
++	       (pa >= PMEM_ADSP_PA && pa < PMEM_ADSP_END);
+ }
+ 
+ static volatile uint32_t *
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 80f775d..3af9bd3 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -823,13 +823,21 @@ sweet_sandbox_priv_grant(kauth_cred_t cred, int priv)
+ 	}
+ 	if (sweet_privs_by_entitlement && cred == kauth_cred_get()) {
+ 		proc_t cur = current_proc();
+-		for (unsigned i = 0; i < sizeof(sweet_sandbox_privileges) / sizeof(sweet_sandbox_privileges[0]); i++) {
+-			if (sweet_sandbox_privileges[i].priv == priv) {
+-				if (cur != PROC_NULL &&
++		if (cur != PROC_NULL) {
++			if (priv == PRIV_GLOBAL_PROC_INFO) {
++				const void *ent = sweet_proc_entitlements(cur);
++				if (sweet_entitlements_bool(ent, "com.apple.private.kernel.global-proc-info") ||
++				    sweet_entitlements_bool(ent, "com.apple.security.exception.process-info") ||
++				    sweet_entitlements_bool(ent, "com.apple.private.AudioSession.PID") ||
++				    csproc_get_platform_binary(cur)) {
++					return 0;
++				}
++			}
++			for (unsigned i = 0; i < sizeof(sweet_sandbox_privileges) / sizeof(sweet_sandbox_privileges[0]); i++) {
++				if (sweet_sandbox_privileges[i].priv == priv &&
+ 				    sweet_amfi_query_boolean_with_proc(cur, sweet_sandbox_privileges[i].entitlement) == KERN_SUCCESS) {
+ 					return 0;
+ 				}
+-				break;
+ 			}
+ 		}
+ 	}
+-- 
+2.43.0
+
