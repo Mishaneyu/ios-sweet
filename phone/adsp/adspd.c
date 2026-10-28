@@ -292,24 +292,90 @@ qrtr_sock_is_live(void)
 	return rc == 0;
 }
 
+static bool
+wland_wlan_bringup_done(void)
+{
+	char buf[8192];
+	int fd;
+
+	if (access("/var/local/wland.off", F_OK) == 0) {
+		return true;
+	}
+	fd = open("/dev/sweet-diag", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		ssize_t n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n > 0) {
+			buf[n] = '\0';
+			if (strstr(buf, "\"wland_open\": true") != NULL ||
+			    strstr(buf, "\"radio_ready\": true") != NULL) {
+				return true;
+			}
+		}
+	}
+	FILE *f = fopen("/var/local/wland.log", "rb");
+	if (f != NULL) {
+		if (fseek(f, 0, SEEK_END) == 0) {
+			long sz = ftell(f);
+			long off = sz > 4096 ? (sz - 4096) : 0;
+			if (fseek(f, off, SEEK_SET) == 0) {
+				size_t nr = fread(buf, 1, sizeof(buf) - 1, f);
+				buf[nr] = '\0';
+				if (strstr(buf, "bridge: /dev/wlan open") != NULL ||
+				    strstr(buf, "WMI READY") != NULL ||
+				    strstr(buf, "WLFW bring-up failed") != NULL ||
+				    strstr(buf, "radio start failed") != NULL ||
+				    strstr(buf, "wland: off") != NULL) {
+					fclose(f);
+					return true;
+				}
+			}
+		}
+		fclose(f);
+	}
+	return false;
+}
+
 static void
 wait_for_wland_qrtr(void)
 {
-	if (qrtr_sock_is_live()) {
-		adsp_log("coexist: %s already listening", QRTR_MUX_SOCK_PATH);
+	bool qrtr_up = qrtr_sock_is_live();
+
+	if (!qrtr_up) {
+		adsp_log("coexist: waiting up to 20s for live %s...", QRTR_MUX_SOCK_PATH);
+		for (int i = 0; i < 200 && !g_stop_requested; i++) {
+			if (qrtr_sock_is_live()) {
+				adsp_log("coexist: %s live after %d ms", QRTR_MUX_SOCK_PATH, i * 100);
+				qrtr_up = true;
+				break;
+			}
+			delay_ms(100);
+		}
+		if (!qrtr_up) {
+			adsp_log("coexist: proceeding without live %s after 20s timeout", QRTR_MUX_SOCK_PATH);
+			return;
+		}
+	}
+	/*
+	 * MPSS spawns wlan_pd (wlanmdsp.mbn TFTP + MSA hyp_assign + WLFW mission
+	 * mode) across t=1.4s..11.8s after QRTR comes up. Wait until wland opens
+	 * /dev/wlan before firing TrustZone PAS_INIT_IMAGE/MEM_SETUP/AUTH_AND_RESET
+	 * on ADSP so PIL/RPMh/QMP never collide with wlan_pd bring-up.
+	 */
+	if (wland_wlan_bringup_done()) {
+		adsp_log("coexist: wland /dev/wlan already up");
 		return;
 	}
-	adsp_log("coexist: waiting up to 20s for live %s so wland finishes MPSS boot first...",
-	    QRTR_MUX_SOCK_PATH);
-	for (int i = 0; i < 200 && !g_stop_requested; i++) {
-		if (qrtr_sock_is_live()) {
-			adsp_log("coexist: %s live after %d ms", QRTR_MUX_SOCK_PATH, i * 100);
-			delay_ms(400);
+	adsp_log("coexist: waiting up to 16s for wland WLFW + /dev/wlan bring-up...");
+	for (int i = 0; i < 160 && !g_stop_requested; i++) {
+		if (wland_wlan_bringup_done()) {
+			adsp_log("coexist: wland /dev/wlan ready after %d ms", i * 100);
+			delay_ms(150);
 			return;
 		}
 		delay_ms(100);
 	}
-	adsp_log("coexist: proceeding without live %s after 20s timeout", QRTR_MUX_SOCK_PATH);
+	adsp_log("coexist: proceeding after 16s wland WLFW wait timeout");
 }
 
 static int

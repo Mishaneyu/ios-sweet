@@ -333,6 +333,14 @@ adsp_apr_rx(const uint8_t *data, uint32_t len)
 		return;
 	}
 
+	if (h.opcode == APR_BASIC_RSP_RESULT && body_bytes >= 8) {
+		uint32_t late_stat = 0;
+		memcpy(&late_stat, body + 4, 4);
+		if (late_stat == 0) {
+			return;
+		}
+	}
+
 	{
 		static uint32_t unmatched_logs;
 		if (unmatched_logs < 32u) {
@@ -1061,11 +1069,11 @@ q6_voice_start(bool speakerphone)
 		uint16_t pad;
 	} __attribute__((packed)) attach;
 	struct {
-		uint16_t ramp_ms;
 		uint16_t direction;
 		uint16_t mute_flag;
+		uint16_t ramp_ms;
 		uint16_t pad;
-	} __attribute__((packed)) unmute = { .ramp_ms = 20u, .direction = 1u, .mute_flag = 0u };
+	} __attribute__((packed)) unmute = { .direction = 0u, .mute_flag = 0u, .ramp_ms = 20u };
 	uint16_t mvm_h = 0, cvs_h = 0, cvp_h = 0;
 
 	adsp_log("q6voice: starting cellular voice session (speakerphone=%d)", speakerphone ? 1 : 0);
@@ -1148,11 +1156,11 @@ q6_voice_start(bool speakerphone)
 		goto fail;
 	}
 
-	/* Unmute RX (1) and TX (0) on CVS */
+	/* Unmute TX (0) on CVS and RX (1) on CVP */
 	(void)apr_call_ex(APR_SVC_ADSP_CVS, s_port, cvs_h, VSS_IVOLUME_CMD_MUTE_V2,
 	    &unmute, 6u, 0, NULL, NULL, 800);
-	unmute.direction = 0u;
-	(void)apr_call_ex(APR_SVC_ADSP_CVS, s_port, cvs_h, VSS_IVOLUME_CMD_MUTE_V2,
+	unmute.direction = 1u;
+	(void)apr_call_ex(APR_SVC_ADSP_CVP, s_port, cvp_h, VSS_IVOLUME_CMD_MUTE_V2,
 	    &unmute, 6u, 0, NULL, NULL, 800);
 
 	{
