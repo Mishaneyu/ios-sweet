@@ -20,6 +20,6 @@ codesign -f -s - --entitlements cellulard-ents.plist out/qmicli
 	-framework Foundation -framework CoreTelephony \
 	-o out/cellulard cellulard.m qmi_cellular.c
 strip -x out/cellulard
-codesign -f -s - --entitlements cellulard-ents.plist out/cellulard
+codesign -f -s - -i com.apple.coretelephony --entitlements cellulard-ents.plist out/cellulard
 
 ls -la out/qmicli out/cellulard

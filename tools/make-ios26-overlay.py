@@ -502,6 +502,7 @@ def main():
     mobile_global_prefs = {'AppleLocale': 'en_US', 'AppleLanguages': ['en']}
     sys_global_prefs = {}
     sb_ff_plist = None
+    tu_ff_plist = None
     va_disabled_files = []
     has_idle_xpc = bool(
         args.userland_dir and os.path.isfile(os.path.join(args.userland_dir, 'bin', 'sweet-idle-xpc'))
@@ -579,6 +580,13 @@ def main():
                         sb_ff_plist = loaded_ff
                 except FileNotFoundError:
                     pass
+            try:
+                raw_tu_ff, _, _, _ = hfs.read_file('/System/Library/FeatureFlags/Domain/TelephonyUtilities.plist')
+                loaded_tu_ff = plistlib.loads(raw_tu_ff)
+                if isinstance(loaded_tu_ff, dict):
+                    tu_ff_plist = loaded_tu_ff
+            except FileNotFoundError:
+                pass
             try:
                 va_info, va_uid, va_gid, va_mode = hfs.read_file(
                     '/Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin/Info.plist')
@@ -795,6 +803,29 @@ def main():
     mc_nb_bytes = plistlib.dumps({
         'LockdownActivationIndicatesCloudConfigurationAvailable': False,
     }, fmt=plistlib.FMT_BINARY)
+    tu_prefs_bytes = plistlib.dumps({
+        'CallScreeningDisabled': True,
+        'CallScreeningEnabled': False,
+        'LiveVoicemailEnabled': False,
+        'SilenceUnknownCallersEnabled': False,
+        'SilenceUnknownFaceTimeCallersEnabled': False,
+    }, fmt=plistlib.FMT_BINARY)
+    # Disable iOS 26 AI Call Screening ("Receptionist" / LiveVoicemail) before launchd builds
+    # com.apple.featureflags.shm so callservicesd synchronously creates CSDProviderCall and launches
+    # InCallService for all incoming calls instead of holding unknown callers on stripped ANE/SiriTTS daemons.
+    tu_ff_override = {
+        'CallScreeningEnabled': {'Enabled': False},
+        'CallScreeningEnabledM3': {'Enabled': False},
+        'CallScreeningRTTEnabled': {'Enabled': False},
+        'LVMEverywhere': {'Enabled': False},
+        'LVMGeneralASRMigration': {'Enabled': False},
+        'ReceptionistEnabled': {'Enabled': False},
+        'ReceptionistEnabledMac': {'Enabled': False},
+        'ReceptionistEnabledPad': {'Enabled': False},
+        'lvmExpansionLiveOnEnabled': {'Enabled': False},
+    }
+    tu_ff_domain = dict(tu_ff_plist) if tu_ff_plist is not None else {}
+    tu_ff_domain.update(tu_ff_override)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with tarfile.open(args.output, 'w', format=tarfile.USTAR_FORMAT) as tf:
@@ -802,6 +833,16 @@ def main():
         if jetsam_bytes is not None:
             add_ustar_bytes(tf, 'System/Library/LaunchDaemons/com.apple.jetsamproperties.D421.plist',
                             jetsam_bytes, mode=j_mode, uid=j_uid, gid=j_gid)
+        add_ustar_dir(tf, 'System/Library/FeatureFlags', mode=0o755, uid=0, gid=0)
+        add_ustar_dir(tf, 'System/Library/FeatureFlags/Domain', mode=0o755, uid=0, gid=0)
+        add_ustar_bytes(tf, 'System/Library/FeatureFlags/Domain/TelephonyUtilities.plist',
+                        plistlib.dumps(tu_ff_domain, fmt=plistlib.FMT_BINARY), mode=0o644, uid=0, gid=0)
+        add_ustar_dir(tf, 'private/var/preferences', mode=0o755, uid=0, gid=0)
+        add_ustar_dir(tf, 'private/var/preferences/FeatureFlags', mode=0o755, uid=0, gid=0)
+        add_ustar_dir(tf, 'private/var/preferences/FeatureFlags/Domain', mode=0o755, uid=0, gid=0)
+        add_ustar_bytes(tf, 'private/var/preferences/FeatureFlags/Domain/TelephonyUtilities.plist',
+                        plistlib.dumps(tu_ff_override, fmt=plistlib.FMT_BINARY), mode=0o644, uid=0, gid=0)
+
         add_ustar_dir(tf, 'private/var/mobile/Library', mode=0o755, uid=MOBILE_UID, gid=MOBILE_UID)
         add_ustar_dir(tf, 'private/var/mobile/Library/Preferences', mode=0o755, uid=MOBILE_UID, gid=MOBILE_UID)
         for pref_name, pref_data in (
@@ -810,6 +851,7 @@ def main():
             ('com.apple.purplebuddy.plist', buddy_bytes),
             ('com.apple.purplebuddy.notbackedup.plist', buddy_nb_bytes),
             ('com.apple.managedconfiguration.notbackedup.plist', mc_nb_bytes),
+            ('com.apple.TelephonyUtilities.plist', tu_prefs_bytes),
         ):
             add_ustar_bytes(tf, f'private/var/mobile/Library/Preferences/{pref_name}',
                             pref_data, mode=0o600, uid=MOBILE_UID, gid=MOBILE_UID)
@@ -862,7 +904,6 @@ def main():
                 'AutomaticTimeZoneEnabled': False,
                 'TimeZone': tz_name,
             })
-            add_ustar_dir(tf, 'private/var/preferences', mode=0o755, uid=0, gid=0)
             add_ustar_bytes(tf, 'private/var/preferences/.GlobalPreferences.plist',
                             plistlib.dumps(sys_global_prefs, fmt=plistlib.FMT_BINARY),
                             mode=0o644, uid=0, gid=0)
@@ -888,14 +929,8 @@ def main():
             }
             ff_domain = dict(sb_ff_plist) if sb_ff_plist is not None else {}
             ff_domain.update(autobahn_override)
-            add_ustar_dir(tf, 'System/Library/FeatureFlags', mode=0o755, uid=0, gid=0)
-            add_ustar_dir(tf, 'System/Library/FeatureFlags/Domain', mode=0o755, uid=0, gid=0)
             add_ustar_bytes(tf, 'System/Library/FeatureFlags/Domain/SpringBoard.plist',
                             plistlib.dumps(ff_domain, fmt=plistlib.FMT_BINARY), mode=0o644, uid=0, gid=0)
-            if not tz_name:
-                add_ustar_dir(tf, 'private/var/preferences', mode=0o755, uid=0, gid=0)
-            add_ustar_dir(tf, 'private/var/preferences/FeatureFlags', mode=0o755, uid=0, gid=0)
-            add_ustar_dir(tf, 'private/var/preferences/FeatureFlags/Domain', mode=0o755, uid=0, gid=0)
             add_ustar_bytes(tf, 'private/var/preferences/FeatureFlags/Domain/SpringBoard.plist',
                             plistlib.dumps(autobahn_override, fmt=plistlib.FMT_BINARY), mode=0o644, uid=0, gid=0)
 

@@ -21,6 +21,16 @@
 		<string>access-call-capabilities</string>
 		<string>access-call-providers</string>
 	</array>
+	<key>com.apple.private.icfcallserver</key>
+	<true/>
+	<key>com.apple.springboard.remote-alert</key>
+	<true/>
+	<key>com.apple.springboard.opensensitiveurl</key>
+	<true/>
+	<key>com.apple.backboardd.launchapplications</key>
+	<true/>
+	<key>com.apple.frontboard.launchapplications</key>
+	<true/>
 	<key>com.apple.CallHistory.sync.allow</key>
 	<true/>
 	<key>com.apple.private.security.storage.CallHistory</key>

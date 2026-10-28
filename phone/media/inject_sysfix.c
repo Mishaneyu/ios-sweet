@@ -719,6 +719,7 @@ sb26_return_no(__unused id self, __unused SEL selector)
 
 static bool sb_xb_hooked;
 static bool sb_mc_hooked;
+static bool sb_rc_hooked;
 
 static void
 sb_image_added(__unused const struct mach_header *header, __unused intptr_t slide)
@@ -750,6 +751,19 @@ sb_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 			method_setImplementation(method, (IMP)sb26_return_no);
 		}
 		say("sweet: SpringBoard: -[MCProfileConnection shouldShowSetupAssistant/CloudConfigurationUI] -> NO\n");
+	}
+	if (!sb_rc_hooked &&
+	    (cls = objc_getClass("SBRingerControl")) != NULL) {
+		sb_rc_hooked = true;
+		method = class_getInstanceMethod(cls,
+		    sel_registerName("isRingerMuted"));
+		if (method != NULL && method_getNumberOfArguments(method) == 2) {
+			const char *enc = method_getTypeEncoding(method);
+			if (enc != NULL && (enc[0] == 'B' || enc[0] == 'c')) {
+				method_setImplementation(method, (IMP)sb26_return_no);
+				say("sweet: SpringBoard: -[SBRingerControl isRingerMuted] -> NO\n");
+			}
+		}
 	}
 }
 
@@ -787,10 +801,12 @@ sb_start_ringer_unmute(void)
 	}
 }
 
-/* ---- backboardd (iOS 26+): -[CBBacklightNode getBacklightCalibration:] ---- */
+/* ---- backboardd (iOS 26+): CBBacklightNode + BKButtonHIDEventProcessor ringer state ---- */
 
 static IMP orig_get_backlight_calib;
-static bool bb_hooked;
+static IMP orig_bb_button_init;
+static bool bb_cb_hooked;
+static bool bb_ringer_hooked;
 
 static BOOL
 bb26_get_backlight_calib(id self, SEL selector, float *out)
@@ -816,21 +832,54 @@ bb26_get_backlight_calib(id self, SEL selector, float *out)
 	return YES;
 }
 
+static uint64_t
+bb26_ringer_state(__unused id self, __unused SEL selector)
+{
+	return 1ULL;
+}
+
+static id
+bb26_button_init_with_context(id self, SEL selector, id ctx)
+{
+	id res = orig_bb_button_init != NULL ?
+	    ((id (*)(id, SEL, id))orig_bb_button_init)(self, selector, ctx) : self;
+	if (res != NULL) {
+		SEL set_sel = sel_registerName("setRingerState:");
+		if (class_getInstanceMethod(object_getClass(res), set_sel) != NULL) {
+			((void (*)(id, SEL, uint64_t))objc_msgSend)(res, set_sel, 1ULL);
+		}
+	}
+	return res;
+}
+
 static void
 bb_image_added(__unused const struct mach_header *header, __unused intptr_t slide)
 {
 	Class cls;
 	Method method;
 
-	if (bb_hooked || (cls = objc_getClass("CBBacklightNode")) == NULL) {
-		return;
+	if (!bb_ringer_hooked &&
+	    (cls = objc_getClass("BKButtonHIDEventProcessor")) != NULL) {
+		bb_ringer_hooked = true;
+		method = class_getInstanceMethod(cls, sel_registerName("ringerState"));
+		if (method != NULL) {
+			(void)method_setImplementation(method, (IMP)bb26_ringer_state);
+		}
+		method = class_getInstanceMethod(cls, sel_registerName("initWithContext:"));
+		if (method != NULL) {
+			orig_bb_button_init = method_setImplementation(method,
+			    (IMP)bb26_button_init_with_context);
+		}
+		say("sweet: backboardd: -[BKButtonHIDEventProcessor ringerState] -> 1 (unmuted)\n");
 	}
-	bb_hooked = true;
-	method = class_getInstanceMethod(cls, sel_registerName("getBacklightCalibration:"));
-	if (method != NULL) {
-		orig_get_backlight_calib = method_setImplementation(method,
-		    (IMP)bb26_get_backlight_calib);
-		say("sweet: backboardd: -[CBBacklightNode getBacklightCalibration:] -> 625-nit fallback\n");
+	if (!bb_cb_hooked && (cls = objc_getClass("CBBacklightNode")) != NULL) {
+		bb_cb_hooked = true;
+		method = class_getInstanceMethod(cls, sel_registerName("getBacklightCalibration:"));
+		if (method != NULL) {
+			orig_get_backlight_calib = method_setImplementation(method,
+			    (IMP)bb26_get_backlight_calib);
+			say("sweet: backboardd: -[CBBacklightNode getBacklightCalibration:] -> 625-nit fallback\n");
+		}
 	}
 }
 

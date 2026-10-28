@@ -135,10 +135,71 @@ read_shm_snapshot(uint32_t *out_w, uint32_t *out_r, uint32_t *out_vol, bool *out
 	munmap(s, sizeof(*s));
 }
 
+static int
+run_ringtone_test(unsigned duration_ms)
+{
+	if (duration_ms < 200u) duration_ms = 200u;
+	if (duration_ms > 8000u) duration_ms = 8000u;
+
+	(void)dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices",
+	    RTLD_NOW | RTLD_GLOBAL);
+	uint64_t (*fn_ringer_state)(void) = dlsym(RTLD_DEFAULT, "BKSHIDServicesGetRingerState");
+	uint64_t ringer_state = fn_ringer_state != NULL ? fn_ringer_state() : 999ULL;
+
+	void *tl = dlopen("/System/Library/PrivateFrameworks/ToneLibrary.framework/ToneLibrary",
+	    RTLD_NOW | RTLD_GLOBAL);
+	Class clsCfg = NSClassFromString(@"TLAlertConfiguration");
+	Class clsAlert = NSClassFromString(@"TLAlert");
+	if (tl == NULL || clsCfg == nil || clsAlert == nil) {
+		fprintf(stderr, "sweet-audiotest ring: ToneLibrary unavailable (tl=%p cfg=%p alert=%p)\n",
+		    tl, (void *)clsCfg, (void *)clsAlert);
+		return 1;
+	}
+
+	uint32_t w0 = 0, r0 = 0, vol0 = 0;
+	bool shm_ok0 = false;
+	read_shm_snapshot(&w0, &r0, &vol0, &shm_ok0);
+	printf("sweet-audiotest ring: %u ms TLAlertTypeIncomingCall (BKSHIDServicesGetRingerState=%llu)\n",
+	    duration_ms, (unsigned long long)ringer_state);
+	printf("  before: shm=%s write_frames=%u read_frames=%u vol_q16=%u\n",
+	    shm_ok0 ? "attached" : "missing", w0, r0, vol0);
+
+	/* TLAlertTypeIncomingCall = 1 (matches InCallService PHRingtoneController) */
+	id cfg = ((id (*)(id, SEL, NSInteger))objc_msgSend)([clsCfg alloc],
+	    NSSelectorFromString(@"initWithType:"), (NSInteger)1);
+	id alert = ((id (*)(id, SEL, id))objc_msgSend)((id)clsAlert,
+	    NSSelectorFromString(@"alertWithConfiguration:"), cfg);
+	if (alert == nil) {
+		fprintf(stderr, "sweet-audiotest ring: alertWithConfiguration: returned nil\n");
+		return 1;
+	}
+
+	((void (*)(id, SEL))objc_msgSend)(alert, NSSelectorFromString(@"play"));
+	NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] +
+	    ((double)duration_ms / 1000.0);
+	while ([NSDate timeIntervalSinceReferenceDate] < deadline) {
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+	}
+	((void (*)(id, SEL))objc_msgSend)(alert, NSSelectorFromString(@"stop"));
+	CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.15, false);
+
+	uint32_t w1 = 0, r1 = 0, vol1 = 0;
+	bool shm_ok1 = false;
+	read_shm_snapshot(&w1, &r1, &vol1, &shm_ok1);
+	printf("  after:  shm=%s write_frames=%u (+%u) read_frames=%u (+%u) vol_q16=%u\n",
+	    shm_ok1 ? "attached" : "missing", w1, w1 - w0, r1, r1 - r0, vol1);
+	return 0;
+}
+
 int
 main(int argc, const char *argv[])
 {
 	@autoreleasepool {
+		if (argc > 1 && strcmp(argv[1], "ring") == 0) {
+			unsigned ring_ms = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 1200u;
+			return run_ringtone_test(ring_ms);
+		}
+
 		unsigned duration_ms = argc > 1 ? (unsigned)strtoul(argv[1], NULL, 10) : 600u;
 		double freq_l = argc > 2 ? strtod(argv[2], NULL) : 523.25;
 		double freq_r = argc > 3 ? strtod(argv[3], NULL) : 659.25;

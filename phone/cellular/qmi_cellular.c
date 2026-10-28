@@ -1685,8 +1685,17 @@ int qmi_voice_end(struct qmi_cellular *qc, uint8_t call_id)
 	if (rc < 0)
 		return rc;
 	uint16_t qerr = 0;
-	if (qmi_check_result(rsp, rsp_len, &qerr) != 0)
+	if (qmi_check_result(rsp, rsp_len, &qerr) != 0) {
+		/*
+		 * 3GPP CSFB incoming/waiting calls return QMI_ERR_INCOMPATIBLE_STATE (0x005a)
+		 * on QMI_VOICE_END_CALL; reject via QMI_VOICE_MANAGE_CALLS UDUB (0x01) / END_ALL (0x08).
+		 */
+		if (qmi_voice_manage(qc, 0x01u, 0) == 0)
+			return 0;
+		if (qmi_voice_manage(qc, 0x08u, 0) == 0)
+			return 0;
 		return -(int)(qerr ? qerr : 1);
+	}
 	return 0;
 }
 
