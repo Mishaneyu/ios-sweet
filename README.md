@@ -1,111 +1,141 @@
-# ios-flame
+# IOS-26-Hot
 
-**Apple's iOS 16 running on a Google Pixel 4.**
+[![XNU Kernel CI](https://github.com/nithinyadavamaraboina-online/IOS-26-Hot/actions/workflows/xnu.yml/badge.svg)](https://github.com/nithinyadavamaraboina-online/IOS-26-Hot/actions/workflows/xnu.yml)
+[![iOS Userland & Metal2 CI](https://github.com/nithinyadavamaraboina-online/IOS-26-Hot/actions/workflows/userland.yml/badge.svg)](https://github.com/nithinyadavamaraboina-online/IOS-26-Hot/actions/workflows/userland.yml)
 
-A port of [ios-sweet](https://github.com/dipa-studio/ios-sweet) to the Pixel 4 (`flame`, Qualcomm SM8150 /
-Snapdragon 855, Adreno 640). Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation), with ios-sweet's
-patches and the flame ones on top, runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**. The
-phone is booted with `fastboot boot` from Google's own bootloader. Nothing is flashed to the boot chain; the iOS
-root lives in the `userdata` partition.
+**Apple's iOS 26.5.2 (`23F84`, Liquid Glass `arm64e`) running natively on Qualcomm Snapdragon 855 (`SM8150` / Adreno 640) — Realme X2 Pro (`RMX1931`) & Google Pixel 4 (`flame`).**
 
-![Lock screen, home screen, Settings, General, Control Center, Today view, Spotlight, Clock, Calendar, Notes, Photos and Safari, all rendered through Metal on the Adreno 640](docs/img/metal2-tour.jpg)
+`IOS-26-Hot` rebases and extends the open-source `SWEET` XNU port onto **`xnu-12377.121.6` (Darwin `25.5.0`, the iOS 26 generation)** and boots an unmodified **iPhone 11 Pro (`D421AP`) iOS 26.5.2 (`23F84`)** userland directly from UFS 3.0 storage — complete with GPU-accelerated **Liquid Glass** compositing on Adreno 640 (`SweetMetal2` + Mesa Turnip + `metal2vulkan`), 2.4/5 GHz Wi-Fi, LTE Cellular + CallKit voice calls, stereo `MAX98937` speaker/earpiece/mic audio, **SweetStore 2.0** (App Store discovery, `arm64`/`arm64e` `.ipa` installer, per-app sandbox/Keychain runtime shim, and standalone WebApp packager), and **SweetAuth** (microG-style Apple Account & iCloud compatibility layer).
 
-> Experimental bring-up, not a usable phone OS. It **erases Android's user data**, Apple's security model is
-> mostly switched off (permissive AMFI and sandbox, stub keystore), and many parts are missing. Do not put
-> anything personal on it.
+![iOS running on Adreno 640 Metal2/Turnip](docs/img/metal2-tour.jpg)
 
-## What works (2026-10-22, kernel 0124)
+> [!CAUTION]
+> **Experimental research bring-up — not a production daily-driver OS.** Writing the iOS HFS+ root image to `userdata` replaces Android's user data partition, Apple's SEP/Secure Enclave hardware security model is replaced by software stubs (`cs_integrity_skip=1`, non-SEP `SweetKeyStore`), and bootloader partitions (`abl`, `xbl`, `tz`, `modem`, `persist`) must **never** be modified or relocked. Always back up your per-device partitions first — see [RECOVERY.md](RECOVERY.md).
 
-| Area | State |
+---
+
+## Hardware & Subsystem Status (iOS 26.5.2 / Kernel `0149` on `RMX1931`)
+
+| Subsystem | Status | Implementation Details |
+| --- | --- | --- |
+| **Boot Chain** | **Working** | Unlocked ABL -> bare-metal `shim` (`Image.gz-dtb` + AVB v1.0 footer) -> `xnu-12377.121.6` (`DEVELOPMENT_ARM64_SWEET`) + dynamic POSIX ustar root overlay |
+| **CPU & Thermals** | **Working** | All 8 Kryo 485 cores (`4x A55` + `3x A76` + `1x A76 Prime @ 2.84 GHz`), 3-tier dynamic OSM DVFS (`flamecpufreq=3`) + SMP2P proxy-vote handover (`~32.2–34.4 °C`, `36 mA` idle) |
+| **ARMv8.3 PAC / `arm64e`** | **Working** | EL1 `locore.s` ~45-cycle PAC trap fast-path + offline/on-device `arm64e` PAC opcode stripping while preserving `DYLD_CHAINED_PTR_ARM64E` fixups for `dyld-1378` |
+| **Storage** | **Working** | Qualcomm UFSHCI 3.0 (`sda16` on `RMX1931`, `sda15` on `flame`), case-sensitive HFS+ (`HFSX`) read/write root + HFS+-compatible `containermanagerd` ACL/protection shims |
+| **Display & Dimming** | **Working** | Full-bleed `20:9` (`1125x2499 -> 1080x2400` Samsung `SOFEF03F-M` AMOLED), 60 Hz `gpu_direct` `BGRA` swapchain, `AppleARMBacklight` 0–625 nit OLED dimming + Tap-to-Wake |
+| **GPU / Metal (`SweetMetal2`)** | **Working** | `SweetMetal2.bundle` (`NativeBridgeMetalFrontend` + `metal2vulkan` + Mesa `Turnip` Vulkan on Adreno 640 @ `675 MHz`), transient Liquid Glass render-target pooling, `MTLLinkedFunctions`, crisp Liquid Glass icons |
+| **Touch & Buttons** | **Working** | Synaptics `S3706` RMI4 over QUPv3 GENI I2C (`4 ms` active poll, 10-finger multi-touch) on `RMX1931`; ST `ftm5` SPI touch on `flame`; PM8150 Power / Volume keys |
+| **Wi-Fi (`en0`)** | **Working** | Userland `wland` driving Qualcomm `WCN3990` (`QRTR` + `PD-Mapper` `wlan_pd` + `QMI WLFW` + `CE/HTT/WMI`), active 2.4/5 GHz Probe Request scanning, WPA2/WPA3, native `Settings -> Wi-Fi` (`IO80211`) |
+| **Cellular & Voice Calls** | **Working** | `cellulard` (`CoreTelephony` XPC + `QMI UIM/DMS/NAS/WDS/VOICE` over `/tmp/sweet-qrtr.sock`), physical USIM + LTE registration, incoming/outgoing `CallKit` UI + audible ringtone |
+| **Audio (`adspd` + HAL)** | **Working** | SM8150 LPASS ADSP PAS bring-up + `Q6AFE`/`Q6ADM`/`Q6ASM` + `Q6Voice` (`CVD v2.3`), stereo `MAX98937` speaker amps + earpiece + mic via `HakiosAudio.driver` CoreAudio HAL |
+| **App Store & 3rd-Party Apps** | **Working** | **`SweetStore 2.0`** (`itunes.apple.com` live charts/search + multi-repo unencrypted `.ipa` catalog + Wi-Fi `.ipa` dropzone + 1-tap `WKWebView` `SweetWebAppStub` packager) + **`libsweet_appfix.dylib`** (`@userapps` container, AppGroup, `-34018` Keychain & StoreKit/APNs compatibility layer) |
+| **Apple Account & iCloud** | **Working** | **`SweetAuth.app` + `sweetauthd`** ("microG for iOS"): Self-Check diagnostics, 100% on-device native `CardDAV`/`CalDAV`/`IMAP` provisioning (Contacts, Calendar, Mail, Notes via App-Specific Password), persistent `icloud.com` WebKit container, and `akd`/`cdpd` bridge |
+| **USB Debugging & SSH** | **Working** | Synopsys `DWC3` USB Ethernet: `dropbear` root SSH (`:22`), kernel file server & live telemetry hub (`sweetdiag` / `sweet-dbg.py` on `:2223`) |
+
+**Not working yet:** FairPlay-encrypted (`cryptid = 1`) App Store binaries (use decrypted `.ipa` builds or 1-tap `SweetStore` WebApps), Cellular packet data (`rmnet_ipa0`), hardware camera (`cameracaptured`), Bluetooth (`bluetoothd`), GPS (`locationd`), and hardware SEP / Face ID / Apple Pay.
+
+---
+
+## Architecture
+
+```
+Unlocked Qualcomm Bootloader (ABL)
+  └── shim (shim/build-rmx1931.sh) — bare-metal iBoot replacement (EL1)
+        • Preserves ABL cont_splash framebuffer, configures SMMU/PON/WDT, unpacks SWEETXNU v2 payload + ADT
+        ▼
+XNU 12377.121.6 (xnu/patches-26/0001..0149) — Darwin 25.5.0 (DEVELOPMENT_ARM64_SWEET)
+  ├── Built-in Silicon Drivers: UFSHCI 3.0, SDE Display, Adreno 640 (/dev/sweet_gpu + /dev/pmem),
+  │   Synaptics S3706 I2C Touch, DWC3 USB, PM8150 SPMI/RTC/Battery, Kryo 485 OSM DVFS, Apple80211 en0
+  ├── ARMv8.2 -> ARMv8.3 Compatibility: locore.s PAC fast-path + sleh.c instruction emulator
+  └── Non-SEP Security & Exec Injection: SweetKeyStore (1024 B wrap/unwrap + bag ops) + @userapps kern.exec_inject
+        ▼
+iOS 26.5.2 (23F84) Userland + IOS-26-Hot Daemons & Apps (phone/)
+  ├── SweetMetal2.bundle   — Metal -> metal2vulkan -> Mesa Turnip (Adreno 640 Vulkan 1.3)
+  ├── wland + qrtr_mux     — MPSS remoteproc, rmtfs, pd-mapper (wlan_pd + audio_pd), WCN3990 802.11ac
+  ├── cellulard + adspd    — CoreTelephony XPC + QMI LTE/Voice + LPASS ADSP + HakiosAudio.driver
+  ├── SweetStore 2.0       — sweetstored (:29170 / LAN :29172) + SweetWebAppStub + libsweet_appfix.dylib
+  └── SweetAuth            — sweetauthd (:29171) + SweetAuth.app + libsweet_sysfix.dylib (akd / cdpd / MCM)
+```
+
+---
+
+## Repository Layout
+
+| Path | Description |
 | --- | --- |
-| Boot | Google ABL (unlocked) -> `fastboot boot` of the shim -> XNU. Every reset lands back in fastboot (the shim sets the PMIC reboot reason) |
-| CPU | All 8 cores (4x Cortex-A55 + 4x Cortex-A76) at full clock, PSCI |
-| Storage | UFS 3.0; the iOS root is an HFS+ image in `userdata`, read/write |
-| Display | The 1080x2280 command-mode panel ABL leaves running. iOS sees an iPhone X (1125x2436); the Adreno 640 scales each frame to fit, with Apple's continuous corners |
-| GPU / Metal | Metal on Mesa's Turnip Vulkan driver through metal2vulkan (`sweetmtl=2`): backboardd, SpringBoard and apps render on the GPU, shaders compile on the phone. Swiping home screens runs at about 20-26 fps |
-| Touch, buttons | ST FTS touch over SPI; power and volume keys |
-| USB | Ethernet to the Mac: SSH (dropbear), a kernel file server, the live kernel log, internet sharing |
-| Wi-Fi | The WCN3990 radio driven from userland (`wland`): scan, WPA2-PSK, joins at boot. **Settings -> Wi-Fi works** (wifid on en0, iOS's own DHCP) |
-| Apps | Settings, Safari (renders full pages), Clock, Calendar, Notes, Photos and the other stock apps. An ad hoc-signed third-party IPA (YouTube) launches and browses |
-| Time | PM8150 RTC |
+| `xnu/patches-26/` | **149 sequential patches (`0001`–`0149`)** porting Apple's `xnu-12377.121.6` (iOS 26 / macOS 26.5) to `SWEET` (`SM8150`) |
+| `xnu/patches/` | Legacy `0001`–`0128` patch series for `xnu-8796` (iOS 16.7.16) |
+| `shim/` | Bare-metal ARM64 bootloader shim (`build-rmx1931.sh` for Realme X2 Pro, `build.sh` for Pixel 4) |
+| `phone/metal2/`, `phone/turnip/` | `SweetMetal2.bundle` (`NativeBridgeMetalFrontend.mm`), `metal2vulkan` Rust bridge patches, and Mesa Turnip iOS patches |
+| `phone/wifi/` | `wland` userland Qualcomm MPSS + WCN3990 Wi-Fi driver, `rmtfs`, `pdmapper`, `servreg`, and multi-client `qrtr_mux` |
+| `phone/cellular/` | `cellulard` (`CoreTelephony` XPC server + QMI `UIM`/`DMS`/`NAS`/`WDS`/`VOICE`) and `qmicli` |
+| `phone/adsp/`, `phone/audio/` | `adspd` SM8150 LPASS ADSP audio/voice daemon (`MAX98937` + `Q6Voice`) and `HakiosAudio.driver` CoreAudio HAL |
+| `phone/store/` | `SweetStore.app` 2.0, `sweetstored` v2 (embedded `arm64e` de-PAC + 4 KB SHA-256 signer + WebApp packager), `SweetWebApp.m`, and `libsweet_appfix.dylib` |
+| `phone/auth/` | `SweetAuth.app` and `sweetauthd` (Self-Check, native iCloud CardDAV/CalDAV/IMAP provisioning, `icloud.com` WebKit, Anisette v1/v3 bridge) |
+| `phone/media/` | `libsweet_sysfix.dylib` (`containermanagerd` HFS+/persona shims, `backboardd` OLED calibration & 8-bit `BGRA`, `SpringBoard` JPEG snapshots, `akd`/`cdpd` hooks) & `libsweet_media.dylib` |
+| `phone/tools/` | On-device CLI utilities (`sweetdiag`, `lsreg`, `openapp`, `oslog`, `psx`, `pstack`, `prefs`, `nettest`, `sweet-bootprep`, `sweet-idle-xpc`) |
+| `tools/` | Host build & bring-up tools (`make-ios26-overlay.py`, `mkadt.py`, `mkpayload.py`, `de-pac-arm64e.py`, `rmx1931-run.ps1`, `sweet-dbg.py`, `flame-files.py`) |
+| `.github/workflows/` | Automated macOS CI builds for XNU (`xnu.yml`) and the complete iOS userland + Turnip + `SweetMetal2` bundle (`userland.yml`) |
+| [NOTES.md](NOTES.md), [HANDOFF.md](HANDOFF.md) | Hardware register map, ABL boot image rules, patch index, and chronological bring-up engineering log |
+| [DEVICE.md](DEVICE.md), [RECOVERY.md](RECOVERY.md) | Target device specifications (`RMX1931` & `flame`), partition backup rules, and stock Android restoration |
 
-**Not working yet:** audio, video playback (mediaserverd crashes), Bluetooth, cellular, camera, sensors, GPS,
-SEP / Face ID, HEIC/HEVC decoding (no software decoder), Today-view widgets with Metal (they use the CPU path),
-real battery readings.
+---
 
-## How it boots
+## Not in Git (What You Provide Yourself)
 
-```
-ABL (Google's bootloader, unlocked)
-  -> fastboot boot shim-boot.img          LZ4 kernel + AVB hash footer, or ABL refuses it
-       shim (shim/): acts as iBoot. Logs to UFS, sets the PON reason, arms the watchdog,
-       builds the boot args and jumps to XNU with an Apple device tree (tools/mkadt.py)
-  -> XNU (xnu/patches): every driver built in: UFS, display, GPU, touch, keys, USB, RTC,
-       RPMh, /dev/pmem for the userland drivers, en0 for wifid
-  -> launchd and the iPhone X userland from userdata
-       + phone/: SweetMetal2.bundle (Metal), wland (Wi-Fi), debug tools
-```
+This repository contains **source code, build scripts, and patches only**. No Apple IPSW binaries, Qualcomm/Google/Oppo firmware blobs, or device partition dumps are stored in git:
 
-## Repository
+1. **Unlocked Target Phone & Backups**:
+   - **Realme X2 Pro (`RMX1931` / `samurai`)** (or Google Pixel 4 `flame`) with an unlocked bootloader and TWRP in `recovery`.
+   - Back up your per-device partitions (`boot`, `dtbo`, `persist`, `modemst1`, `modemst2`, `fsg`, `fsc`, `oppostanvbk`, `oppodycnvbk`) into `backup/` before touching `userdata` — keep `backup/` strictly private.
+   - Extract `stock/dtb` from your stock `boot.img` and keep `avbtool.py` in `downloads/avb/`.
+2. **Qualcomm Firmware (from your phone's own `/vendor/firmware_mnt` & NV backups)**:
+   - Adreno 640: `a640_gmu.bin`, `a640_zap.mdt`/`.b00`–`.b02`, `a630_sqe.fw`.
+   - Modem / Wi-Fi / ADSP (staged on-phone under `/var/local/fw/`): `modem.mdt`/`.b*`, `wlanmdsp.mbn`, `adsp.mdt`/`.b*`, `bdwlan*`, and your device's own `modemst1`/`modemst2`/`fsg`/`fsc` images.
+3. **iOS 26.5.2 (`23F84`) Root Image**:
+   - Obtain the official iPhone 11 Pro (`iPhone12,3` / `D421AP`) iOS 26.5.2 (`23F84`) IPSW directly from Apple.
+   - Assemble the case-sensitive HFS+ (`HFSX`) root image (OS + SystemOS + AppOS Cryptexes), run `tools/de-pac-arm64e.py` across binaries/stub subcaches and `tools/sweet-root-tweaks.py`, and stream it to `userdata` (`/dev/block/sda16` on `RMX1931`) via TWRP `dd bs=4194304`.
 
-| Path | What |
-| --- | --- |
-| `xnu/patches/` | 0001-0081 from ios-sweet, 0082-0124 for flame ([list](NOTES.md#flame-patches), [how to build](xnu/README.md)) |
-| `shim/` | The bare-metal shim ABL boots (`shim/build.sh`) |
-| `tools/` | Host tools: ADT and payload, boot-and-collect-logs loop, SSH/file/command access to the running phone, GPU and Metal debugging, ios-sweet's root-image scripts |
-| `phone/` | Code that runs in iOS: `wifi/` (wland), `metal2/` + `turnip/` (Metal on Turnip), `metal/` (the older template driver), `gpu/`, `tools/` (psx, pstack, openapp, lsreg, netsvc, oslog, ...) |
-| [NOTES.md](NOTES.md) | Hardware facts, Google ABL boot image rules, test loop, one line per flame patch |
-| [HANDOFF.md](HANDOFF.md) | The engineering log, newest first: every step, what broke and why |
-| [METAL-NEXT.md](METAL-NEXT.md) | The plan for Metal at user quality (metal2vulkan + Turnip) and why |
-| [RECOVERY.md](RECOVERY.md), [DEVICE.md](DEVICE.md) | Back to stock Android; the test phone and host setup |
-| `docs/ios-sweet/` | ios-sweet's README and notes (the history of patches 0001-0081) |
+---
 
-## Not in git: what you need to get yourself
+## Building & Booting (`RMX1931`)
 
-Scripts expect these at the paths shown (all gitignored). None of them can be shared: they are Apple's or
-Google's/Qualcomm's files, or data from your own phone.
+1. **Build Kernel & Userland (via GitHub Actions or macOS Xcode 16 + LLVM)**:
+   - Trigger `.github/workflows/xnu.yml` -> produces `kernel.development.sweet` (`xnu-12377.121.6` + `0001..0149`).
+   - Trigger `.github/workflows/userland.yml` -> produces `ios-userland.tar.gz` (`SweetMetal2.bundle`, `wland`, `cellulard`, `adspd`, `HakiosAudio.driver`, `SweetStore.app`, `SweetAuth.app`, `sweetstored`, `sweetauthd`, dylibs, and CLI tools).
 
-- **The phone**: a Pixel 4 (`flame`; the 4 XL `coral` is untested) with the bootloader unlocked, on the final
-  Android 13 build `TP1A.221005.002.B2`. Keep Google's factory image in `images/` ([RECOVERY.md](RECOVERY.md)).
-  Back up the per-device partitions first (persist, modemst1/2, fsg, fsc, ...) into `backup/`. They hold your
-  IMEI and calibration data, so keep them private.
-- **Boot image tools**: AOSP `mkbootimg` in `downloads/mkbootimg/`, `avbtool.py` in `downloads/avb/`, and the
-  stock DTB (`python3 tools/unpack_bootv2.py boot.img stock/` on the factory image's boot.img) as `stock/dtb`.
-- **TWRP** 3.7.1_12-0 for flame in `downloads/twrp/`. It writes the root image and reads the logs back. The
-  test loop keeps it in `boot_a` (see NOTES.md).
-- **The iOS root**: the iPhone X iOS 16.7.16 (20H392) IPSW. `tools/remotezip.py` fetches single files from
-  Apple's CDN. Build the HFS+ image with `tools/mkiosroot.sh` in a Linux VM (apfs-fuse, hfsprogs), then run
-  `tools/sweet-root-tweaks.py`. Write it from TWRP with `adb exec-in 'dd of=/dev/block/sda15 bs=4194304' < IMG`,
-  not `fastboot flash userdata` (ABL hangs on the last chunk).
-- **Firmware** from the factory image's `vendor.img` (`/firmware`):
-  - GPU: `a640_gmu.bin`, `a640_zap.mdt`/`.b02` and `a630_sqe.fw` in `research/gpu/fw/` (`flame-run.sh -G`
-    puts them in the device tree).
-  - Wi-Fi: `wlanmdsp.mbn`, `modemuw.jsn` and `bdwlan-flame.bin`, plus the modem's `modem.mdt`/`.bNN` and
-    `modemr.jsn`, in `/var/local/fw/modem` on the phone.
-  - Your own modemst1/modemst2/fsg/fsc images go in `/var/local/fw/rmtfs` on the phone (HANDOFF.md, "WiFi, part 1").
-- **Toolchains**: Xcode with the iOS SDK (`work/userland/bin/ios-cc`), Homebrew `llvm`, `lld` and `lz4` for the
-  shim, [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) for the first kernel build,
-  Mesa and metal2vulkan checkouts for `tools/build-turnip-ios.sh` and `tools/build-m2v-bridge.sh` (pins in the
-  script headers), and dropbear, toybox and dash built for iOS (HANDOFF.md, "SSH into iOS works").
+2. **Assemble Root Overlay, Payload & Boot Image**:
+   ```bash
+   # 1. Build deterministic POSIX ustar root overlay
+   python3 tools/make-ios26-overlay.py \
+     -o work/boot/ios26-overlay.tar \
+     --root-img ~/ios26-root-rmx1931.img \
+     --dsc-stubs-dir work/boot/dsc-stubs-depac \
+     --sweetmetal2 work/boot/ios-userland/Extensions/SweetMetal2.bundle \
+     --userland-dir work/boot/ios-userland \
+     --timezone Asia/Kolkata \
+     --enable-cellular --enable-adsp \
+     --wland-wrapper /private/var/local/bin/sweet-bootprep
 
-## Run it
+   # 2. Pack XNU 0149 + Apple Device Tree + overlay into SWEETXNU v2 payload
+   python3 tools/mkpayload.py \
+     work/boot/kernel-26-0149 \
+     work/boot/rmx1931-d421ap-20x9-bb.adt \
+     work/boot/payload-rmx1931.bin \
+     --overlay work/boot/ios26-overlay.tar \
+     --cmdline "debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsrw=1 rootrw=1 cs_integrity_skip=1 fips_mode=0x44 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=2 sweetfb_direct=1 sweetfb_hz=60 sweetiolog=- sweetgpu=1 sweetmtl=2 sweetgpufreq=6 sweetusb=2 sweetusbframes=0 flamecpufreq=3 rmxtouchdelay=2 flamereboot=180"
 
-```sh
-python3 tools/mkadt.py work/boot/flame-hi.adt --highmem     # Apple device tree for flame
-tools/build-xnu.sh $PWD/work/build.log                       # kernel (after one full darwin-xnu-build run)
-cp work/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet work/boot/kernel-0124
-tools/flame-run.sh first -k work/boot/kernel-0124 -s 600 -G -a "sweetusb=2 sweetmtl=2"   # one boot + logs
-# once, with the phone up and FlameBridge running (tools/flamebridge/build.sh, open the app):
-ssh-keygen -t ed25519 -N '' -f work/userland/ssh/id_ed25519 && tools/flame-install-ssh.sh
-tools/flame-fresh-run.sh second 1800 sweetmtl=2              # from then on: boot and wait for SSH
-tools/flame-ssh                                              # root shell in iOS
-```
+   # 3. Wrap into 96 MiB RMX1931 AVB v1.0 boot image
+   bash shim/build-rmx1931.sh work/boot/payload-rmx1931.bin shim/out/shim-rmx1931-test.img
+   ```
 
-`tools/flame-run.sh` is the loop underneath. It builds the payload and boot image, runs `fastboot boot`, waits for
-the run to end back in fastboot, boots TWRP, then pulls and decodes the kernel log. NOTES.md and HANDOFF.md
-("How to run things", "Tools") cover each step and the boot args.
+3. **Guarded Test Boot (Auto-Restores `backup/boot.img`)**:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File tools\rmx1931-run.ps1 -Image shim\out\shim-rmx1931-test.img -TimeoutSeconds 200
+   ```
 
-## Credits
+---
 
-Built on ios-sweet by dipa-studio, with Wi-Fi from ios-topaz and HackiOS, and Metal from UniXNU, metal2vulkan
-and Mesa. Licences and details in [CREDITS.md](CREDITS.md).
+## Credits & Licences
+
+Built upon [ios-sweet](https://github.com/dipa-studio/ios-sweet), Apple's [darwin-xnu](https://github.com/apple-oss-distributions/xnu) (`APSL-2.0`), [UniXNU](https://github.com/UniXNU/UniXNU) & [UniXNU-zeta](https://github.com/none24smu/UniXNU-zeta), [metal2vulkan](https://github.com/steelbrain/metal2vulkan), [Mesa Turnip](https://gitlab.freedesktop.org/mesa/mesa), [ios-topaz](https://github.com/MakrSas/ios-topaz), and [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel). Full licence breakdown in [CREDITS.md](CREDITS.md) and [LICENSE](LICENSE).

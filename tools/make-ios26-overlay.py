@@ -2,7 +2,7 @@
 """Build a POSIX ustar root overlay (work/boot/ios26-overlay.tar) for iOS 26 bring-up.
 
 Reads /System/Library/xpc/launchd.plist strictly read-only from an HFS+/HFSX
-root image (default /home/paink/ios26-root-rmx1931.img) or an extracted plist,
+root image (default ~/ios26-root-rmx1931.img) or an extracted plist,
 strips crash-looping / hardware-absent LaunchDaemons via sweet-root-tweaks.py,
 configures dropbear/wland/sweetstored, and optionally stages de-PAC'd DSC stub
 subcaches, SweetMetal2.bundle, and iOS 26 userland binaries/apps/drivers into a
@@ -468,7 +468,7 @@ def add_tree(tf, src_dir, dst_prefix, force_exec_names=()):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('-o', '--output', default='work/boot/ios26-overlay.tar', help='output POSIX ustar archive')
-    ap.add_argument('--root-img', default='/home/paink/ios26-root-rmx1931.img',
+    ap.add_argument('--root-img', default=os.path.expanduser('~/ios26-root-rmx1931.img'),
                     help='read-only HFS+/HFSX rootfs image to extract launchd.plist from')
     ap.add_argument('--launchd-plist', help='optional pre-extracted launchd.plist (overrides --root-img)')
     ap.add_argument('--sweetmetal2', help='optional path to SweetMetal2.bundle to stage under /System/Library/Extensions')

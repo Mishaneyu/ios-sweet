@@ -22,7 +22,7 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
   3. **`phone/metal2/NativeBridgeMetalFrontend.mm`**: Scoped `canPoolTextureDesc` / `texturePoolLimits` strictly to transient 2D render-target textures (`>= 64x64`, `levels=1`, `samples=1`, `RenderTarget && !ShaderWrite`) in `backboardd` (`192 MiB / 32`) and `SpringBoard` (`64 MiB / 24`), preserving zero-init guarantees on glyph/icon atlases and compute `ShaderWrite` textures while keeping Liquid Glass backdrop blur pyramids zero-alloc.
   4. **`phone/auth/sweetauthd-ents.plist`, `phone/auth/SweetAuth-ents.plist`, `phone/auth/sweetauthd.m`**: Moved `org.iosonpixel.sweetauthd` / `org.iosonpixel.sweetauth` to index `0` of `keychain-access-groups` (`*` last) and updated `run_keychain_roundtrip_512b` to use explicit `kSecAttrAccessGroup` + `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.
 - **Still Open (Verify on Hardware When Switching Back from Android 17)**:
-  - Check `/dev/block/sda16` (`userdata`) HFSX magic (`HX` at `+1024`) in TWRP before booting iOS (re-stream `/home/paink/ios26-root-rmx1931.img` first if Android 17 reformatted `userdata`).
+  - Check `/dev/block/sda16` (`userdata`) HFSX magic (`HX` at `+1024`) in TWRP before booting iOS (re-stream `~/ios26-root-rmx1931.img` first if Android 17 reformatted `userdata`).
   - Boot `shim/out/shim-rmx1931-wave6-test.img` (`fastboot boot`) and verify simultaneous `en0` Wi-Fi + LTE voice/ringer + `present_mode: "gpu_direct"` (`BGRA` `0x42475241` on Boot #1, 60 Hz smooth scroll) + `sweetauthd` `keychain_512b_ok: true`.
 
 
@@ -73,7 +73,7 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 - **Official Gate 1a (QEMU `virt` `-cpu cortex-a76` + `sweet-init-v84.macho`)**:
   - Boot-args: `debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0 wdt=-1`.
   - **PASSED**: `*** SWEET v8.4 + arm64e SELF-TEST: ALL 9 SUITES PASSED (PID 1) ***`, `{"status": "no_panic_observed", "unknown_glyphs": 0}` (`work/gate1a-0136/`).
-- **Official Gate 1b (QEMU `virt` `-cpu cortex-a76` + `/home/paink/ios26-qemu-dyld.img` real iOS 26.5.2 `dyld-1378` / `libignition-58~38278` + mixed `arm64e`/`arm64`)**:
+- **Official Gate 1b (QEMU `virt` `-cpu cortex-a76` + `~/ios26-qemu-dyld.img` real iOS 26.5.2 `dyld-1378` / `libignition-58~38278` + mixed `arm64e`/`arm64`)**:
   - Boot-args: `debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0 launchd_unsecure_cache=1 wdt=-1`.
   - **PASSED**: `*** SWEET DYLD-1378 (iOS 26.5.2) + ARM64E + ARM64 MIXED DYLIB: PASSED (PID 1) ***` (`work/gate1b-0136/`).
 - **Gate 2 Root Causes Isolated & Fixed (Host Tools Only — Zero Kernel Changes)**:
@@ -91,7 +91,7 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
     - `SWEET GPU: bring-up done, GPU ready in 286 ms (pool 0x105000000)` (`gmu: init result babeface BOOTED`, `675 MHz`, `zap: auth and reset rc 0`)
     - `RMX TOUCH: Synaptics S3706 ready (1080x2400, 10 fingers, poll=4ms/8ms)` (`product="S3706A" fwid=0xcc183013`)
     - 10 `SWEET init-v84: still alive` heartbeats through `flamereboot=30`, clean return to Fastboot at `+67s`, `backup/boot.img` restored.
-- **Still open — Gate 3**: Stream `/home/paink/ios26-root-rmx1931.img` (`30 GiB`) to `/dev/block/sda16` (`userdata`) **only after explicit user confirmation**, boot full iOS 26.5.2 (`23F84`) userland (`rd=ufsroot0`), and verify `launchd`, `backboardd`, `SpringBoard`, `SweetMetal2` (`Adreno 640`), touch, USB/SSH, and Wi-Fi.
+- **Still open — Gate 3**: Stream `~/ios26-root-rmx1931.img` (`30 GiB`) to `/dev/block/sda16` (`userdata`) **only after explicit user confirmation**, boot full iOS 26.5.2 (`23F84`) userland (`rd=ufsroot0`), and verify `launchd`, `backboardd`, `SpringBoard`, `SweetMetal2` (`Adreno 640`), touch, USB/SSH, and Wi-Fi.
 
 
 ### Kernel 0135 built cleanly on CI; Gate 1 preflight findings folded into kernel 0136 (2026-10-26)
@@ -160,8 +160,8 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
      - `0130-ios26-sleh-armv84-pac-emulator.patch`: EL1 `sleh.c` user-mode instruction emulator for ARMv8.4 + PAC (`reta*`, `bra*`/`blra*`, `pac*`/`aut*`/`xpac*`, `pacga`, `ldra*`, `fjcvtzs`, `fcadd`/`fcmla`, `stlur*`/`ldapur*`, `FlagM`/`DIT`, `SHA3`) with zero floating-point libcalls and TBI user address sanitization.
      - `tools/validate-repo.py` passes 100% across both `xnu/patches/` and `xnu/patches-26/`.
   4. **Staged Root Images**:
-     - `/home/paink/ios26-root-rmx1931.img` (`30 GiB` case-sensitive journaled HFS+ image holding iOS 26.5.2 OS + SystemOS + AppOS Cryptexes, de-PAC rewritten, `sweet-root-tweaks.py` applied, `SweetMetal2.bundle`, `wland`, `dropbear`, and RMX1931 firmware staged; verified `fsck_hfs` clean). Phone's `/dev/block/sda16` (`userdata`) is untouched.
-     - `/home/paink/ios26-qemu-dyld.img` (`16 MiB` HFS+ test ramdisk with real iOS 26.5.2 `/usr/lib/dyld` and test binaries).
+     - `~/ios26-root-rmx1931.img` (`30 GiB` case-sensitive journaled HFS+ image holding iOS 26.5.2 OS + SystemOS + AppOS Cryptexes, de-PAC rewritten, `sweet-root-tweaks.py` applied, `SweetMetal2.bundle`, `wland`, `dropbear`, and RMX1931 firmware staged; verified `fsck_hfs` clean). Phone's `/dev/block/sda16` (`userdata`) is untouched.
+     - `~/ios26-qemu-dyld.img` (`16 MiB` HFS+ test ramdisk with real iOS 26.5.2 `/usr/lib/dyld` and test binaries).
      - `work/boot/sweet-init-v84.macho` (`16,635 B` `0x80000002` Mach-O exercising all 9 instruction emulation test suites).
 - **Exact Remaining Fixes for CI Build (`.github/workflows/xnu.yml` / `xnu/patches-26/`)**:
   GitHub Actions run `40265518489` (`make -k` on `macos-latest` Xcode 26.6 / MacOSX26.5.sdk) reported the following fixes needed:
@@ -198,10 +198,10 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
       - **Clock & return**: `PM8150 RTC 20913 s (ctrl 80), time of day 1792965861`; clean warm-reset to Fastboot at `+73 s` and automatic restore of `backup/boot.img` back into the user's custom Android ROM.
 - **iOS 16 arm64 userland (`userland.yml` run `40229029013`, `macos-15` -> `work/userland/ios-userland.tar.gz`)**:
   - Built `SweetMetal2.bundle` (Mesa Turnip `libvulkan_freedreno.dylib` with UniXNU's `darwin` KMD + `metal2vulkan` Rust bridge), `wland` (`MPSS_SIZE = 0x0a000000`, `MSA_PA = 0x9b000000`, `bdwlan-rmx1931.bin`), `gpu` (`FB_H = 2400`), `pmem`, `phone/tools/*`, `dropbearmulti`, `toybox`, plus freestanding signed `arm64` `/bin/sh`.
-- **16 GB iOS 16.7.16 (`20H392`, `iPhone10,3` / `D22AP`) HFS+ root image (`/home/paink/ios-root-rmx1931.img` in WSL2)**:
+- **16 GB iOS 16.7.16 (`20H392`, `iPhone10,3` / `D22AP`) HFS+ root image (`~/ios-root-rmx1931.img` in WSL2)**:
   - Built from verified Apple CDN DMGs (`087-86698-044.dmg`, `087-86593-047.dmg`, `087-86715-047.dmg`) via `tools/mkiosroot.sh` + `tools/sweet-root-tweaks.py`, pre-populated offline with `SweetMetal2.bundle` (`/var/local/mtl2-clients` = `*` / `-chronod`), `RMX1931` Adreno 640 firmware (`/var/local/gpu/fw/`), `RMX1931` modem + `WCN3990` firmware + persist `bdwlan-rmx1931.bin` (`/var/local/fw/modem/`), `rmtfs` EFS copies (`/var/local/fw/rmtfs/`), SSH key (`work/userland/ssh/id_ed25519`), `/bin/sh` + `dropbear` + `toybox`, and `launchd.plist` daemons (`org.iosonpixel.dropbear` + `org.iosonpixel.wland`), verified clean with `fsck.hfsplus -fn`.
 - **Open (next, awaiting explicit user confirmation before overwriting `userdata`)**:
-  1. Full iOS 16.7.16 install (replaces Android `userdata` `/dev/block/sda16`; TWRP in `recovery` `sde18` + `backup/` stay intact): stream `/home/paink/ios-root-rmx1931.img` to `/dev/block/sda16` from TWRP (`dd bs=4194304`), then boot `shim-rmx1931-ios.img` into the iOS 16 Lock Screen & Home Screen.
+  1. Full iOS 16.7.16 install (replaces Android `userdata` `/dev/block/sda16`; TWRP in `recovery` `sde18` + `backup/` stay intact): stream `~/ios-root-rmx1931.img` to `/dev/block/sda16` from TWRP (`dd bs=4194304`), then boot `shim-rmx1931-ios.img` into the iOS 16 Lock Screen & Home Screen.
 
 ### APPLE XNU + USERSPACE PID 1 RUNNING ON RMX1931: Boots #2-#4 verified, kernel 0126 touch GPIO-I2C queued (2026-10-26, 00:38)
 - **Kernel 0125 (`246ed2898282b1777e2133d5d29837465a9083e5b688c243d5a91bec916fce21`, `xnu-8796.141.3`)**:
