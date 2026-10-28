@@ -483,6 +483,8 @@ def main():
                     help='system IANA timezone (default: Asia/Kolkata; empty string disables)')
     ap.add_argument('--enable-cellular', action='store_true',
                     help='register org.iosonpixel.cellulard LaunchDaemon (CoreTelephony XPC + QRTR QMI)')
+    ap.add_argument('--enable-adsp', action='store_true',
+                    help='register org.iosonpixel.adspd LaunchDaemon (SM8150 LPASS ADSP + MAX98927 audio)')
     ap.add_argument('--wland-wrapper', help='optional wrapper path for org.iosonpixel.wland ProgramArguments[0]')
     ap.add_argument('--selftest-bin', help='optional compiled arm64 self-test Mach-O for guarded test boots')
     ap.add_argument('--selftest-script', help='optional bring-up self-test shell script for guarded test boots')
@@ -499,6 +501,7 @@ def main():
     mobile_global_prefs = {'AppleLocale': 'en_US', 'AppleLanguages': ['en']}
     sys_global_prefs = {}
     sb_ff_plist = None
+    va_disabled_files = []
     has_idle_xpc = bool(
         args.userland_dir and os.path.isfile(os.path.join(args.userland_dir, 'bin', 'sweet-idle-xpc'))
     )
@@ -575,6 +578,18 @@ def main():
                         sb_ff_plist = loaded_ff
                 except FileNotFoundError:
                     pass
+            try:
+                va_info, va_uid, va_gid, va_mode = hfs.read_file(
+                    '/Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin/Info.plist')
+                va_disabled_files.append(('Info.plist', va_info, va_mode, va_uid, va_gid))
+                try:
+                    va_loc, vl_uid, vl_gid, vl_mode = hfs.read_file(
+                        '/Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin/Localizable.loctable')
+                    va_disabled_files.append(('Localizable.loctable', va_loc, vl_mode, vl_uid, vl_gid))
+                except FileNotFoundError:
+                    pass
+            except FileNotFoundError:
+                pass
         finally:
             hfs.close()
 
@@ -636,6 +651,22 @@ def main():
             'RunAtLoad': True,
             'StandardErrorPath': '/var/local/cellulard.log',
             'StandardOutPath': '/var/local/cellulard.log',
+            'UserName': 'root',
+        }
+
+    if args.enable_adsp:
+        jobs['/System/Library/LaunchDaemons/org.iosonpixel.adspd.plist'] = {
+            'EnvironmentVariables': {'PATH': '/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'},
+            'KeepAlive': True,
+            'Label': 'org.iosonpixel.adspd',
+            'LegacyTimers': True,
+            'LowPriorityIO': False,
+            'Nice': -10,
+            'ProcessType': 'Interactive',
+            'ProgramArguments': ['/var/local/bin/adspd', 'auto'],
+            'RunAtLoad': True,
+            'StandardErrorPath': '/var/local/adspd.log',
+            'StandardOutPath': '/var/local/adspd.log',
             'UserName': 'root',
         }
 
@@ -925,9 +956,18 @@ def main():
                 add_tree(tf, app_dir, 'Applications/SweetStore.app', force_exec_names=('SweetStore',))
             hal_dir = os.path.join(args.userland_dir, 'HAL', 'HakiosAudio.driver')
             if os.path.isdir(hal_dir):
-                add_ustar_dir(tf, 'Library/Audio/Plug-Ins/HAL', 0o755)
-                add_tree(tf, hal_dir, 'Library/Audio/Plug-Ins/HAL/HakiosAudio.driver',
+                add_ustar_dir(tf, 'System/Library/Audio/Plug-Ins/HAL', 0o755)
+                add_tree(tf, hal_dir, 'System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver',
                          force_exec_names=('HakiosAudio',))
+                if va_disabled_files:
+                    va_dst = 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin'
+                    add_ustar_dir(tf, 'Library/Audio/Plug-Ins/HAL', 0o755)
+                    add_ustar_dir(tf, va_dst, 0o755)
+                    for vfn, vdata, vmode, vuid, vgid in va_disabled_files:
+                        add_ustar_bytes(tf, f'{va_dst}/{vfn}', vdata, mode=vmode, uid=vuid, gid=vgid)
+                    for sl_name in ('VirtualAudio', '_CodeSignature', 'en.lproj'):
+                        add_ustar_symlink(tf, f'{va_dst}/{sl_name}',
+                                          f'../../HAL.disabled/VirtualAudio.plugin/{sl_name}')
             lib_dir = os.path.join(args.userland_dir, 'lib')
             if os.path.isdir(lib_dir):
                 add_ustar_dir(tf, 'usr/local', 0o755)
@@ -978,7 +1018,10 @@ def main():
             mode=0o644,
         )
 
-        rm_paths = []
+        rm_paths = [
+            'Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/Info.plist',
+            'Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/HakiosAudio',
+        ]
         if wp_assets is not None:
             rm_paths.extend([
                 'private/var/mobile/Library/SpringBoard/OriginalLockBackground.cpbitmap',
