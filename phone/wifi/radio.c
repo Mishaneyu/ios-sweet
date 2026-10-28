@@ -710,7 +710,7 @@ static const uint16_t scan_freqs[] = {
 	5745, 5765, 5785, 5805, 5825,
 };
 #define NFREQ ((uint32_t)(sizeof(scan_freqs) / sizeof(scan_freqs[0])))
-#define NBSS 64
+#define NBSS 128
 
 struct bss {
 	uint8_t bssid[6];
@@ -729,6 +729,15 @@ static int scan_started, scanning;
 static uint64_t next_scan_ms;
 static int scan_asked;
 
+static int chan_is_passive(uint32_t f)
+{
+	if (f >= 2467 && f <= 2484)
+		return 1;			/* 2.4 GHz Ch 12-14 */
+	if (f >= 5260 && f <= 5700)
+		return 1;			/* 5 GHz UNII-2 / UNII-2e DFS */
+	return 0;				/* active: 2412..2462, 5180..5240, 5745..5825 */
+}
+
 static int scan_send_start(void)
 {
 	static uint8_t m[512];
@@ -740,8 +749,8 @@ static int scan_send_start(void)
 	c = put32(c, 0);				/* vdev */
 	c = put32(c, 1);				/* priority low */
 	c = put32(c, 0x001 | 0x002 | 0x004 | 0x008 | 0x100 | 0x010);	/* events */
-	c = put32(c, 50);				/* dwell active */
-	c = put32(c, 150);				/* dwell passive */
+	c = put32(c, 40);				/* dwell active */
+	c = put32(c, 110);				/* dwell passive */
 	c = put32(c, 50);				/* min rest */
 	c = put32(c, 500);				/* max rest */
 	c = put32(c, 0);
@@ -749,18 +758,19 @@ static int scan_send_start(void)
 	c = put32(c, 0);
 	c = put32(c, 20000);				/* max scan time */
 	c = put32(c, 5);				/* probe delay */
-	c = put32(c, (0x01 | 0x10) ^ 0x20);		/* passive, chan stat; probe-req filter inverted on TLV */
+	c = put32(c, (0x10) ^ 0x20);			/* active scan, chan stat; probe-req filter inverted on TLV */
 	c = put32(c, 0);
 	c = put32(c, NFREQ);
 	c = put32(c, 1);				/* bssids */
-	c = put32(c, 0);				/* ssids */
+	c = put32(c, 1);				/* ssids: 1 wildcard (len=0) sends broadcast Probe Requests */
 	c = put32(c, 0);				/* ie_len */
-	c = put32(c, 3);				/* num_probes */
+	c = put32(c, 2);				/* num_probes */
 	p = c + 16;					/* mac addr + mask: zero */
 	c = put_tlv(p, TAG_ARRAY_UINT32, NFREQ * 4);
 	for (uint32_t i = 0; i < NFREQ; i++)
 		c = put32(c, scan_freqs[i]);
-	p = put_tlv(c, TAG_ARRAY_FIXED_STRUCT, 0);
+	p = put_tlv(c, TAG_ARRAY_FIXED_STRUCT, 36);	/* 1 x struct wmi_ssid (36 zero bytes = wildcard SSID) */
+	p += 36;
 	c = put_tlv(p, TAG_ARRAY_FIXED_STRUCT, 8);	/* bssid: broadcast */
 	memset(c, 0xff, 6);
 	p = put_tlv(c + 8, TAG_ARRAY_BYTE, 0);
@@ -775,12 +785,13 @@ static void scan_start(void)
 	if (scan_started)
 		return;
 	scan_started = 1;
-	/* channel list, every channel passive: nothing is transmitted */
+	/* channel list: active on non-DFS channels, passive on 2.4G Ch 12-14 & 5G DFS */
 	p = put32(put_tlv(p, TAG_SCAN_CHAN_LIST_CMD, 4), NFREQ);
 	p = put_tlv(p, TAG_ARRAY_STRUCT, NFREQ * (4 + 24));
 	for (uint32_t i = 0; i < NFREQ; i++) {
 		uint32_t mode = scan_freqs[i] < 4000 ? 1 : 0;
-		uint32_t flags = mode | (1u << 7) | (1u << 11) | (scan_freqs[i] < 4000 ? 0 : (1u << 12));
+		uint32_t passive = chan_is_passive(scan_freqs[i]) ? (1u << 7) : 0;
+		uint32_t flags = mode | passive | (1u << 11) | (scan_freqs[i] < 4000 ? 0 : (1u << 12));
 		c = put_tlv(p, TAG_CHANNEL, 24);
 		c = put32(c, scan_freqs[i]);
 		c = put32(c, scan_freqs[i]);
@@ -798,7 +809,7 @@ static void scan_start(void)
 	memcpy(c, radio_mac, 6);
 	int b = wmi_send(CMD_VDEV_CREATE, v, sizeof(v));
 	scanning = !scan_send_start();
-	LOG("scan: channel list (%u) %s, vdev %s, passive scan %s", NFREQ, a ? "FAILED" : "ok", b ? "FAILED" : "ok",
+	LOG("scan: channel list (%u) %s, vdev %s, active scan %s", NFREQ, a ? "FAILED" : "ok", b ? "FAILED" : "ok",
 	    scanning ? "requested" : "FAILED");
 }
 
@@ -898,53 +909,82 @@ static void scan_mgmt_rx(const uint8_t *t, uint32_t len)
 	scan_frames++;
 	int32_t rssi = (int32_t)hdr[1] - 95;		/* snr over ath10k's default noise floor */
 	uint32_t chan = hdr[0];
-	char ssid[33] = "";
+	const uint8_t *ie_ssid = NULL;
+	uint32_t ie_ssid_len = 0;
+	int real_ssid = 0;
 	for (uint32_t o = 36; o + 2 <= flen && o + 2 + f[o + 1] <= flen; o += 2 + f[o + 1]) {
-		if (f[o] == 0) {
+		if (f[o] == 0 && !ie_ssid) {
 			uint32_t n = MIN((uint32_t)f[o + 1], 32u);
+			ie_ssid = f + o + 2;
+			ie_ssid_len = n;
 			for (uint32_t i = 0; i < n; i++) {
-				uint8_t ch = f[o + 2 + i];
-				ssid[i] = (ch >= 0x20 && ch != 0x7f) ? (char)ch : '?';
+				if (ie_ssid[i] != 0) {
+					real_ssid = 1;
+					break;
+				}
 			}
-			ssid[n] = 0;
-			if (n == 0 || f[o + 2] == 0)
-				snprintf(ssid, sizeof(ssid), "<hidden>");
 		} else if (f[o] == 3 && f[o + 1] == 1) {
 			chan = f[o + 2];
 		}
 	}
+	uint64_t now = link_ms();
 	struct bss *b = NULL;
 	int fresh = 0;
 	for (uint32_t i = 0; i < nbss && !b; i++)
 		if (!memcmp(bss[i].bssid, f + 16, 6))
 			b = &bss[i];
 	if (!b) {
-		if (nbss >= NBSS)
-			return;
-		b = &bss[nbss++];
+		if (nbss < NBSS) {
+			b = &bss[nbss++];
+		} else {
+			/* Evict stale (>120s), else weakest/oldest <hidden>, else weakest overall */
+			uint32_t vic = 0;
+			int best_tier = 3;
+			for (uint32_t i = 0; i < nbss; i++) {
+				int tier = (now - bss[i].last_ms > 120000) ? 0
+					   : (bss[i].raw_ssid_len == 0) ? 1 : 2;
+				if (tier < best_tier ||
+				    (tier == best_tier && (bss[i].rssi < bss[vic].rssi ||
+				     (bss[i].rssi == bss[vic].rssi && bss[i].last_ms < bss[vic].last_ms)))) {
+					best_tier = tier;
+					vic = i;
+				}
+			}
+			b = &bss[vic];
+		}
 		memset(b, 0, sizeof(*b));
 		memcpy(b->bssid, f + 16, 6);
 		fresh = 1;
 	}
+	int revealed = (!fresh && b->raw_ssid_len == 0 && real_ssid);
 	b->seen++;
-	b->last_ms = link_ms();
+	b->last_ms = now;
 	b->rssi = (int8_t)rssi;
 	b->chan = (uint8_t)chan;
 	b->freq = (uint16_t)(chan == 14 ? 2484 : chan < 14 ? 2407 + 5 * chan : 5000 + 5 * chan);
 	memcpy(&b->bintval, f + 32, 2);
 	memcpy(&b->capab, f + 34, 2);
-	b->ie_len = (uint16_t)MIN(flen - 36, (uint32_t)sizeof(b->ie));
-	memcpy(b->ie, f + 36, b->ie_len);
-	snprintf(b->ssid, sizeof(b->ssid), "%s", ssid);
-	for (uint32_t o = 36; o + 2 <= flen && o + 2 + f[o + 1] <= flen; o += 2 + f[o + 1]) {
-		if (f[o] == 0) {
-			b->raw_ssid_len = (uint8_t)MIN((uint32_t)f[o + 1], 32u);
-			memcpy(b->raw_ssid, f + o + 2, b->raw_ssid_len);
-			break;
+	if (real_ssid) {
+		b->raw_ssid_len = (uint8_t)ie_ssid_len;
+		memset(b->raw_ssid, 0, sizeof(b->raw_ssid));
+		memcpy(b->raw_ssid, ie_ssid, ie_ssid_len);
+		for (uint32_t i = 0; i < ie_ssid_len; i++) {
+			uint8_t ch = ie_ssid[i];
+			b->ssid[i] = (ch >= 0x20 && ch != 0x7f) ? (char)ch : '?';
 		}
+		b->ssid[ie_ssid_len] = 0;
+		b->ie_len = (uint16_t)MIN(flen - 36, (uint32_t)sizeof(b->ie));
+		memcpy(b->ie, f + 36, b->ie_len);
+	} else if (b->raw_ssid_len == 0) {
+		/* Hidden SSID (len==0 or all NUL bytes) and no prior Probe Response SSID learned */
+		b->raw_ssid_len = 0;
+		memset(b->raw_ssid, 0, sizeof(b->raw_ssid));
+		snprintf(b->ssid, sizeof(b->ssid), "<hidden>");
+		b->ie_len = (uint16_t)MIN(flen - 36, (uint32_t)sizeof(b->ie));
+		memcpy(b->ie, f + 36, b->ie_len);
 	}
 	scan_security(b->ie, b->ie_len, b->capab, b->sec, sizeof(b->sec));
-	if (fresh)
+	if (fresh || revealed)
 		LOG("net %2u: %02x:%02x:%02x:**:**:** ch %3u %4d dBm %-8s '%s'", nbss, b->bssid[0], b->bssid[1],
 		    b->bssid[2], b->chan, b->rssi, b->sec, b->ssid);
 }

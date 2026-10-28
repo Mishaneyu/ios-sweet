@@ -262,6 +262,20 @@ static int smp2p_in_value(const char *name, uint32_t *v)
  */
 static uint32_t modem_state = 0xffffffff;
 static uint64_t smp2p_in_pa, slave_kernel_pa;
+static int modem_proxy_votes_held;
+static uint32_t cx_svs_idx = 2;
+
+static void release_modem_proxy_votes(void)
+{
+	if (!modem_proxy_votes_held)
+		return;
+	modem_proxy_votes_held = 0;
+	vote("mss.lvl", 0);
+	vote("cx.lvl", cx_svs_idx);
+	printf("[%6llu] boot: smp2p handover -> released modem proxy votes (mss->0, cx->svs[%u])\n",
+	       (unsigned long long)link_ms(), cx_svs_idx);
+}
+
 static void smp2p_service(void)
 {
 	uint32_t sz, v;
@@ -286,6 +300,8 @@ static void smp2p_service(void)
 			       v & 4 ? " handover" : "", v & 8 ? " stop-ack" : "");
 			modem_state = v;
 		}
+		if ((v & 4) && !(v & 1))
+			release_modem_proxy_votes();
 	}
 }
 
@@ -402,21 +418,30 @@ struct phdr { uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align; 
 
 static int boot_modem(void)
 {
-	/* 1. proxy votes as downstream (vdd_cx/vdd_mss >= 385): the top levels */
+	/* 1. proxy votes as downstream (vdd_cx/vdd_mss >= 385): top levels until SMP2P handover */
 	int ncx = levels("cx.lvl", 0), nmss = levels("mss.lvl", 0);
 	uint64_t aux;
-	uint32_t len, top_cx = 0, top_mss = 0;
-	if (!cmddb_aux("cx.lvl", &aux, &len))
-		for (uint32_t i = 0; i < len / 2; i++)
-			if (aux16(aux, i))
+	uint32_t len, top_cx = 0, top_mss = 0, svs_cx = 2, best_svs_val = 0xffffffffu;
+	if (!cmddb_aux("cx.lvl", &aux, &len)) {
+		for (uint32_t i = 0; i < len / 2; i++) {
+			uint32_t lv = aux16(aux, i);
+			if (lv)
 				top_cx = i;
+			if (lv >= 128 && lv < best_svs_val) {
+				best_svs_val = lv;
+				svs_cx = i;
+			}
+		}
+	}
+	cx_svs_idx = svs_cx;
 	if (!cmddb_aux("mss.lvl", &aux, &len))
 		for (uint32_t i = 0; i < len / 2; i++)
 			if (aux16(aux, i))
 				top_mss = i;
-	printf("boot: cx %d levels, mss %d levels: voting cx[%u] mss[%u]\n", ncx, nmss, top_cx, top_mss);
+	printf("boot: cx %d levels (svs=%u), mss %d levels: voting cx[%u] mss[%u]\n", ncx, cx_svs_idx, nmss, top_cx, top_mss);
 	if (vote("cx.lvl", top_cx) || vote("mss.lvl", top_mss))
 		return -1;
+	modem_proxy_votes_held = 1;
 
 	/* 2. metadata: ELF header + program headers + hash segment */
 	size_t mlen;
@@ -521,6 +546,12 @@ static int boot_modem(void)
 		/* after a crash the old entry still says ready + fatal until the modem rewrites it */
 		if (smp2p_in_value("slave-kernel", &v) == 0 && (v & 2) && !(v & 1)) {
 			printf("boot: modem ready after %d00 ms\n", t);
+			for (int h = 0; h < 5 && modem_proxy_votes_held; h++) {
+				smp2p_service();
+				if (!modem_proxy_votes_held)
+					break;
+				usleep(20000);
+			}
 			return 0;
 		}
 		usleep(100000);
@@ -720,9 +751,13 @@ static int net(unsigned secs)
 			if (radio_start()) {
 				printf("net: radio start failed\n");
 				wland_console("wland: radio start failed\n");
-			} else if (bridge_open() != 0 && conf_ssid[0] && ipnet_init()) {
-				printf("net: no utun: joining without IP\n");
+			} else if (bridge_open() != 0) {
+				(void)setpriority(PRIO_PROCESS, 0, 0);
+				if (conf_ssid[0] && ipnet_init())
+					printf("net: no utun: joining without IP\n");
 			}
+		} else {
+			(void)setpriority(PRIO_PROCESS, 0, 0);
 		}
 	}
 	radio_summary();

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include "flamewlan.h"
 #include "link.h"
@@ -129,32 +130,63 @@ static void bridge_link(int up)
 	bridge_send(FW_LINK, &l, sizeof(l));
 }
 
-/* what the scans heard (in the last minute), then SCAN_DONE */
+static int bss_has_ssid(const struct radio_bss *r)
+{
+	if (!r->ssid_len)
+		return 0;
+	for (uint8_t i = 0; i < r->ssid_len && i < sizeof(r->ssid); i++)
+		if (r->ssid[i] != 0)
+			return 1;
+	return 0;
+}
+
+static int cmp_bss(const void *pa, const void *pb)
+{
+	const struct radio_bss *a = (const struct radio_bss *)pa;
+	const struct radio_bss *b = (const struct radio_bss *)pb;
+	int ha = bss_has_ssid(a), hb = bss_has_ssid(b);
+	if (ha != hb)
+		return hb - ha;				/* real SSIDs before <hidden> */
+	if (a->rssi != b->rssi)
+		return (int)b->rssi - (int)a->rssi;	/* strongest RSSI descending */
+	return memcmp(a->bssid, b->bssid, 6);
+}
+
+/* what the scans heard (in the last two minutes), sorted & capped to FW_MAX_BSS (64), then SCAN_DONE */
 static void bridge_list(int32_t status)
 {
+	static struct radio_bss list[128];
 	static struct radio_bss r;
 	static struct fw_bss b;
-	unsigned n = 0;
-	bridge_send(FW_BSS_BEGIN, NULL, 0);
+	unsigned count = 0, n = 0;
 	for (unsigned i = 0; radio_heard(i, &r) == 0; i++) {
 		if (r.age_ms > 120000)
 			continue;			/* not heard in the last two minutes */
+		if (count < sizeof(list) / sizeof(list[0]))
+			list[count++] = r;
+	}
+	if (count > 1)
+		qsort(list, count, sizeof(list[0]), cmp_bss);
+	unsigned limit = count < 64 ? count : 64;
+	bridge_send(FW_BSS_BEGIN, NULL, 0);
+	for (unsigned i = 0; i < limit; i++) {
+		const struct radio_bss *e = &list[i];
 		memset(&b, 0, sizeof(b));
-		memcpy(b.bssid, r.bssid, 6);
-		memcpy(b.ssid, r.ssid, r.ssid_len);
-		b.ssid_len = r.ssid_len;
-		b.frequency = r.freq;
-		b.rssi = r.rssi;
-		b.beacon_interval = r.bintval;
-		b.capability = r.capab;
-		b.age_ms = r.age_ms;
-		b.elements_len = r.ie_len;
-		memcpy(b.elements, r.ie, r.ie_len);
+		memcpy(b.bssid, e->bssid, 6);
+		memcpy(b.ssid, e->ssid, e->ssid_len);
+		b.ssid_len = e->ssid_len;
+		b.frequency = e->freq;
+		b.rssi = e->rssi;
+		b.beacon_interval = e->bintval;
+		b.capability = e->capab;
+		b.age_ms = e->age_ms;
+		b.elements_len = e->ie_len;
+		memcpy(b.elements, e->ie, e->ie_len);
 		bridge_send(FW_BSS, &b, sizeof(b));
 		n++;
 	}
 	bridge_status(FW_SCAN_DONE, status);
-	printf("[%6llu] bridge: scan done, %u networks for wifid\n", (unsigned long long)link_ms(), n);
+	printf("[%6llu] bridge: scan done, %u/%u networks for wifid\n", (unsigned long long)link_ms(), n, count);
 }
 
 int bridge_open(void)
@@ -219,7 +251,8 @@ void bridge_poll(void)
 		hello_sent = 1;
 		hello_ms = link_ms();
 		configd_checked = 0;
-		printf("[%6llu] bridge: hello: the kernel makes en0\n", (unsigned long long)hello_ms);
+		(void)setpriority(PRIO_PROCESS, 0, 0);
+		printf("[%6llu] bridge: hello: the kernel makes en0 (priority->0)\n", (unsigned long long)hello_ms);
 		bridge_console("wland: FW_HELLO sent -> en0 live\n");
 	}
 	if (hello_sent && !configd_checked && link_ms() - hello_ms >= 800) {
