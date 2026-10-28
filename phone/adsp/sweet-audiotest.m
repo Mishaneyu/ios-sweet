@@ -152,7 +152,7 @@ run_ringtone_test(unsigned duration_ms)
 	Class clsAlert = NSClassFromString(@"TLAlert");
 	if (tl == NULL || clsCfg == nil || clsAlert == nil) {
 		fprintf(stderr, "sweet-audiotest ring: ToneLibrary unavailable (tl=%p cfg=%p alert=%p)\n",
-		    tl, (void *)clsCfg, (void *)clsAlert);
+		    tl, (__bridge void *)clsCfg, (__bridge void *)clsAlert);
 		return 1;
 	}
 
