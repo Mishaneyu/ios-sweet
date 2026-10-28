@@ -9,6 +9,7 @@
 #include "link.h"
 #include "pdmapper.h"
 #include "qmi.h"
+#include "servreg.h"
 
 #define GET_DOMAIN_LIST	0x21
 #define PFR		0x24	/* protection domain failure report */
@@ -79,6 +80,8 @@ void pdmapper_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			list[0]++;
 		}
 		printf("pd-mapper: \"%s\" -> %u domain(s)\n", name, total);
+		if (!strcmp(name, "kernel/elf_loader"))
+			servreg_on_elf_loader();
 		qmi_tlv_result(&q, 0, 0);
 		qmi_tlv(&q, 0x10, &total, 2);
 		uint16_t rev = 1;

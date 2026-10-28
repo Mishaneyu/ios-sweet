@@ -35,6 +35,7 @@
 #include "link.h"
 #include "rmtfs.h"
 #include "pdmapper.h"
+#include "servreg.h"
 #include "tftp.h"
 #include "wlfw.h"
 #include "radio.h"
@@ -576,6 +577,10 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			wlfw_handle(h, d, n);
 			return;
 		}
+		if (h->dst_port == SERVREG_PORT) {
+			servreg_handle(h, d, n);
+			return;
+		}
 		if (h->dst_port == PDMAPPER_PORT) {
 			pdmapper_handle(h, d, n);
 			return;
@@ -599,10 +604,16 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	} else if (w[0] == QRTR_TYPE_NEW_SERVER) {
 		printf("qrtr:   server service %#x instance %#x at %u:%x\n", w[1], w[2], w[3], w[4]);
 		qrtr_mux_on_ctrl(w[0], w[1], w[2], w[3], w[4]);
-		if (w[1] == WLFW_SERVICE)
+		if (w[1] == SERVREG_SERVICE)
+			servreg_new_server(w[2], w[3], w[4]);
+		if (w[1] == WLFW_SERVICE) {
+			servreg_on_wlfw_up();
 			wlfw_new_server(w[3], w[4]);
+		}
 	} else if (w[0] == QRTR_TYPE_DEL_SERVER) {
 		qrtr_mux_on_ctrl(w[0], w[1], w[2], w[3], w[4]);
+		if (w[1] == SERVREG_SERVICE)
+			servreg_del_server(w[3], w[4]);
 	}
 }
 
@@ -697,6 +708,7 @@ static void net_idle(void)
 		smp2p_service();
 	}
 	qrtr_mux_poll();
+	servreg_poll();
 	radio_poll();
 	ipnet_poll();
 	bridge_poll();
@@ -732,6 +744,7 @@ static int net(unsigned secs)
 		printf("net: no rmtfs\n");
 	if (pdmapper_init() || tftp_init())
 		printf("net: no pd-mapper/tftp\n");
+	servreg_ready();
 	read_conf();
 	uint64_t end = link_ms() + (uint64_t)secs * 1000, stats = link_ms() + 30000;
 	while (!secs || link_ms() < end) {

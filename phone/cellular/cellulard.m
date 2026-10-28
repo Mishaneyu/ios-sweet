@@ -29,6 +29,8 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -36,6 +38,7 @@
 #include "qmi_cellular.h"
 
 #define CELLULARD_LOG		"/var/local/cellulard.log"
+#define CELLULARD_STAMP		"/var/local/cellulard.boot"
 #define CELLULARD_JSON		"/var/local/cellular-status.json"
 #define CELLULARD_CONF		"/var/local/cellular.conf"
 #define RADIOS_PLIST		"/private/var/preferences/SystemConfiguration/com.apple.radios.plist"
@@ -312,7 +315,17 @@
 - (instancetype)initWithType:(NSInteger)type value:(NSString *)value;
 @end
 
+@interface SweetCXAccountSPI : NSObject
+- (instancetype)initWithUUID:(NSUUID *)UUID
+		 description:(NSString *)description
+		 serviceName:(NSString *)serviceName
+	      isoCountryCode:(NSString *)isoCountryCode
+		      handle:(id)handle
+		  shortLabel:(NSString *)shortLabel;
+@end
+
 @interface SweetCXSenderIdentitySPI : NSObject
+- (instancetype)initWithUUID:(NSUUID *)UUID account:(id)account;
 - (instancetype)initWithUUID:(NSUUID *)UUID handle:(id)handle localizedName:(NSString *)localizedName;
 @end
 
@@ -327,23 +340,29 @@
 - (void)setSupportsCurrentPlatform:(BOOL)v;
 - (void)setSupportsRinging:(BOOL)v;
 - (void)setSupportsDynamicSystemUI:(BOOL)v;
+- (void)setSupportsAudioTranslation:(BOOL)v;
 - (void)setIncludesCallsInRecents:(BOOL)v;
 - (void)setMaximumCallGroups:(NSUInteger)v;
 - (void)setMaximumCallsPerCallGroup:(NSUInteger)v;
-- (void)setOrderedSenderIdentities:(NSOrderedSet *)identities;
+- (void)setPrioritizedSenderIdentities:(NSOrderedSet *)identities;
 - (void)setSenderIdentities:(NSSet *)identities;
+- (void)setEmergencyHandles:(NSArray *)handles;
 @end
 
 @interface SweetCXProviderSPI : NSObject
 - (instancetype)initWithConfiguration:(id)configuration;
+- (id)configuration;
+- (void)setConfiguration:(id)configuration;
 - (void)setDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 - (void)reportNewIncomingCallWithUUID:(NSUUID *)UUID
 			       update:(id)update
 			   completion:(void (^)(NSError *error))completion;
 - (void)reportCallWithUUID:(NSUUID *)UUID updated:(id)update;
+- (void)reportOutgoingCallWithUUID:(NSUUID *)UUID sentInvitationAtDate:(NSDate *)dateSentInvitation;
 - (void)reportOutgoingCallWithUUID:(NSUUID *)UUID startedConnectingAtDate:(NSDate *)dateStartedConnecting;
 - (void)reportOutgoingCallWithUUID:(NSUUID *)UUID connectedAtDate:(NSDate *)dateConnected;
-- (void)reportCallWithUUID:(NSUUID *)UUID endedAtDate:(NSDate *)dateEnded endedReason:(NSInteger)endedReason;
+- (void)reportCallWithUUID:(NSUUID *)UUID endedAtDate:(NSDate *)dateEnded reason:(NSInteger)endedReason;
+- (void)reportCallWithUUID:(NSUUID *)UUID endedAtDate:(NSDate *)dateEnded privateReason:(NSInteger)privateReason;
 @end
 
 @interface SweetCXActionSPI : NSObject
@@ -373,6 +392,7 @@ static bool g_cellular_data_enabled = true;
 static bool g_airplane_mode = false;
 static bool g_enable_wds_data = false;
 static bool g_publish_system_status = true;
+static uint16_t g_rat_mode_pref = 0x001cu; /* GSM|WCDMA|LTE */
 static char g_configured_apn[64] = "";
 
 typedef void *sweet_xpc_t;
@@ -469,6 +489,19 @@ static void load_config(void)
 			g_publish_system_status = (atoi(line + 22) != 0);
 		else if (!strncmp(line, "apn=", 4))
 			snprintf(g_configured_apn, sizeof(g_configured_apn), "%s", line + 4);
+		else if (!strncmp(line, "rat_mode=", 9)) {
+			const char *rm = line + 9;
+			if (!strcmp(rm, "3g2g") || !strcmp(rm, "cs"))
+				g_rat_mode_pref = 0x000cu; /* GSM|WCDMA */
+			else if (!strcmp(rm, "gsm") || !strcmp(rm, "2g"))
+				g_rat_mode_pref = 0x0004u; /* GSM */
+			else if (!strcmp(rm, "wcdma") || !strcmp(rm, "3g"))
+				g_rat_mode_pref = 0x0008u; /* WCDMA */
+			else if (!strcmp(rm, "lte") || !strcmp(rm, "4g"))
+				g_rat_mode_pref = 0x0010u; /* LTE */
+			else
+				g_rat_mode_pref = 0x001cu; /* GSM|WCDMA|LTE */
+		}
 	}
 	fclose(f);
 }
@@ -2322,6 +2355,7 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 @property (nonatomic, assign) uint8_t lastState;
 @property (nonatomic, assign) BOOL outgoing;
 @property (nonatomic, assign) BOOL reportedConnecting;
+@property (nonatomic, assign) BOOL reportedSentInvitation;
 @property (nonatomic, assign) BOOL reportedConnected;
 @property (nonatomic, assign) BOOL reportedIncoming;
 @property (nonatomic, assign) BOOL reportedRemoteHandle;
@@ -2338,6 +2372,34 @@ static SweetCXProviderDelegate *g_cx_delegate;
 static NSMutableArray<SweetTrackedCall *> *g_tracked_calls;
 static dispatch_source_t g_ctrl_sock_src;
 static int g_ctrl_listen_fd = -1;
+
+static NSString *iso_country_for_mcc(const char *mcc)
+{
+	if (!mcc || !mcc[0])
+		return @"in";
+	if (!strcmp(mcc, "404") || !strcmp(mcc, "405") || !strcmp(mcc, "406"))
+		return @"in";
+	if (!strncmp(mcc, "31", 2))
+		return @"us";
+	if (!strcmp(mcc, "234") || !strcmp(mcc, "235"))
+		return @"gb";
+	if (!strcmp(mcc, "262"))
+		return @"de";
+	if (!strcmp(mcc, "208"))
+		return @"fr";
+	if (!strcmp(mcc, "440") || !strcmp(mcc, "441"))
+		return @"jp";
+	if (!strcmp(mcc, "460"))
+		return @"cn";
+	if (!strcmp(mcc, "505"))
+		return @"au";
+	if (!strcmp(mcc, "302"))
+		return @"ca";
+	return @"in";
+}
+
+static id build_cx_call_update(const struct qmi_voice_call *c, const struct cellular_state *st);
+static void refresh_callkit_configuration(const struct cellular_state *st);
 
 static SweetTrackedCall *find_tracked_by_uuid(NSUUID *uuid)
 {
@@ -2377,129 +2439,189 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 {
 	(void)provider;
 	clog("CallKit providerDidBegin");
+	struct cellular_state st = snapshot_state();
+	refresh_callkit_configuration(&st);
 }
 
 - (void)provider:(SweetCXProviderSPI *)provider performStartCallAction:(SweetCXActionSPI *)action
 {
-	NSUUID *uuid = [action callUUID];
-	id handle = ct_get(action, @"handle");
-	NSString *numStr = [ct_get(handle, @"value") isKindOfClass:[NSString class]]
-			   ? (NSString *)ct_get(handle, @"value") : @"";
-	BOOL actEmerg = [ct_get(action, @"isEmergency") respondsToSelector:@selector(boolValue)]
-			? [ct_get(action, @"isEmergency") boolValue] : NO;
+	@try {
+		NSUUID *uuid = [action callUUID];
+		id handle = ct_get(action, @"handle");
+		NSString *numStr = [ct_get(handle, @"value") isKindOfClass:[NSString class]]
+				   ? (NSString *)ct_get(handle, @"value") : @"";
+		BOOL actEmerg = [ct_get(action, @"isEmergency") respondsToSelector:@selector(boolValue)]
+				? [ct_get(action, @"isEmergency") boolValue] : NO;
 
-	char numBuf[64];
-	wipe_ram(numBuf, sizeof(numBuf));
-	if (numStr.length > 0)
-		snprintf(numBuf, sizeof(numBuf), "%s", [numStr UTF8String]);
-	bool isEmerg = actEmerg || is_emergency_cstr(numBuf);
+		char numBuf[64];
+		wipe_ram(numBuf, sizeof(numBuf));
+		if (numStr.length > 0)
+			snprintf(numBuf, sizeof(numBuf), "%s", [numStr UTF8String]);
+		bool isEmerg = actEmerg || is_emergency_cstr(numBuf);
 
-	clog("CallKit performStartCallAction uuid=%s num_len=%lu emergency=%d",
-	     [[uuid UUIDString] UTF8String], (unsigned long)numStr.length, isEmerg ? 1 : 0);
+		clog("CallKit performStartCallAction uuid=%s num_len=%lu emergency=%d",
+		     [[uuid UUIDString] UTF8String], (unsigned long)numStr.length, isEmerg ? 1 : 0);
 
-	SweetTrackedCall *tc = [[SweetTrackedCall alloc] init];
-	tc.uuid = uuid;
-	tc.callId = 0;
-	tc.lastState = QMI_VOICE_CALL_STATE_ORIGINATING;
-	tc.outgoing = YES;
-	[g_tracked_calls addObject:tc];
+		SweetTrackedCall *tc = [[SweetTrackedCall alloc] init];
+		tc.uuid = uuid;
+		tc.callId = 0;
+		tc.lastState = QMI_VOICE_CALL_STATE_ORIGINATING;
+		tc.outgoing = YES;
+		[g_tracked_calls addObject:tc];
 
-	uint8_t cid = 0;
-	int rc = qmi_voice_dial(&g_qmi, numBuf, isEmerg, &cid);
-	wipe_ram(numBuf, sizeof(numBuf));
-	if (rc < 0) {
-		clog("CallKit startCall qmi_voice_dial failed rc=%d", rc);
-		[g_tracked_calls removeObjectIdenticalTo:tc];
-		[action fail];
-		return;
+		uint8_t cid = 0;
+		int rc = qmi_voice_dial(&g_qmi, numBuf, isEmerg, &cid);
+		wipe_ram(numBuf, sizeof(numBuf));
+		if (rc < 0) {
+			clog("CallKit startCall qmi_voice_dial failed rc=%d", rc);
+			[g_tracked_calls removeObjectIdenticalTo:tc];
+			[action fail];
+			return;
+		}
+		if (cid != 0 && tc.callId == 0)
+			tc.callId = cid;
+
+		struct cellular_state st = snapshot_state();
+		struct qmi_voice_call mo_info;
+		memset(&mo_info, 0, sizeof(mo_info));
+		mo_info.present = true;
+		mo_info.call_id = cid;
+		mo_info.state = tc.lastState;
+		mo_info.call_type = isEmerg ? 0x09u : 0x00u;
+		mo_info.direction = 0x01u;
+		id upd = build_cx_call_update(&mo_info, &st);
+		if (upd && [provider respondsToSelector:@selector(reportCallWithUUID:updated:)])
+			[provider reportCallWithUUID:uuid updated:upd];
+
+		if (!tc.reportedConnecting &&
+		    [provider respondsToSelector:@selector(reportOutgoingCallWithUUID:startedConnectingAtDate:)]) {
+			tc.reportedConnecting = YES;
+			[provider reportOutgoingCallWithUUID:uuid startedConnectingAtDate:[NSDate date]];
+		}
+		if (tc.lastState == QMI_VOICE_CALL_STATE_CONVERSATION && !tc.reportedConnected &&
+		    [provider respondsToSelector:@selector(reportOutgoingCallWithUUID:connectedAtDate:)]) {
+			tc.reportedConnected = YES;
+			[provider reportOutgoingCallWithUUID:uuid connectedAtDate:[NSDate date]];
+		}
+		[action fulfill];
+	} @catch (id exc) {
+		clog("performStartCallAction exception: %s", [[exc description] UTF8String]);
+		@try { [action fail]; } @catch (id e2) { (void)e2; }
 	}
-	if (cid != 0 && tc.callId == 0)
-		tc.callId = cid;
-	if (!tc.reportedConnecting) {
-		tc.reportedConnecting = YES;
-		[provider reportOutgoingCallWithUUID:uuid startedConnectingAtDate:[NSDate date]];
-	}
-	if (tc.lastState == QMI_VOICE_CALL_STATE_CONVERSATION && !tc.reportedConnected) {
-		tc.reportedConnected = YES;
-		[provider reportOutgoingCallWithUUID:uuid connectedAtDate:[NSDate date]];
-	}
-	[action fulfill];
 }
 
 - (void)provider:(SweetCXProviderSPI *)provider performAnswerCallAction:(SweetCXActionSPI *)action
 {
 	(void)provider;
-	NSUUID *uuid = [action callUUID];
-	SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
-	uint8_t cid = tc ? tc.callId : 0;
-	int rc = qmi_voice_answer(&g_qmi, cid);
-	clog("CallKit performAnswerCallAction uuid=%s call_id=%u -> rc=%d",
-	     [[uuid UUIDString] UTF8String], cid, rc);
-	if (rc == 0 || g_qmi.voice_call_count > 0)
-		[action fulfill];
-	else
-		[action fail];
+	@try {
+		NSUUID *uuid = [action callUUID];
+		SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+		uint8_t cid = tc ? tc.callId : 0;
+		int rc = qmi_voice_answer(&g_qmi, cid);
+		clog("CallKit performAnswerCallAction uuid=%s call_id=%u -> rc=%d",
+		     [[uuid UUIDString] UTF8String], cid, rc);
+		if (rc == 0 || g_qmi.voice_call_count > 0)
+			[action fulfill];
+		else
+			[action fail];
+	} @catch (id exc) {
+		clog("performAnswerCallAction exception: %s", [[exc description] UTF8String]);
+		@try { [action fail]; } @catch (id e2) { (void)e2; }
+	}
 }
 
 - (void)provider:(SweetCXProviderSPI *)provider performEndCallAction:(SweetCXActionSPI *)action
 {
 	(void)provider;
-	NSUUID *uuid = [action callUUID];
-	SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
-	uint8_t cid = tc ? tc.callId : 0;
-	int rc = (cid != 0) ? qmi_voice_end(&g_qmi, cid) : qmi_voice_manage(&g_qmi, 0x08u, 0);
-	clog("CallKit performEndCallAction uuid=%s call_id=%u -> rc=%d",
-	     [[uuid UUIDString] UTF8String], cid, rc);
-	if (tc)
-		[g_tracked_calls removeObjectIdenticalTo:tc];
-	if (g_tracked_calls.count == 0)
-		sweet_voice_write_shm(0, QMI_VOICE_CALL_STATE_END, 0);
-	[action fulfill];
+	@try {
+		NSUUID *uuid = [action callUUID];
+		SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+		uint8_t cid = tc ? tc.callId : 0;
+		int rc = (cid != 0) ? qmi_voice_end(&g_qmi, cid) : qmi_voice_manage(&g_qmi, 0x08u, 0);
+		clog("CallKit performEndCallAction uuid=%s call_id=%u -> rc=%d",
+		     [[uuid UUIDString] UTF8String], cid, rc);
+		if (tc)
+			[g_tracked_calls removeObjectIdenticalTo:tc];
+		if (g_tracked_calls.count == 0)
+			sweet_voice_write_shm(0, QMI_VOICE_CALL_STATE_END, 0);
+		[action fulfill];
+	} @catch (id exc) {
+		clog("performEndCallAction exception: %s", [[exc description] UTF8String]);
+		@try { [action fulfill]; } @catch (id e2) { (void)e2; }
+	}
 }
 
 - (void)provider:(SweetCXProviderSPI *)provider performSetHeldCallAction:(SweetCXActionSPI *)action
 {
 	(void)provider;
-	NSUUID *uuid = [action callUUID];
-	SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
-	uint8_t cid = tc ? tc.callId : 0;
-	BOOL onHold = [ct_get(action, @"isOnHold") respondsToSelector:@selector(boolValue)]
-		      ? [ct_get(action, @"isOnHold") boolValue] : NO;
-	int rc = qmi_voice_manage(&g_qmi, 0x03u, cid);
-	clog("CallKit performSetHeldCallAction call_id=%u hold=%d -> rc=%d", cid, onHold ? 1 : 0, rc);
-	[action fulfill];
+	@try {
+		NSUUID *uuid = [action callUUID];
+		SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+		uint8_t cid = tc ? tc.callId : 0;
+		BOOL onHold = [ct_get(action, @"isOnHold") respondsToSelector:@selector(boolValue)]
+			      ? [ct_get(action, @"isOnHold") boolValue] : NO;
+		int rc = qmi_voice_manage(&g_qmi, 0x03u, cid);
+		clog("CallKit performSetHeldCallAction call_id=%u hold=%d -> rc=%d", cid, onHold ? 1 : 0, rc);
+		[action fulfill];
+	} @catch (id exc) {
+		clog("performSetHeldCallAction exception: %s", [[exc description] UTF8String]);
+		@try { [action fulfill]; } @catch (id e2) { (void)e2; }
+	}
 }
 
 - (void)provider:(SweetCXProviderSPI *)provider performSetMutedCallAction:(SweetCXActionSPI *)action
 {
 	(void)provider;
-	BOOL muted = [ct_get(action, @"isMuted") respondsToSelector:@selector(boolValue)]
-		     ? [ct_get(action, @"isMuted") boolValue] : NO;
-	clog("CallKit performSetMutedCallAction muted=%d", muted ? 1 : 0);
-	[action fulfill];
+	@try {
+		BOOL muted = [ct_get(action, @"isMuted") respondsToSelector:@selector(boolValue)]
+			     ? [ct_get(action, @"isMuted") boolValue] : NO;
+		clog("CallKit performSetMutedCallAction muted=%d", muted ? 1 : 0);
+		[action fulfill];
+	} @catch (id exc) {
+		clog("performSetMutedCallAction exception: %s", [[exc description] UTF8String]);
+		@try { [action fulfill]; } @catch (id e2) { (void)e2; }
+	}
 }
 
 - (void)provider:(SweetCXProviderSPI *)provider performPlayDTMFCallAction:(SweetCXActionSPI *)action
 {
 	(void)provider;
-	NSUUID *uuid = [action callUUID];
-	SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
-	uint8_t cid = tc ? tc.callId : 0;
-	NSString *digits = [ct_get(action, @"digits") isKindOfClass:[NSString class]]
-			   ? (NSString *)ct_get(action, @"digits") : @"";
-	NSInteger dtype = [ct_get(action, @"type") respondsToSelector:@selector(integerValue)]
-			  ? [ct_get(action, @"type") integerValue] : 1;
-	clog("CallKit performPlayDTMFCallAction call_id=%u digits_len=%lu type=%ld",
-	     cid, (unsigned long)digits.length, (long)dtype);
-	for (NSUInteger i = 0; i < digits.length; i++) {
-		unichar uc = [digits characterAtIndex:i];
-		if (uc < 0x7f) {
-			(void)qmi_voice_dtmf(&g_qmi, cid, (char)uc, true);
-			usleep(100000);
-			(void)qmi_voice_dtmf(&g_qmi, cid, (char)uc, false);
+	@try {
+		NSUUID *uuid = [action callUUID];
+		SweetTrackedCall *tc = find_tracked_by_uuid(uuid);
+		uint8_t cid = tc ? tc.callId : 0;
+		NSString *digits = [ct_get(action, @"digits") isKindOfClass:[NSString class]]
+				   ? (NSString *)ct_get(action, @"digits") : @"";
+		NSInteger dtype = [ct_get(action, @"type") respondsToSelector:@selector(integerValue)]
+				  ? [ct_get(action, @"type") integerValue] : 1;
+		clog("CallKit performPlayDTMFCallAction call_id=%u digits_len=%lu type=%ld",
+		     cid, (unsigned long)digits.length, (long)dtype);
+		for (NSUInteger i = 0; i < digits.length; i++) {
+			unichar uc = [digits characterAtIndex:i];
+			if (uc < 0x7f) {
+				(void)qmi_voice_dtmf(&g_qmi, cid, (char)uc, true);
+				usleep(100000);
+				(void)qmi_voice_dtmf(&g_qmi, cid, (char)uc, false);
+			}
 		}
+		[action fulfill];
+	} @catch (id exc) {
+		clog("performPlayDTMFCallAction exception: %s", [[exc description] UTF8String]);
+		@try { [action fulfill]; } @catch (id e2) { (void)e2; }
 	}
-	[action fulfill];
+}
+
+- (void)provider:(SweetCXProviderSPI *)provider performSendMMIOrUSSDCodeAction:(SweetCXActionSPI *)action
+{
+	(void)provider;
+	@try {
+		NSString *code = [ct_get(action, @"code") isKindOfClass:[NSString class]]
+				 ? (NSString *)ct_get(action, @"code") : @"";
+		clog("CallKit performSendMMIOrUSSDCodeAction code_len=%lu", (unsigned long)code.length);
+		[action fail];
+	} @catch (id exc) {
+		(void)exc;
+	}
 }
 
 - (void)provider:(SweetCXProviderSPI *)provider didActivateAudioSession:(id)audioSession
@@ -2516,153 +2638,291 @@ static SweetTrackedCall *find_tracked_by_id(uint8_t cid)
 
 @end
 
-static id build_cx_call_update(const struct qmi_voice_call *c)
+static id build_cx_call_update(const struct qmi_voice_call *c, const struct cellular_state *st)
 {
 	Class clsUpd = NSClassFromString(@"CXCallUpdate");
 	Class clsHnd = NSClassFromString(@"CXHandle");
 	if (!clsUpd)
 		return nil;
 	id upd = [[clsUpd alloc] init];
-	if (c->number[0] && clsHnd) {
+	if (c && c->number[0] && clsHnd) {
 		NSString *numStr = [NSString stringWithUTF8String:c->number];
 		if (numStr.length > 0) {
 			id h = [(SweetCXHandleSPI *)[clsHnd alloc] initWithType:2 value:numStr];
 			ct_set(upd, @"remoteHandle", h);
 		}
 	}
-	ct_set(upd, @"hasVideo", @NO);
-	ct_set(upd, @"supportsHolding", @YES);
-	ct_set(upd, @"supportsDTMF", @YES);
+	/* Exact CommCenter TelephonyProvider baseband call properties (iOS 26.5.2) */
+	ct_set(upd, @"localSenderIdentityUUID", slot1_uuid());
+	ct_set(upd, @"localSenderIdentityAccountUUID", slot1_uuid());
+	ct_set(upd, @"ISOCountryCode", iso_country_for_mcc(st ? st->mcc : NULL));
+	ct_set(upd, @"audioCategory", @"AVAudioSessionCategoryPhoneCall");
 	ct_set(upd, @"usingBaseband", @YES);
+	ct_set(upd, @"callSubType", @1);
+	ct_set(upd, @"hasVideo", @NO);
+	ct_set(upd, @"emergency", @(c && c->call_type == 0x09));
+	ct_set(upd, @"supportsHolding", @YES);
+	ct_set(upd, @"supportsGrouping", @YES);
+	ct_set(upd, @"supportsUngrouping", @YES);
+	ct_set(upd, @"supportsDTMF", @YES);
+	ct_set(upd, @"supportsDTMFUpdates", @YES);
+	ct_set(upd, @"supportsAddCall", @YES);
+	ct_set(upd, @"supportsSendingToVoicemail", @YES);
+	ct_set(upd, @"supportsUnambiguousMultiPartyState", @YES);
 	ct_set(upd, @"localizedCallerName", nil);
 	return upd;
+}
+
+static void report_cx_call_ended_safe(NSUUID *uuid, NSInteger cxReason)
+{
+	if (!g_cx_provider || !uuid)
+		return;
+	@try {
+		NSDate *now = [NSDate date];
+		if ([g_cx_provider respondsToSelector:@selector(reportCallWithUUID:endedAtDate:reason:)]) {
+			[g_cx_provider reportCallWithUUID:uuid endedAtDate:now reason:cxReason];
+		} else if ([g_cx_provider respondsToSelector:@selector(reportCallWithUUID:endedAtDate:privateReason:)]) {
+			[g_cx_provider reportCallWithUUID:uuid endedAtDate:now privateReason:cxReason];
+		}
+	} @catch (id exc) {
+		clog("reportCallWithUUID ended exception: %s", [[exc description] UTF8String]);
+	}
 }
 
 static void on_qmi_voice_calls_changed(struct qmi_ctx *ctx, const struct qmi_voice_call *calls,
 				       size_t count, void *user)
 {
 	(void)ctx; (void)user;
-	if (!g_tracked_calls)
-		g_tracked_calls = [NSMutableArray array];
+	@try {
+		if (!g_tracked_calls)
+			g_tracked_calls = [NSMutableArray array];
+		struct cellular_state st = snapshot_state();
 
-	NSMutableSet<NSNumber *> *seenIds = [NSMutableSet set];
-	for (size_t i = 0; i < count; i++) {
-		const struct qmi_voice_call *c = &calls[i];
-		if (!c->present || c->call_id == 0)
-			continue;
+		NSMutableSet<NSNumber *> *seenIds = [NSMutableSet set];
+		for (size_t i = 0; i < count; i++) {
+			const struct qmi_voice_call *c = &calls[i];
+			if (!c->present || c->call_id == 0)
+				continue;
 
-		SweetTrackedCall *tc = find_tracked_by_id(c->call_id);
-		if (!tc && c->direction == 0x01) {
-			/* Bind pending CallKit/CLI MO call whose QMI call_id just arrived */
-			for (SweetTrackedCall *cand in g_tracked_calls) {
-				if (cand.callId == 0 && cand.outgoing) {
-					cand.callId = c->call_id;
-					tc = cand;
-					break;
+			SweetTrackedCall *tc = find_tracked_by_id(c->call_id);
+			if (!tc && c->direction == 0x01) {
+				/* Bind pending CallKit/CLI MO call whose QMI call_id just arrived */
+				for (SweetTrackedCall *cand in g_tracked_calls) {
+					if (cand.callId == 0 && cand.outgoing) {
+						cand.callId = c->call_id;
+						tc = cand;
+						break;
+					}
 				}
 			}
-		}
 
-		if (c->state == QMI_VOICE_CALL_STATE_END) {
-			clog("voice call_id=%u -> END (end_reason=%u)", c->call_id, c->end_reason);
-			if (tc) {
-				/* CXCallEndedReasonRemoteEnded = 2, CXCallEndedReasonFailed = 1 */
-				NSInteger cxReason = (tc.reportedConnected || c->end_reason == 0 ||
-						      c->end_reason == 16 || c->end_reason == 27 ||
-						      c->end_reason == 102 || c->end_reason == 143) ? 2 : 1;
-				if (g_cx_provider)
-					[g_cx_provider reportCallWithUUID:tc.uuid
-							      endedAtDate:[NSDate date]
-							      endedReason:cxReason];
-				[g_tracked_calls removeObjectIdenticalTo:tc];
+			if (c->state == QMI_VOICE_CALL_STATE_END) {
+				clog("voice call_id=%u -> END (end_reason=%u)", c->call_id, c->end_reason);
+				if (tc) {
+					/* CXCallEndedReasonRemoteEnded = 2, CXCallEndedReasonFailed = 1 */
+					NSInteger cxReason = (tc.reportedConnected || c->end_reason == 0 ||
+							      c->end_reason == 16 || c->end_reason == 27 ||
+							      c->end_reason == 102 || c->end_reason == 143) ? 2 : 1;
+					report_cx_call_ended_safe(tc.uuid, cxReason);
+					[g_tracked_calls removeObjectIdenticalTo:tc];
+				}
+				continue;
 			}
-			continue;
-		}
 
-		[seenIds addObject:@(c->call_id)];
+			[seenIds addObject:@(c->call_id)];
 
-		if (!tc) {
-			tc = [[SweetTrackedCall alloc] init];
-			tc.uuid = [NSUUID UUID];
-			tc.callId = c->call_id;
-			tc.lastState = c->state;
-			tc.outgoing = (c->direction == 0x01);
-			[g_tracked_calls addObject:tc];
+			if (!tc) {
+				tc = [[SweetTrackedCall alloc] init];
+				tc.uuid = [NSUUID UUID];
+				tc.callId = c->call_id;
+				tc.lastState = c->state;
+				tc.outgoing = (c->direction == 0x01);
+				[g_tracked_calls addObject:tc];
 
-			clog("voice new call_id=%u dir=%s state=%s mode=%u num_len=%zu",
-			     c->call_id, tc.outgoing ? "MO" : "MT",
-			     qmi_voice_state_str(c->state), c->mode, strlen(c->number));
+				clog("voice new call_id=%u dir=%s state=%s mode=%u num_len=%zu",
+				     c->call_id, tc.outgoing ? "MO" : "MT",
+				     qmi_voice_state_str(c->state), c->mode, strlen(c->number));
 
-			if (!tc.outgoing &&
-			    (c->state == QMI_VOICE_CALL_STATE_INCOMING ||
-			     c->state == QMI_VOICE_CALL_STATE_WAITING ||
-			     c->state == QMI_VOICE_CALL_STATE_SETUP)) {
-				tc.reportedIncoming = YES;
-				tc.reportedRemoteHandle = (c->number[0] != '\0');
-				if (g_cx_provider) {
-					id upd = build_cx_call_update(c);
-					NSUUID *u = tc.uuid;
-					[g_cx_provider reportNewIncomingCallWithUUID:u
-									      update:upd
-									  completion:^(NSError *err) {
-						if (err)
-							clog("CallKit reportNewIncomingCall err: %s",
-							     [[err description] UTF8String]);
-						else
-							clog("CallKit reportNewIncomingCall accepted uuid=%s",
-							     [[u UUIDString] UTF8String]);
-					}];
+				if (!tc.outgoing &&
+				    (c->state == QMI_VOICE_CALL_STATE_INCOMING ||
+				     c->state == QMI_VOICE_CALL_STATE_WAITING ||
+				     c->state == QMI_VOICE_CALL_STATE_SETUP)) {
+					tc.reportedIncoming = YES;
+					tc.reportedRemoteHandle = (c->number[0] != '\0');
+					if (g_cx_provider) {
+						id upd = build_cx_call_update(c, &st);
+						NSUUID *u = tc.uuid;
+						[g_cx_provider reportNewIncomingCallWithUUID:u
+										      update:upd
+										  completion:^(NSError *err) {
+							if (err)
+								clog("CallKit reportNewIncomingCall err: %s",
+								     [[err description] UTF8String]);
+							else
+								clog("CallKit reportNewIncomingCall accepted uuid=%s",
+								     [[u UUIDString] UTF8String]);
+						}];
+					}
+				}
+			} else if (tc.lastState != c->state) {
+				clog("voice call_id=%u state %s -> %s (mode=%u, num_len=%zu)",
+				     c->call_id, qmi_voice_state_str(tc.lastState),
+				     qmi_voice_state_str(c->state), c->mode, strlen(c->number));
+				tc.lastState = c->state;
+			}
+
+			if (!tc.outgoing && tc.reportedIncoming && !tc.reportedRemoteHandle && c->number[0]) {
+				tc.reportedRemoteHandle = YES;
+				if (g_cx_provider && [g_cx_provider respondsToSelector:@selector(reportCallWithUUID:updated:)]) {
+					id upd = build_cx_call_update(c, &st);
+					if (upd)
+						[g_cx_provider reportCallWithUUID:tc.uuid updated:upd];
 				}
 			}
-		} else if (tc.lastState != c->state) {
-			clog("voice call_id=%u state %s -> %s (mode=%u, num_len=%zu)",
-			     c->call_id, qmi_voice_state_str(tc.lastState),
-			     qmi_voice_state_str(c->state), c->mode, strlen(c->number));
-			tc.lastState = c->state;
-		}
 
-		if (!tc.outgoing && tc.reportedIncoming && !tc.reportedRemoteHandle && c->number[0]) {
-			tc.reportedRemoteHandle = YES;
-			if (g_cx_provider && [g_cx_provider respondsToSelector:@selector(reportCallWithUUID:updated:)]) {
-				id upd = build_cx_call_update(c);
-				if (upd)
-					[g_cx_provider reportCallWithUUID:tc.uuid updated:upd];
-			}
-		}
-
-		if (tc.outgoing && g_cx_provider) {
-			if (!tc.reportedConnecting &&
-			    (c->state == QMI_VOICE_CALL_STATE_ORIGINATING ||
-			     c->state == QMI_VOICE_CALL_STATE_ALERTING ||
-			     c->state == QMI_VOICE_CALL_STATE_PRE_ALERTING)) {
-				tc.reportedConnecting = YES;
-				[g_cx_provider reportOutgoingCallWithUUID:tc.uuid
-						  startedConnectingAtDate:[NSDate date]];
-			}
-			if (!tc.reportedConnected && c->state == QMI_VOICE_CALL_STATE_CONVERSATION) {
-				if (!tc.reportedConnecting) {
+			if (tc.outgoing && g_cx_provider) {
+				if (!tc.reportedConnecting &&
+				    (c->state == QMI_VOICE_CALL_STATE_ORIGINATING ||
+				     c->state == QMI_VOICE_CALL_STATE_ALERTING ||
+				     c->state == QMI_VOICE_CALL_STATE_PRE_ALERTING) &&
+				    [g_cx_provider respondsToSelector:@selector(reportOutgoingCallWithUUID:startedConnectingAtDate:)]) {
 					tc.reportedConnecting = YES;
 					[g_cx_provider reportOutgoingCallWithUUID:tc.uuid
 							  startedConnectingAtDate:[NSDate date]];
 				}
-				tc.reportedConnected = YES;
-				[g_cx_provider reportOutgoingCallWithUUID:tc.uuid
-							  connectedAtDate:[NSDate date]];
+				if (!tc.reportedSentInvitation &&
+				    (c->state == QMI_VOICE_CALL_STATE_ALERTING ||
+				     c->state == QMI_VOICE_CALL_STATE_PRE_ALERTING) &&
+				    [g_cx_provider respondsToSelector:@selector(reportOutgoingCallWithUUID:sentInvitationAtDate:)]) {
+					tc.reportedSentInvitation = YES;
+					[g_cx_provider reportOutgoingCallWithUUID:tc.uuid
+							     sentInvitationAtDate:[NSDate date]];
+				}
+				if (!tc.reportedConnected && c->state == QMI_VOICE_CALL_STATE_CONVERSATION) {
+					if (!tc.reportedConnecting &&
+					    [g_cx_provider respondsToSelector:@selector(reportOutgoingCallWithUUID:startedConnectingAtDate:)]) {
+						tc.reportedConnecting = YES;
+						[g_cx_provider reportOutgoingCallWithUUID:tc.uuid
+								  startedConnectingAtDate:[NSDate date]];
+					}
+					tc.reportedConnected = YES;
+					if ([g_cx_provider respondsToSelector:@selector(reportOutgoingCallWithUUID:connectedAtDate:)]) {
+						[g_cx_provider reportOutgoingCallWithUUID:tc.uuid
+								  connectedAtDate:[NSDate date]];
+					}
+				}
 			}
+		}
+
+		/* Reconcile any tracked calls that vanished from GET_ALL_CALL_INFO / ALL_CALL_STATUS_IND */
+		for (NSInteger idx = (NSInteger)g_tracked_calls.count - 1; idx >= 0; idx--) {
+			SweetTrackedCall *tc = g_tracked_calls[(NSUInteger)idx];
+			if (tc.callId != 0 && ![seenIds containsObject:@(tc.callId)]) {
+				clog("voice call_id=%u disappeared from active list -> reporting ended", tc.callId);
+				report_cx_call_ended_safe(tc.uuid, tc.reportedConnected ? 2 : 1);
+				[g_tracked_calls removeObjectAtIndex:(NSUInteger)idx];
+			}
+		}
+	} @catch (id exc) {
+		clog("on_qmi_voice_calls_changed exception: %s", [[exc description] UTF8String]);
+	}
+}
+
+static SweetCXProviderConfigSPI *build_callkit_configuration(const struct cellular_state *st)
+{
+	Class clsCfg    = NSClassFromString(@"CXProviderConfiguration");
+	Class clsAcct   = NSClassFromString(@"CXAccount");
+	Class clsSender = NSClassFromString(@"CXSenderIdentity");
+	Class clsHandle = NSClassFromString(@"CXHandle");
+	if (!clsCfg)
+		return nil;
+
+	SweetCXProviderConfigSPI *cfg = [[clsCfg alloc] init];
+	if ([cfg respondsToSelector:@selector(setLocalizedName:)])
+		[cfg setLocalizedName:@"Phone"];
+	if ([cfg respondsToSelector:@selector(setSupportedHandleTypes:)])
+		[cfg setSupportedHandleTypes:[NSSet setWithObjects:@2, @1, nil]];
+	if ([cfg respondsToSelector:@selector(setSupportsAudioOnly:)])
+		[cfg setSupportsAudioOnly:YES];
+	if ([cfg respondsToSelector:@selector(setSupportsVideo:)])
+		[cfg setSupportsVideo:NO];
+	if ([cfg respondsToSelector:@selector(setSupportsEmergency:)])
+		[cfg setSupportsEmergency:YES];
+	if ([cfg respondsToSelector:@selector(setSupportsVoicemail:)])
+		[cfg setSupportsVoicemail:YES];
+	if ([cfg respondsToSelector:@selector(setSupportsCurrentPlatform:)])
+		[cfg setSupportsCurrentPlatform:YES];
+	if ([cfg respondsToSelector:@selector(setSupportsRinging:)])
+		[cfg setSupportsRinging:YES];
+	if ([cfg respondsToSelector:@selector(setSupportsDynamicSystemUI:)])
+		[cfg setSupportsDynamicSystemUI:YES];
+	if ([cfg respondsToSelector:@selector(setSupportsAudioTranslation:)])
+		[cfg setSupportsAudioTranslation:YES];
+	if ([cfg respondsToSelector:@selector(setIncludesCallsInRecents:)])
+		[cfg setIncludesCallsInRecents:YES];
+	if ([cfg respondsToSelector:@selector(setMaximumCallGroups:)])
+		[cfg setMaximumCallGroups:2];
+	if ([cfg respondsToSelector:@selector(setMaximumCallsPerCallGroup:)])
+		[cfg setMaximumCallsPerCallGroup:5];
+
+	/* Match CommCenter TelephonyProvider: CXAccount + CXSenderIdentity -> prioritizedSenderIdentities */
+	if (clsSender) {
+		NSString *svcName = (st && st->operator_name[0])
+				    ? [NSString stringWithUTF8String:st->operator_name] : @"Cellular";
+		NSString *iso = iso_country_for_mcc(st ? st->mcc : NULL);
+		id sender = nil;
+		if (clsAcct &&
+		    [clsAcct instancesRespondToSelector:
+		     @selector(initWithUUID:description:serviceName:isoCountryCode:handle:shortLabel:)] &&
+		    [clsSender instancesRespondToSelector:@selector(initWithUUID:account:)]) {
+			id acct = [(SweetCXAccountSPI *)[clsAcct alloc]
+				   initWithUUID:slot1_uuid()
+				    description:@"Primary"
+				    serviceName:svcName
+				 isoCountryCode:iso
+					 handle:nil
+				     shortLabel:@"P"];
+			if (acct)
+				sender = [(SweetCXSenderIdentitySPI *)[clsSender alloc]
+					  initWithUUID:slot1_uuid() account:acct];
+		}
+		if (!sender && clsHandle &&
+		    [clsSender instancesRespondToSelector:@selector(initWithUUID:handle:localizedName:)]) {
+			id senderH = [(SweetCXHandleSPI *)[clsHandle alloc] initWithType:1 value:@"Primary"];
+			sender = [(SweetCXSenderIdentitySPI *)[clsSender alloc]
+				  initWithUUID:slot1_uuid() handle:senderH localizedName:@"Primary"];
+		}
+		if (sender) {
+			if ([cfg respondsToSelector:@selector(setPrioritizedSenderIdentities:)])
+				[cfg setPrioritizedSenderIdentities:[NSOrderedSet orderedSetWithObject:sender]];
+			else if ([cfg respondsToSelector:@selector(setSenderIdentities:)])
+				[cfg setSenderIdentities:[NSSet setWithObject:sender]];
 		}
 	}
 
-	/* Reconcile any tracked calls that vanished from GET_ALL_CALL_INFO / ALL_CALL_STATUS_IND */
-	for (NSInteger idx = (NSInteger)g_tracked_calls.count - 1; idx >= 0; idx--) {
-		SweetTrackedCall *tc = g_tracked_calls[(NSUInteger)idx];
-		if (tc.callId != 0 && ![seenIds containsObject:@(tc.callId)]) {
-			clog("voice call_id=%u disappeared from active list -> reporting ended", tc.callId);
-			if (g_cx_provider)
-				[g_cx_provider reportCallWithUUID:tc.uuid
-						      endedAtDate:[NSDate date]
-						      endedReason:(tc.reportedConnected ? 2 : 1)];
-			[g_tracked_calls removeObjectAtIndex:(NSUInteger)idx];
+	if (clsHandle && [cfg respondsToSelector:@selector(setEmergencyHandles:)]) {
+		static NSString * const emergNums[] = { @"112", @"911", @"100", @"101", @"102", @"108" };
+		NSMutableArray *ehs = [NSMutableArray arrayWithCapacity:6];
+		for (size_t i = 0; i < sizeof(emergNums) / sizeof(emergNums[0]); i++) {
+			id eh = [(SweetCXHandleSPI *)[clsHandle alloc] initWithType:2 value:emergNums[i]];
+			if (eh)
+				[ehs addObject:eh];
 		}
+		[cfg setEmergencyHandles:ehs];
+	}
+	return cfg;
+}
+
+static void refresh_callkit_configuration(const struct cellular_state *st)
+{
+	if (!g_cx_provider || ![g_cx_provider respondsToSelector:@selector(setConfiguration:)])
+		return;
+	@try {
+		SweetCXProviderConfigSPI *cfg = build_callkit_configuration(st);
+		if (cfg)
+			[g_cx_provider setConfiguration:cfg];
+	} @catch (id exc) {
+		clog("refresh_callkit_configuration exception: %s", [[exc description] UTF8String]);
 	}
 }
 
@@ -2683,60 +2943,18 @@ static void init_callkit_provider(void)
 
 	Class clsXPCProv = NSClassFromString(@"CXXPCProvider");
 	Class clsProv    = NSClassFromString(@"CXProvider");
-	Class clsCfg     = NSClassFromString(@"CXProviderConfiguration");
-	Class clsSender  = NSClassFromString(@"CXSenderIdentity");
-	Class clsHandle  = NSClassFromString(@"CXHandle");
-	if (!clsCfg || (!clsXPCProv && !clsProv)) {
+	if (!clsXPCProv && !clsProv) {
 		clog("CallKit provider classes unavailable");
 		return;
 	}
 
 	@try {
-		SweetCXProviderConfigSPI *cfg = nil;
-		if ([clsCfg instancesRespondToSelector:@selector(initWithLocalizedName:)])
-			cfg = [(SweetCXProviderConfigSPI *)[clsCfg alloc] initWithLocalizedName:@"Phone"];
-		else
-			cfg = [[clsCfg alloc] init];
-		if ([cfg respondsToSelector:@selector(setLocalizedName:)])
-			[cfg setLocalizedName:@"Phone"];
-		if ([cfg respondsToSelector:@selector(setSupportedHandleTypes:)])
-			[cfg setSupportedHandleTypes:[NSSet setWithObject:@2]];
-		if ([cfg respondsToSelector:@selector(setSupportsAudioOnly:)])
-			[cfg setSupportsAudioOnly:YES];
-		if ([cfg respondsToSelector:@selector(setSupportsVideo:)])
-			[cfg setSupportsVideo:NO];
-		if ([cfg respondsToSelector:@selector(setSupportsEmergency:)])
-			[cfg setSupportsEmergency:YES];
-		if ([cfg respondsToSelector:@selector(setSupportsVoicemail:)])
-			[cfg setSupportsVoicemail:YES];
-		if ([cfg respondsToSelector:@selector(setSupportsCurrentPlatform:)])
-			[cfg setSupportsCurrentPlatform:YES];
-		if ([cfg respondsToSelector:@selector(setSupportsRinging:)])
-			[cfg setSupportsRinging:YES];
-		if ([cfg respondsToSelector:@selector(setSupportsDynamicSystemUI:)])
-			[cfg setSupportsDynamicSystemUI:YES];
-		if ([cfg respondsToSelector:@selector(setIncludesCallsInRecents:)])
-			[cfg setIncludesCallsInRecents:YES];
-		if ([cfg respondsToSelector:@selector(setMaximumCallGroups:)])
-			[cfg setMaximumCallGroups:2];
-		if ([cfg respondsToSelector:@selector(setMaximumCallsPerCallGroup:)])
-			[cfg setMaximumCallsPerCallGroup:5];
-
-		if (clsSender && clsHandle) {
-			id senderH = [(SweetCXHandleSPI *)[clsHandle alloc] initWithType:1 value:@"Primary"];
-			id sender = nil;
-			if ([clsSender instancesRespondToSelector:@selector(initWithUUID:handle:localizedName:)]) {
-				sender = [(SweetCXSenderIdentitySPI *)[clsSender alloc]
-					  initWithUUID:slot1_uuid() handle:senderH localizedName:@"Primary"];
-			}
-			if (sender) {
-				if ([cfg respondsToSelector:@selector(setOrderedSenderIdentities:)])
-					[cfg setOrderedSenderIdentities:[NSOrderedSet orderedSetWithObject:sender]];
-				else if ([cfg respondsToSelector:@selector(setSenderIdentities:)])
-					[cfg setSenderIdentities:[NSSet setWithObject:sender]];
-			}
+		struct cellular_state st = snapshot_state();
+		SweetCXProviderConfigSPI *cfg = build_callkit_configuration(&st);
+		if (!cfg) {
+			clog("failed to build CXProviderConfiguration");
+			return;
 		}
-
 		Class chosenCls = clsXPCProv ? clsXPCProv : clsProv;
 		SweetCXProviderSPI *prov = [(SweetCXProviderSPI *)[chosenCls alloc] initWithConfiguration:cfg];
 		if (!prov && clsXPCProv && clsProv) {
@@ -2750,7 +2968,8 @@ static void init_callkit_provider(void)
 		g_cx_delegate = [[SweetCXProviderDelegate alloc] init];
 		[prov setDelegate:g_cx_delegate queue:g_qmi_queue];
 		g_cx_provider = prov;
-		clog("initialized CallKit %s (delegate on g_qmi_queue)", class_getName(chosenCls));
+		clog("initialized CallKit %s (prioritizedSender=%s, delegate on g_qmi_queue)",
+		     class_getName(chosenCls), SLOT1_UUID_STR);
 	} @catch (id exc) {
 		clog("init_callkit_provider exception: %s", [[exc description] UTF8String]);
 	}
@@ -2901,7 +3120,7 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 {
 	os_unfair_lock_lock(&g_state_lock);
 	bool prev_sim = g_state.sim_present;
-	char prev_sim_st[32], prev_op[64], prev_reg[32], prev_rat[16], prev_call_st[24];
+	char prev_sim_st[32], prev_op[64], prev_mcc[8], prev_reg[32], prev_rat[16], prev_call_st[24];
 	int prev_bars = g_state.bars_0_to_4;
 	bool prev_ps = g_state.ps_attached;
 	bool prev_data = g_state.data_connected;
@@ -2910,6 +3129,7 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 	uint32_t prev_calls = g_state.active_calls;
 	snprintf(prev_sim_st, sizeof(prev_sim_st), "%s", g_state.sim_state);
 	snprintf(prev_op, sizeof(prev_op), "%s", g_state.operator_name);
+	snprintf(prev_mcc, sizeof(prev_mcc), "%s", g_state.mcc);
 	snprintf(prev_reg, sizeof(prev_reg), "%s", g_state.reg_state);
 	snprintf(prev_rat, sizeof(prev_rat), "%s", g_state.rat);
 	snprintf(prev_call_st, sizeof(prev_call_st), "%s", g_state.last_call_state);
@@ -2920,6 +3140,8 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 
 	bool sim_changed = force_broadcast || (prev_sim != next->sim_present) ||
 			   (strcmp(prev_sim_st, next->sim_state) != 0);
+	bool op_or_mcc_changed = (strcmp(prev_op, next->operator_name) != 0) ||
+				 (strcmp(prev_mcc, next->mcc) != 0);
 	bool any_changed = sim_changed ||
 			   (prev_dms != next->dms_mode_raw) ||
 			   (prev_rej != next->last_reject_cause) ||
@@ -2928,12 +3150,12 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 			   (prev_bars != next->bars_0_to_4) ||
 			   (prev_ps != next->ps_attached) ||
 			   (prev_data != next->data_connected) ||
-			   (strcmp(prev_op, next->operator_name) != 0) ||
+			   op_or_mcc_changed ||
 			   (strcmp(prev_reg, next->reg_state) != 0) ||
 			   (strcmp(prev_rat, next->rat) != 0);
 
 	if (any_changed) {
-		clog("state: imei=%d sim=%s(slot %d,%s) mode=%s(%u,off=0x%04x,hw=%d) reg=%s(rej=%u) rat=%s plmn=%s-%s op='%s' rsrp=%d bars=%d/4 voice=%d(calls=%u,%s) ps=%d data=%d",
+		clog("state: imei=%d sim=%s(slot %d,%s) mode=%s(%u,off=0x%04x,hw=%d) reg=%s(rej=%u) rat=%s plmn=%s-%s op='%s' rsrp=%d bars=%d/4 voice=%d(cs=%d,ltev=%d,imsv=%d,calls=%u,%s) ps=%d data=%d",
 		     next->imei_present ? 1 : 0,
 		     next->sim_present ? "yes" : "no",
 		     next->sim_slot, next->app_state, next->radio_mode, next->dms_mode_raw,
@@ -2941,9 +3163,12 @@ static void commit_and_publish(const struct cellular_state *next, bool force_bro
 		     next->reg_state, next->last_reject_cause, next->rat, next->mcc, next->mnc,
 		     next->operator_name, next->has_rsrp ? next->rsrp_dbm : 0,
 		     next->bars_0_to_4, next->voice_svc_ready ? 1 : 0,
+		     next->cs_attached ? 1 : 0, next->lte_voice_support ? 1 : 0, next->ims_voice_support ? 1 : 0,
 		     next->active_calls, next->last_call_state,
 		     next->ps_attached ? 1 : 0,
 		     next->data_connected ? 1 : 0);
+		if (sim_changed || op_or_mcc_changed)
+			refresh_callkit_configuration(next);
 		publish_system_status(next);
 		broadcast_ct_notifications(next, sim_changed);
 	}
@@ -3153,7 +3378,25 @@ int main(int argc, char **argv)
 
 		if (!foreground) {
 			(void)mkdir("/var/local", 0755);
-			(void)rename(CELLULARD_LOG, CELLULARD_LOG ".prev");
+			struct timeval bt = { 0 };
+			size_t blen = sizeof(bt);
+			char want[32] = "", stamp[32] = "";
+			if (sysctlbyname("kern.boottime", &bt, &blen, NULL, 0) == 0)
+				snprintf(want, sizeof(want), "%ld\n", (long)bt.tv_sec);
+			FILE *sf = fopen(CELLULARD_STAMP, "r");
+			if (sf) {
+				if (!fgets(stamp, sizeof(stamp), sf))
+					stamp[0] = '\0';
+				fclose(sf);
+			}
+			/* Rotate to .prev only once per phone boot so intra-boot restarts keep history */
+			if (!want[0] || strcmp(stamp, want) != 0) {
+				(void)rename(CELLULARD_LOG, CELLULARD_LOG ".prev");
+				if (want[0] && (sf = fopen(CELLULARD_STAMP, "w")) != NULL) {
+					fputs(want, sf);
+					fclose(sf);
+				}
+			}
 			g_logf = fopen(CELLULARD_LOG, "a");
 		}
 		clog("cellulard starting (pid %d)", (int)getpid());
@@ -3167,6 +3410,7 @@ int main(int argc, char **argv)
 		g_logged_unhandled = [NSMutableSet set];
 
 		load_config();
+		g_qmi.rat_mode_pref = g_rat_mode_pref;
 		(void)cellular_state_write_json_file(&g_state, CELLULARD_JSON);
 
 		/* 1. Initialize SystemStatus publisher */

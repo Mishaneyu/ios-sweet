@@ -191,6 +191,8 @@ struct cellular_state {
 
 	/* Redacted QMI_SVC_VOICE (0x09) summary (NO phone numbers ever stored here) */
 	bool     voice_svc_ready;
+	bool     lte_voice_support;
+	bool     ims_voice_support;
 	uint32_t active_calls;
 	char     last_call_state[24];
 	uint16_t last_call_end_reason;
@@ -248,6 +250,7 @@ struct qmi_ctx {
 	bool                 nas_pref_configured;
 	bool                 nas_auto_reg_attempted;
 	bool                 voice_initial_queried;
+	uint16_t             rat_mode_pref;
 	uint32_t             ind_reg_mask;
 };
 

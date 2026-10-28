@@ -122,6 +122,7 @@ int qmi_open(struct qmi_ctx *ctx, const char *sock_path)
 	void *saved_user = ctx->ind_user;
 	on_voice_calls_changed_fn saved_vcb = ctx->on_voice_calls_changed;
 	void *saved_vuser = ctx->voice_user;
+	uint16_t saved_rat = ctx->rat_mode_pref;
 	wipe_sensitive(ctx, sizeof(*ctx));
 	ctx->fd = -1;
 	ctx->next_txn = 1;
@@ -129,6 +130,7 @@ int qmi_open(struct qmi_ctx *ctx, const char *sock_path)
 	ctx->ind_user = saved_user;
 	ctx->on_voice_calls_changed = saved_vcb;
 	ctx->voice_user = saved_vuser;
+	ctx->rat_mode_pref = saved_rat;
 
 	const char *path = (sock_path && sock_path[0]) ? sock_path : SWEET_QRTR_SOCK;
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -920,6 +922,13 @@ static void parse_nas_sys_info(struct cellular_state *st, const uint8_t *tlvs, s
 		if (!strcmp(st->rat, "none"))
 			snprintf(st->rat, sizeof(st->rat), "lte");
 	}
+	const uint8_t *lte_v = qmi_tlv_find(tlvs, len, 0x21, &l);
+	if (lte_v && l >= 1)
+		st->lte_voice_support = (lte_v[0] != 0);
+	const uint8_t *ims_v = qmi_tlv_find(tlvs, len, 0x29, &l);
+	if (ims_v && l >= 1)
+		st->ims_voice_support = (ims_v[0] != 0);
+
 	/* TLV 0x19 (LTE Sys Info), 0x18 (WCDMA), 0x17 (GSM): common 8B + LAC(3) + CID(5) + PLMN(7) = 23B */
 	static const uint8_t sys_tlvs[] = { 0x19, 0x18, 0x17 };
 	for (size_t idx = 0; idx < sizeof(sys_tlvs); idx++) {
@@ -1196,9 +1205,11 @@ static void poll_dms_imei_present(struct qmi_ctx *ctx, struct cellular_state *st
 }
 
 /*
- * Configure multi-RAT GSM|WCDMA|LTE + CS_PS + IMS_PS_PREFERRED (VoLTE w/ CS/CSFB fallback
- * for BSNL) once DMS enters ONLINE, and trigger one automatic network registration if
- * registration was previously stuck in denied while IMEI is present.
+ * Configure multi-RAT GSM|WCDMA|LTE + CS_PS + VOICE_CENTRIC + CS_PREFERRED
+ * (with POWER_CYCLE duration so NV is never permanently mutated) once DMS
+ * enters ONLINE, and trigger one automatic network registration if needed.
+ * Since HLOS has no IMS/VoLTE RTP stack yet, CS_PREFERRED (2) directs MPSS to
+ * use CS / CSFB immediately for incoming paging and outgoing QMI_VOICE_DIAL_CALL.
  */
 static void configure_nas_selection_and_reg(struct qmi_ctx *ctx, struct cellular_state *st)
 {
@@ -1208,20 +1219,23 @@ static void configure_nas_selection_and_reg(struct qmi_ctx *ctx, struct cellular
 	if (!ctx->nas_pref_configured) {
 		uint8_t req[64], rsp[128];
 		size_t req_len = 0, rsp_len = 0;
+		uint16_t mpref = ctx->rat_mode_pref ? ctx->rat_mode_pref : 0x001cu;
+		uint8_t change_dur = 0x00u;	/* QMI_NAS_CHANGE_DURATION_POWER_CYCLE */
 		uint8_t mode_pref[2];
 		uint8_t roam_pref[2];
 		uint8_t srv_dom[4];
 		uint8_t usage_pref[4];
 		uint8_t voice_dom[4];
 
-		wr_le16(mode_pref, 0x001cu);	/* GSM (0x04) | WCDMA (0x08) | LTE (0x10) */
+		wr_le16(mode_pref, mpref);	/* default: GSM(0x04)|WCDMA(0x08)|LTE(0x10) */
 		wr_le16(roam_pref, 0x00ffu);	/* ANY */
 		wr_le32(srv_dom, 2u);		/* QMI_NAS_SERVICE_DOMAIN_PREFERENCE_CS_PS */
 		wr_le32(usage_pref, 1u);	/* QMI_NAS_USAGE_PREFERENCE_VOICE_CENTRIC */
-		wr_le32(voice_dom, 3u);		/* QMI_NAS_VOICE_DOMAIN_PREFERENCE_PS_PREFERRED (IMS->CSFB) */
+		wr_le32(voice_dom, 2u);		/* QMI_NAS_VOICE_DOMAIN_PREFERENCE_CS_PREFERRED */
 
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x11, mode_pref, 2);
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x14, roam_pref, 2);
+		qmi_tlv_put(req, sizeof(req), &req_len, 0x17, &change_dur, 1);
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x18, srv_dom, 4);
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x21, usage_pref, 4);
 		qmi_tlv_put(req, sizeof(req), &req_len, 0x23, voice_dom, 4);
@@ -1235,10 +1249,12 @@ static void configure_nas_selection_and_reg(struct qmi_ctx *ctx, struct cellular
 			req_len = 0;
 			qmi_tlv_put(req, sizeof(req), &req_len, 0x11, mode_pref, 2);
 			qmi_tlv_put(req, sizeof(req), &req_len, 0x14, roam_pref, 2);
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x17, &change_dur, 1);
 			qmi_tlv_put(req, sizeof(req), &req_len, 0x18, srv_dom, 4);
 			(void)qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_SET_SYSTEM_SELECTION_PREFERENCE,
 					  req, req_len, rsp, sizeof(rsp), &rsp_len, 2000);
 			req_len = 0;
+			qmi_tlv_put(req, sizeof(req), &req_len, 0x17, &change_dur, 1);
 			qmi_tlv_put(req, sizeof(req), &req_len, 0x21, usage_pref, 4);
 			qmi_tlv_put(req, sizeof(req), &req_len, 0x23, voice_dom, 4);
 			(void)qmi_request(ctx, QMI_SVC_NAS, QMI_NAS_SET_SYSTEM_SELECTION_PREFERENCE,
@@ -2203,6 +2219,8 @@ int cellular_state_format_json(const struct cellular_state *st, char *buf, size_
 		"  \"rsrq_db\": %s,\n"
 		"  \"bars_0_to_4\": %d,\n"
 		"  \"voice_svc_ready\": %s,\n"
+		"  \"lte_voice_support\": %s,\n"
+		"  \"ims_voice_support\": %s,\n"
 		"  \"active_calls\": %u,\n"
 		"  \"last_call_state\": \"%s\",\n"
 		"  \"last_call_end_reason\": %u,\n"
@@ -2247,6 +2265,8 @@ int cellular_state_format_json(const struct cellular_state *st, char *buf, size_
 		rsrq_s,
 		st->bars_0_to_4,
 		st->voice_svc_ready ? "true" : "false",
+		st->lte_voice_support ? "true" : "false",
+		st->ims_voice_support ? "true" : "false",
 		st->active_calls,
 		st->last_call_state[0] ? st->last_call_state : "idle",
 		st->last_call_end_reason,

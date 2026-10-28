@@ -25,7 +25,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
-#include <sys/un.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "adspd.h"
@@ -277,19 +277,45 @@ escape_jetsam_and_bg(void)
 static bool
 qrtr_sock_is_live(void)
 {
-	struct sockaddr_un sun;
-	int s, rc;
+	struct timeval bt = { 0 };
+	size_t blen = sizeof(bt);
+	char want[32], stamp[32] = "";
+	char buf[4096];
+	FILE *f;
 
-	s = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (s < 0) {
+	if (access("/var/local/wland.off", F_OK) == 0) {
+		return true;
+	}
+	/*
+	 * Check /var/local/wland.boot + /var/local/wland.log instead of opening
+	 * and immediately closing /var/run/sweet-qrtr.sock (which would allocate
+	 * qrtr-mux port 0x40 and emit a spurious QRTR_TYPE_DEL_CLIENT to MPSS).
+	 */
+	if (sysctlbyname("kern.boottime", &bt, &blen, NULL, 0) != 0) {
+		return access(QRTR_MUX_SOCK_PATH, F_OK) == 0;
+	}
+	snprintf(want, sizeof(want), "%ld\n", (long)bt.tv_sec);
+	f = fopen("/var/local/wland.boot", "r");
+	if (f == NULL) {
 		return false;
 	}
-	memset(&sun, 0, sizeof(sun));
-	sun.sun_family = AF_UNIX;
-	strncpy(sun.sun_path, QRTR_MUX_SOCK_PATH, sizeof(sun.sun_path) - 1);
-	rc = connect(s, (struct sockaddr *)&sun, sizeof(sun));
-	close(s);
-	return rc == 0;
+	if (fgets(stamp, sizeof(stamp), f) == NULL) {
+		stamp[0] = '\0';
+	}
+	fclose(f);
+	if (strcmp(stamp, want) != 0) {
+		return false;
+	}
+	f = fopen("/var/local/wland.log", "rb");
+	if (f == NULL) {
+		return false;
+	}
+	size_t nr = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[nr] = '\0';
+	return strstr(buf, "qrtr-mux: listening on") != NULL ||
+	    strstr(buf, "glink: IPCRTR open") != NULL ||
+	    strstr(buf, "GLINK/QRTR link_up failed") != NULL;
 }
 
 static bool
