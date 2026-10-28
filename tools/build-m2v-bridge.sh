@@ -34,9 +34,23 @@ panic = "unwind"
 debug = 1
 EOF
 if [ "$target" = ios ]; then triple=aarch64-apple-ios; else triple=aarch64-apple-darwin; fi
+# CI touches work/metal2vulkan back to 2025-01-01 while restoring a newer work/m2v-bridge/target cache via restore-keys;
+# invalidate cached metal2vulkan artifacts whenever the applied patch set changes while keeping 3rd-party crates cached.
+PATCH_HASH=$(cat "$ROOT"/phone/metal2/bridge/patches/*.patch 2>/dev/null | shasum -a 256 | awk '{print $1}')
+if [ -d "$OUT/target" ] && [ "$(cat "$OUT/target/.patches.sha256" 2>/dev/null || true)" != "$PATCH_HASH" ]; then
+	cargo +1.98.0 clean --manifest-path "$OUT/Cargo.toml" --target-dir "$OUT/target" --target "$triple" --release \
+		-p metal2vulkan -p metal2vulkan-runtime -p native-metal-bridge 2>/dev/null || true
+	rm -rf "$OUT/target/$triple/release/deps/libmetal2vulkan"* \
+		"$OUT/target/$triple/release/deps/metal2vulkan"* \
+		"$OUT/target/$triple/release/.fingerprint/metal2vulkan"* \
+		"$OUT/target/release/.fingerprint/metal2vulkan"* \
+		"$OUT/target/$triple/release/deps/libnative_metal_bridge"* \
+		"$OUT/target/$triple/release/.fingerprint/native-metal-bridge"*
+fi
 NMB_FIXTURE_AIR=$OUT/runtime_examples.air NMB_FC_AIR=$OUT/function_constant.air IPHONEOS_DEPLOYMENT_TARGET=16.0 \
 	MACOSX_DEPLOYMENT_TARGET=14.0 cargo +1.98.0 build --release --manifest-path "$OUT/Cargo.toml" --target $triple \
 	--target-dir "$OUT/target" > "$OUT/build-$target.log" 2>&1 || { grep -E "^(error|warning: unused)" -A6 "$OUT/build-$target.log" | head -60; exit 1; }
+printf '%s\n' "$PATCH_HASH" > "$OUT/target/.patches.sha256"
 mkdir -p "$OUT/$target"
 cp "$OUT/target/$triple/release/libnative_metal_bridge.a" "$OUT/$target/"
 ls -la "$OUT/$target/libnative_metal_bridge.a"
