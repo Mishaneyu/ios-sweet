@@ -1134,10 +1134,10 @@ adsp_pas_boot(void)
 #define GCC_AUDIO_TBU_GDSC_PA 0x0017d040ULL /* hlos1_vote_aggre_noc_mmu_audio_tbu_gdsc */
 #define SMMU_CB_CBAR          0x0001f300u   /* S2_BYPASS | MEMATTR=WBWA | BPSHCFG=NSH (arm_smmu.c) */
 #define SMMU_CB_CBA2R         0x00000001u   /* VA64 (AArch64 VMSAv8-64) */
-/* RES1[23:22] | ASIDPNE[12] | HUPCF[8] | CFRE[5] | AFE[2] | TRE[1] | M[0]; CFCFG=0, CFIE=0 */
-#define SMMU_CB_SCTLR_S1      0x00c01127u
-/* T0SZ=28 (36-bit IA: 3-level L1->L2->L3 walk per qcom,use-3-lvl-tables), NC walks, OSH, 4KB, EPD1=1 */
-#define SMMU_CB_TCR_S1        (28u | (2u << 12) | (1u << 23))
+/* RES1[23:22] | HUPCF[8] | CFRE[5] | AFE[2] | TRE[1] | M[0]; CFCFG=0, CFIE=0 (arm_smmu.c) */
+#define SMMU_CB_SCTLR_S1      0x00c00127u
+/* T0SZ=25 (39-bit IA: 3-level L1->L2->L3 walk per qcom,use-3-lvl-tables), NC/NSH walks, 4KB, EPD1=1 */
+#define SMMU_CB_TCR_S1        (25u | (1u << 23))
 /* MAIR0: Attr0=0x44 (Normal Outer/Inner Non-Cacheable), Attr1=0xff (Normal WBWA) */
 #define SMMU_CB_MAIR0_S1      0x0000ff44u
 
@@ -1154,10 +1154,15 @@ void
 adsp_smmu_check_fault(const char *tag)
 {
 	uint64_t s = APPS_SMMU_PA, cbp;
-	uint32_t id1, psize, npage, fsr, fsynr0, far_lo, far_hi;
+	uint32_t id1, psize, npage, sgfsr, fsr, fsynr0, far_lo, far_hi;
 
 	if (!g_status.smmu_configured || g_status.smmu_cb < 0) {
 		return;
+	}
+	sgfsr = rd32(s + 0x48);
+	if (sgfsr != 0) {
+		adsp_log("smmu: %s GLOBAL FAULT sGFSR=0x%08x sGFSYNR0=0x%08x sGFSYNR1=0x%08x",
+		    tag ? tag : "check", sgfsr, rd32(s + 0x50), rd32(s + 0x54));
 	}
 	id1 = rd32(s + 0x24);
 	psize = (id1 >> 31) ? 0x10000u : 0x1000u;
@@ -1208,17 +1213,17 @@ adsp_smmu_setup(void)
 
 	/*
 	 * Build 3-level VMSAv8-64 Stage-1 4 KiB page tables matching RMX1931 live.dtb
-	 * (apps-smmu@0x15000000: qcom,qsmmu-v500 + qcom,use-3-lvl-tables) and stock
-	 * msm_audio_ion (va_start = ADSP_DMA_IOVA = 0x10000000, sid_bits = 1ULL << 32):
-	 *   - L1 (0xC0008000): entries (c << 2) | 0 for c=0..15 -> L2 table (0xC0009000)
+	 * (apps-smmu@0x15000000: qcom,qsmmu-v500 + qcom,use-3-lvl-tables -> 39-bit IA,
+	 * T0SZ=25) and stock msm_audio_ion (va_start = 0x10000000, sid_bits = 1ULL << 32):
+	 *   - L1 (0xC3808000): entries (c << 2) | 0 for c=0..127 -> L2 table (0xC3809000)
 	 *     so both 32-bit IOVA 0x10000000 and 36-bit IOVA 0x1_10000000 resolve identically.
-	 *   - L2 (0xC0009000): index (0x10000000 >> 21) & 0x1ff == 128 -> L3 table (0xC000A000).
-	 *   - L3 (0xC000A000): 512 x 4 KiB Page Descriptors (0x10000000..0x101FFFFF) ->
-	 *     physical HLOS DRAM 0xC0000000..0xC01FFFFF (nG=1, AF=1, OSH, AP=RW, Attr0=NC).
+	 *   - L2 (0xC3809000): index (0x10000000 >> 21) & 0x1ff == 128 -> L3 table (0xC380A000).
+	 *   - L3 (0xC380A000): 512 x 4 KiB Page Descriptors (0x10000000..0x101FFFFF) ->
+	 *     physical HLOS DRAM 0xC3800000..0xC39FFFFF (nG=1, AF=1, OSH, AP=RW, Attr0=NC).
 	 */
 	memset(l1, 0, sizeof(l1));
 	memset(l2, 0, sizeof(l2));
-	for (unsigned c = 0; c < 16u; c++) {
+	for (unsigned c = 0; c < 128u; c++) {
 		l1[(c << 2) | ((ADSP_DMA_IOVA >> 30) & 3u)] = ADSP_SMMU_L2_PA | 3ULL;
 	}
 	l2[(ADSP_DMA_IOVA >> 21) & 0x1ffu] = ADSP_SMMU_L3_PA | 3ULL;
@@ -1231,6 +1236,8 @@ adsp_smmu_setup(void)
 	(void)pm_wr(ADSP_SMMU_PT_PA, l1, sizeof(l1));
 	__asm__ volatile("dsb sy" ::: "memory");
 
+	adsp_log("smmu: pre sCR0=0x%08x sGFSR=0x%08x ID0=0x%08x ID1=0x%08x ID2=0x%08x",
+	    rd32(s), rd32(s + 0x48), id0, id1, id2);
 	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
 		uint32_t smr = rd32(s + 0x800 + 4 * i);
 		uint32_t s2cr = rd32(s + 0xc00 + 4 * i);
@@ -1241,16 +1248,26 @@ adsp_smmu_setup(void)
 			}
 			continue;
 		}
+		adsp_log("smmu: pre SMR%u=0x%08x S2CR%u=0x%08x", i, smr, i, s2cr);
 		if (((s2cr >> 16) & 3u) == 0) {
 			uint32_t c = s2cr & 0xffu;
 			used_cb[c / 64] |= 1ULL << (c % 64);
 		}
-		if (smmu_sid_matches(smr, ADSP_AUDIO_SMMU_SID, ADSP_AUDIO_SMMU_MASK) &&
-		    ((s2cr >> 16) & 3u) == 0) {
-			existing_smr = (int)i;
-			free_smr = (int)i;
-			free_cb = (int)(s2cr & 0xffu);
-			break;
+		if (smmu_sid_matches(smr, ADSP_AUDIO_SMMU_SID, ADSP_AUDIO_SMMU_MASK)) {
+			if (((s2cr >> 16) & 3u) == 0) {
+				existing_smr = (int)i;
+				free_smr = (int)i;
+				free_cb = (int)(s2cr & 0xffu);
+			} else if (((smr >> 16) & 0x7fffu) == 0) {
+				existing_smr = (int)i;
+				free_smr = (int)i;
+			} else {
+				adsp_log("smmu: SMR%u=0x%08x S2CR%u=0x%08x wide-matches 0x%x; skipping duplicate SMR",
+				    i, smr, i, s2cr, ADSP_AUDIO_SMMU_SID);
+				g_status.smmu_configured = true;
+				g_status.smmu_cb = -1;
+				return 0;
+			}
 		}
 	}
 
@@ -1293,11 +1310,14 @@ adsp_smmu_setup(void)
 		usleep(100);
 	}
 	wr32(cbp, SMMU_CB_SCTLR_S1);
-	if (existing_smr < 0) {
-		wr32(s + 0xc00 + 4 * (uint64_t)free_smr, (uint32_t)free_cb);
-		wr32(s + 0x800 + 4 * (uint64_t)free_smr,
-		    (1u << 31) | (ADSP_AUDIO_SMMU_MASK << 16) | ADSP_AUDIO_SMMU_SID);
+	wr32(s + 0x68, 0); /* sTLBIALLNSNH */
+	wr32(s + 0x70, 0); /* sTLBGSYNC */
+	for (int i = 0; i < 50 && (rd32(s + 0x74) & 1u); i++) {
+		usleep(100);
 	}
+	wr32(s + 0xc00 + 4 * (uint64_t)free_smr, (uint32_t)free_cb);
+	wr32(s + 0x800 + 4 * (uint64_t)free_smr,
+	    (1u << 31) | (ADSP_AUDIO_SMMU_MASK << 16) | ADSP_AUDIO_SMMU_SID);
 	wr32(s + 0x70, 0); /* sTLBGSYNC */
 	for (int i = 0; i < 50 && (rd32(s + 0x74) & 1u); i++) {
 		usleep(1000);
@@ -1305,10 +1325,11 @@ adsp_smmu_setup(void)
 
 	g_status.smmu_configured = true;
 	g_status.smmu_cb = free_cb;
-	adsp_log("smmu: mapped SID 0x%x (mask 0x%x) -> SMR%d / CB%d (IOVA 0x%x -> PA 0x%llx SCTLR=0x%08x TCR=0x%08x TCR2=0x%08x GDSC=0x%08x)",
-	    ADSP_AUDIO_SMMU_SID, ADSP_AUDIO_SMMU_MASK, free_smr, free_cb,
-	    ADSP_DMA_IOVA, (unsigned long long)ADSP_DMA_PA, rd32(cbp), rd32(cbp + 0x30),
-	    rd32(cbp + 0x10), rd32(GCC_AUDIO_TBU_GDSC_PA));
+	adsp_log("smmu: mapped SID 0x%x (mask 0x%x) -> SMR%d / CB%d (existing=%d IOVA 0x%x -> PA 0x%llx SMR=0x%08x S2CR=0x%08x SCTLR=0x%08x TCR=0x%08x TCR2=0x%08x GDSC=0x%08x)",
+	    ADSP_AUDIO_SMMU_SID, ADSP_AUDIO_SMMU_MASK, free_smr, free_cb, existing_smr,
+	    ADSP_DMA_IOVA, (unsigned long long)ADSP_DMA_PA,
+	    rd32(s + 0x800 + 4 * (uint64_t)free_smr), rd32(s + 0xc00 + 4 * (uint64_t)free_smr),
+	    rd32(cbp), rd32(cbp + 0x30), rd32(cbp + 0x10), rd32(GCC_AUDIO_TBU_GDSC_PA));
 	return 0;
 }
 

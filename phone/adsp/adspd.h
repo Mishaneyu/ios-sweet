@@ -28,13 +28,14 @@
 #define ADSP_CARVEOUT_SIZE          0x01e00000ULL /* 30 MiB */
 
 /*
- * Uncached <4 GiB HLOS DRAM audio DMA pool in 0xC0000000..0xC0800000 (inside
- * the 64 MiB 0xC0000000..0xC4000000 window left untouched by XNU >=0x100000000,
- * sweet_gpu.c 0xC4000000..0xE0000000 / 0xE1000000..0x100000000, and wland
- * 0xE0000000..0xE1000000). LPASS Q6 uses 32-bit IOVA + (cb_idx << 32) where
- * SID 0x1b21 maps via (1ULL << 32) through our apps_smmu Stage-1 L1 page table.
+ * Uncached <4 GiB HLOS DRAM audio DMA pool at 0xC3800000 (56 MiB inside the
+ * 64 MiB 0xC0000000..0xC4000000 window, well above ABL's ~28 MiB unpacked boot
+ * ramdisk at 0xC0000000 so no stale CPU cache lines exist, and below sweet_gpu.c
+ * 0xC4000000..0xE0000000 and wland 0xE0000000..0xE1000000). LPASS Q6 uses
+ * msm_audio_ion IOVA 0x10000000 + (cb_idx << 32) where SID 0x1b21 maps via
+ * (1ULL << 32) through our apps_smmu 3-level Stage-1 page tables.
  */
-#define ADSP_DMA_PA                 0xC0000000ULL
+#define ADSP_DMA_PA                 0xC3800000ULL
 #define ADSP_DMA_IOVA               0x10000000u   /* msm_audio_ion va_start (bit 31=0) */
 #define ADSP_DMA_PERIODS            8u
 #define ADSP_DMA_PERIOD_ALLOC       4096u
@@ -44,9 +45,9 @@
 #define ADSP_DSP_IOVA_HIGH          0x00000001u
 
 /* 3-level VMSAv8-64 Stage-1 page tables (qcom,use-3-lvl-tables) for apps_smmu */
-#define ADSP_SMMU_PT_PA             0xC0008000ULL /* L1 table */
-#define ADSP_SMMU_L2_PA             0xC0009000ULL /* L2 table (0x10000000..0x101FFFFF) */
-#define ADSP_SMMU_L3_PA             0xC000A000ULL /* L3 4 KiB pages -> 0xC0000000 */
+#define ADSP_SMMU_PT_PA             0xC3808000ULL /* L1 table */
+#define ADSP_SMMU_L2_PA             0xC3809000ULL /* L2 table (0x10000000..0x101FFFFF) */
+#define ADSP_SMMU_L3_PA             0xC380A000ULL /* L3 4 KiB pages -> 0xC3800000 */
 #define ADSP_SMMU_PT_SIZE           0x00001000ULL
 
 /*
@@ -82,10 +83,10 @@
 #define SMP2P_ADSP_OUT_ITEM         429u /* master-kernel */
 #define SMP2P_ADSP_IN_ITEM          443u /* slave-kernel */
 
-/* apps_smmu@15000000 stream ID for msm_audio_ion */
+/* apps_smmu@15000000 stream ID for msm_audio_ion (live.dtb: iommus = <0x26 0x1b21 0x00>) */
 #define APPS_SMMU_PA                0x15000000ULL
 #define ADSP_AUDIO_SMMU_SID         0x1b21u
-#define ADSP_AUDIO_SMMU_MASK        0x000fu
+#define ADSP_AUDIO_SMMU_MASK        0x0000u
 
 /* SM8150 TLMM tiles (pinctrl-sm8150.c verified) */
 #define TLMM_WEST_PA                0x03100000ULL

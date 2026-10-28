@@ -274,6 +274,7 @@ adsp_apr_rx(const uint8_t *data, uint32_t len)
 
 	/* Async DMA write completion from Q6ASM */
 	if (h.opcode == ASM_DATA_EVENT_WRITE_DONE_V2) {
+		static uint32_t wr_ok_logs;
 		uint32_t idx = h.token & ~WRITE_TOKEN_FLAG;
 		if (idx < ADSP_DMA_PERIODS) {
 			period_ready[idx] = 1;
@@ -286,7 +287,15 @@ adsp_apr_rx(const uint8_t *data, uint32_t len)
 				if (wr_err_logs++ < 8u) {
 					adsp_log("q6asm: WRITE_DONE idx=%u status=0x%x", idx, wr_status);
 				}
+			} else if (wr_ok_logs == 0) {
+				wr_ok_logs = 1;
+				adsp_smmu_check_fault("first-write-done");
+				adsp_log("q6asm: first WRITE_DONE_V2 idx=%u ok", idx);
 			}
+		} else if (wr_ok_logs == 0) {
+			wr_ok_logs = 1;
+			adsp_smmu_check_fault("first-write-done");
+			adsp_log("q6asm: first WRITE_DONE_V2 idx=%u ok", idx);
 		}
 		return;
 	}
