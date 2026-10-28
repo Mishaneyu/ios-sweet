@@ -1156,9 +1156,15 @@ adsp_smmu_setup(void)
 	uint64_t used_cb[4] = { 0 };
 	int free_smr = -1, free_cb = -1;
 
-	/* Zero our 32 KiB <4 GiB audio DMA pool first */
+	/* Zero our <4 GiB audio DMA pool and FastRPC invoke pages first */
 	for (uint64_t o = 0; o < ADSP_DMA_TOTAL_BYTES; o += sizeof(z)) {
 		(void)pm_wr(ADSP_DMA_PA + o, z, sizeof(z));
+	}
+	for (uint64_t o = 0; o < ADSP_FASTRPC_MSG_SIZE; o += sizeof(z)) {
+		(void)pm_wr(ADSP_FASTRPC_MSG_PA + o, z, sizeof(z));
+	}
+	for (uint64_t o = 0; o < ADSP_FASTRPC_LST_SIZE; o += sizeof(z)) {
+		(void)pm_wr(ADSP_FASTRPC_LST_PA + o, z, sizeof(z));
 	}
 
 	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
@@ -1224,6 +1230,101 @@ adsp_smmu_setup(void)
 	    ADSP_AUDIO_SMMU_SID, ADSP_AUDIO_SMMU_MASK, free_smr, free_cb,
 	    (unsigned long long)ADSP_DMA_PA);
 	return 0;
+}
+
+int
+adsp_hyp_assign_fastrpc_heap(void)
+{
+	static const uint8_t z[65536];
+	static const uint32_t src_vms[1] = { 3u };               /* VMID_HLOS */
+	static const uint32_t dst_vms[4] = { 3u, 15u, 5u, 6u };  /* HLOS, MSS_MSA, SSC_Q6, ADSP_Q6 */
+	struct {
+		uint32_t vm;
+		uint32_t perm;
+		uint64_t ctx;
+		uint32_t ctx_size;
+		uint32_t pad;
+	} dst_desc[4];
+	struct timeval bt = { 0 };
+	size_t btsz = sizeof(bt);
+	char cur_stamp[64] = "", prev_stamp[64] = "";
+	FILE *sf;
+	uint64_t t, mem[2], ext[4], x[8];
+
+	if (pm_open_dev() != 0) {
+		return -1;
+	}
+	(void)sysctlbyname("kern.boottime", &bt, &btsz, NULL, 0);
+	snprintf(cur_stamp, sizeof(cur_stamp), "%lld %llx %llx\n",
+	    (long long)bt.tv_sec,
+	    (unsigned long long)ADSP_FASTRPC_HEAP_PA,
+	    (unsigned long long)ADSP_FASTRPC_HEAP_HYP_SIZE);
+
+	sf = fopen("/var/local/adspd.rh", "r");
+	if (sf != NULL) {
+		if (fgets(prev_stamp, sizeof(prev_stamp), sf) == NULL) {
+			prev_stamp[0] = '\0';
+		}
+		fclose(sf);
+	}
+	if (bt.tv_sec != 0 && strcmp(cur_stamp, prev_stamp) == 0) {
+		adsp_log("fastrpc: remote heap 0x%llx+0x%llx already hyp_assigned this boot",
+		    (unsigned long long)ADSP_FASTRPC_HEAP_PA,
+		    (unsigned long long)ADSP_FASTRPC_HEAP_HYP_SIZE);
+		return 0;
+	}
+
+	/* Zero the 2 MiB audiopd remote heap before sharing with ADSP_Q6 */
+	for (uint64_t o = 0; o < ADSP_FASTRPC_HEAP_SIZE; o += sizeof(z)) {
+		(void)pm_wr(ADSP_FASTRPC_HEAP_PA + o, z, sizeof(z));
+	}
+
+	t = pm_alloc(4096, 4096);
+	if (t == 0) {
+		adsp_log("fastrpc: pm_alloc(4096) for MP_ASSIGN failed");
+		return -1;
+	}
+	mem[0] = ADSP_FASTRPC_HEAP_PA;
+	mem[1] = ADSP_FASTRPC_HEAP_HYP_SIZE;
+	memset(dst_desc, 0, sizeof(dst_desc));
+	for (int i = 0; i < 4; i++) {
+		dst_desc[i].vm = dst_vms[i];
+		dst_desc[i].perm = 7u; /* PERM_READ | PERM_WRITE | PERM_EXEC (adsprpc.c:4268) */
+	}
+	ext[0] = sizeof(src_vms);
+	ext[1] = t + 128ULL;
+	ext[2] = sizeof(dst_desc);
+	ext[3] = 0;
+
+	(void)pm_wr(t, mem, sizeof(mem));
+	(void)pm_wr(t + 64ULL, src_vms, sizeof(src_vms));
+	(void)pm_wr(t + 128ULL, dst_desc, sizeof(dst_desc));
+	(void)pm_wr(t + 512ULL, ext, sizeof(ext));
+
+	/* MP_ASSIGN (0x0c/0x16): SCM_ARGS(7, RO, VAL, RO, VAL, RO, VAL, VAL) */
+	memset(x, 0, sizeof(x));
+	x[0] = 0x42000000ULL | (0x0cULL << 8) | 0x16ULL;
+	x[1] = 7ULL | (1ULL << 4) | (1ULL << 8) | (1ULL << 12);
+	x[2] = t;
+	x[3] = sizeof(mem);
+	x[4] = t + 64ULL;
+	x[5] = t + 512ULL;
+	pm_smc(x);
+	(void)pm_free(t);
+
+	adsp_log("fastrpc: hyp_assign 0x%llx+0x%llx -> {3,15,5,6} RWX rc=%lld",
+	    (unsigned long long)ADSP_FASTRPC_HEAP_PA,
+	    (unsigned long long)ADSP_FASTRPC_HEAP_HYP_SIZE,
+	    (long long)x[0]);
+	if (x[0] == 0) {
+		sf = fopen("/var/local/adspd.rh", "w");
+		if (sf != NULL) {
+			fputs(cur_stamp, sf);
+			fclose(sf);
+		}
+		return 0;
+	}
+	return -1;
 }
 
 /* ---- SM8150 TLMM GPIO & Open-Drain Bit-Banged I2C (GPIO51 SDA / GPIO52 SCL) ---- */

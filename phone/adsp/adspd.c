@@ -115,6 +115,8 @@ adsp_status_write(void)
 	    "  \"proxy_votes_released\": %s,\n"
 	    "  \"glink_ipcrtr_up\": %s,\n"
 	    "  \"glink_apr_up\": %s,\n"
+	    "  \"glink_fastrpc_up\": %s,\n"
+	    "  \"audiopd_spawned\": %s,\n"
 	    "  \"q6_core_ready\": %s,\n"
 	    "  \"smmu_configured\": %s,\n"
 	    "  \"smmu_cb\": %d,\n"
@@ -138,6 +140,7 @@ adsp_status_write(void)
 	    "  \"underruns\": %llu,\n"
 	    "  \"pd_queries\": %u,\n"
 	    "  \"tftp_reads\": %u,\n"
+	    "  \"fastrpc_rev_calls\": %u,\n"
 	    "  \"shm_write_frames\": %u,\n"
 	    "  \"shm_read_frames\": %u,\n"
 	    "  \"shm_volume_q16\": %u,\n"
@@ -153,6 +156,8 @@ adsp_status_write(void)
 	    g_status.proxy_votes_released ? "true" : "false",
 	    g_status.glink_ipcrtr_up ? "true" : "false",
 	    g_status.glink_apr_up ? "true" : "false",
+	    g_status.glink_fastrpc_up ? "true" : "false",
+	    g_status.audiopd_spawned ? "true" : "false",
 	    g_status.q6_core_ready ? "true" : "false",
 	    g_status.smmu_configured ? "true" : "false",
 	    g_status.smmu_cb,
@@ -176,6 +181,7 @@ adsp_status_write(void)
 	    (unsigned long long)g_status.underruns,
 	    g_status.pd_queries,
 	    g_status.tftp_reads,
+	    g_status.fastrpc_rev_calls,
 	    shm_w, shm_r, shm_vol, shm_spk, shm_voice,
 	    err_esc);
 	if (n <= 0) {

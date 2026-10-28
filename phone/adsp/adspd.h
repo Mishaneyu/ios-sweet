@@ -40,6 +40,24 @@
 #define ADSP_PCM_PERIOD_BYTES       (ADSP_PCM_PERIOD_FRAMES * HAKIOS_AUDIO_FRAME) /* 3840 B */
 #define ADSP_DSP_IOVA_HIGH          0x00000001u
 
+/*
+ * FastRPC static PD ("audiopd") & reverse-RPC buffers in <4 GiB unmanaged DRAM:
+ *   - 0xE1010000..0xE1014000 (16 KiB): sync CREATE_STATIC / listener_init2 page
+ *   - 0xE1014000..0xE1024000 (64 KiB): async adsp_listener_next2 reverse-RPC page
+ *   - 0xE1400000..0xE1800000 (4 MiB, 4 MiB-aligned per live.dtb adsp_region):
+ *     remote heap hyp_assigned to {HLOS, MSS_MSA, SSC_Q6, ADSP_Q6} RWX (2 MiB passed
+ *     to FASTRPC_INIT_CREATE_STATIC as pure 32-bit PA).
+ *   adsprpc-smd (SID 0x1b23) maps invoke pages via cb=3 -> (3ULL << 32).
+ */
+#define ADSP_FASTRPC_CB_HIGH        0x00000003u
+#define ADSP_FASTRPC_MSG_PA         0xE1010000ULL
+#define ADSP_FASTRPC_MSG_SIZE       0x00004000ULL
+#define ADSP_FASTRPC_LST_PA         0xE1014000ULL
+#define ADSP_FASTRPC_LST_SIZE       0x00010000ULL
+#define ADSP_FASTRPC_HEAP_PA        0xE1400000ULL
+#define ADSP_FASTRPC_HEAP_HYP_SIZE  0x00400000ULL
+#define ADSP_FASTRPC_HEAP_SIZE      0x00200000ULL
+
 /* SMEM & APCS IPC doorbells (live.dtb verified: qcom,smem@86000000) */
 #define SMEM_BASE_PA                0x86000000ULL
 #define SMEM_SIZE_BYTES             0x00200000ULL
@@ -90,6 +108,8 @@ struct adsp_status {
 	bool     proxy_votes_released;
 	bool     glink_ipcrtr_up;
 	bool     glink_apr_up;
+	bool     glink_fastrpc_up;
+	bool     audiopd_spawned;
 	bool     q6_core_ready;
 	bool     smmu_configured;
 	int      smmu_cb;
@@ -113,6 +133,7 @@ struct adsp_status {
 	uint64_t underruns;
 	uint32_t pd_queries;
 	uint32_t tftp_reads;
+	uint32_t fastrpc_rev_calls;
 	char     state[32];
 	char     last_error[96];
 };
@@ -145,6 +166,7 @@ void     smp2p_adsp_service(void);
 int      adsp_pas_boot(void);
 int      adsp_pas_shutdown(void);
 int      adsp_smmu_setup(void);
+int      adsp_hyp_assign_fastrpc_heap(void);
 
 void     tlmm_setup_quat_mi2s(void);
 void     tlmm_gpio_drive(uint64_t tile_pa, unsigned pin, int high);
@@ -158,10 +180,11 @@ int      max98927_init_stereo(void);
 int      max98927_set_enable(bool enable);
 int      max98927_set_voice_mode(bool voice_call, bool speakerphone);
 
-/* ---- Multi-channel GLINK + QRTR pd-mapper/tftp (adsp_glink.c) ---- */
+/* ---- Multi-channel GLINK + QRTR pd-mapper/tftp + FastRPC audiopd (adsp_glink.c) ---- */
 int      adsp_glink_prepare(void);
 int      adsp_glink_bringup(unsigned timeout_ms);
 int      adsp_glink_poll(unsigned wait_ms);
+int      adsp_fastrpc_spawn_audiopd(void);
 int      adsp_apr_send(const void *pkt, uint32_t len);
 bool     adsp_apr_is_open(void);
 

@@ -42,7 +42,8 @@
 
 #define CH_IDX_IPCRTR               0
 #define CH_IDX_APR                  1
-#define ACTIVE_CH_COUNT             2
+#define CH_IDX_FASTRPC              2
+#define ACTIVE_CH_COUNT             3
 
 #define N_LOCAL_INTENTS             12
 #define LOCAL_INTENT_SIZE           4096u
@@ -75,8 +76,9 @@ static bool version_acked;
 static uint64_t last_rx_tx_ms;
 
 static struct glink_chan chans[ACTIVE_CH_COUNT] = {
-	[CH_IDX_IPCRTR] = { .name = "IPCRTR",        .lcid = 1, .next_iid = 100 },
-	[CH_IDX_APR]    = { .name = "apr_audio_svc", .lcid = 2, .next_iid = 100 },
+	[CH_IDX_IPCRTR]  = { .name = "IPCRTR",                .lcid = 1, .next_iid = 100 },
+	[CH_IDX_APR]     = { .name = "apr_audio_svc",         .lcid = 2, .next_iid = 100 },
+	[CH_IDX_FASTRPC] = { .name = "fastrpcglink-apps-dsp", .lcid = 3, .next_iid = 100 },
 };
 
 #define DESC_TX_TAIL (desc_pa + 0ULL)
@@ -84,9 +86,10 @@ static struct glink_chan chans[ACTIVE_CH_COUNT] = {
 #define DESC_RX_TAIL (desc_pa + 8ULL)
 #define DESC_RX_HEAD (desc_pa + 12ULL)
 
-/* Forward declarations for embedded QRTR services */
+/* Forward declarations for embedded QRTR & FastRPC services */
 static void qrtr_on_packet(const uint8_t *pkt, uint32_t len);
 static void pdmapper_load_jsn_db(void);
+static void fastrpc_on_packet(const uint8_t *pkt, uint32_t len);
 
 int
 adsp_glink_prepare(void)
@@ -382,6 +385,9 @@ glink_rx_one(void)
 				if (i == CH_IDX_APR && chans[i].open_acked) {
 					g_status.glink_apr_up = true;
 				}
+				if (i == CH_IDX_FASTRPC && chans[i].open_acked) {
+					g_status.glink_fastrpc_up = true;
+				}
 			}
 		}
 		break;
@@ -399,6 +405,9 @@ glink_rx_one(void)
 			if (ch == &chans[CH_IDX_APR] && ch->opened_by_remote) {
 				g_status.glink_apr_up = true;
 			}
+			if (ch == &chans[CH_IDX_FASTRPC] && ch->opened_by_remote) {
+				g_status.glink_fastrpc_up = true;
+			}
 		}
 		break;
 	}
@@ -412,6 +421,9 @@ glink_rx_one(void)
 			ch->nrintent = 0;
 			if (ch == &chans[CH_IDX_APR]) {
 				g_status.glink_apr_up = false;
+			}
+			if (ch == &chans[CH_IDX_FASTRPC]) {
+				g_status.glink_fastrpc_up = false;
 			}
 		}
 		break;
@@ -525,6 +537,8 @@ glink_rx_one(void)
 				qrtr_on_packet(ptr, msg_len);
 			} else if (ch == &chans[CH_IDX_APR]) {
 				adsp_apr_rx(ptr, msg_len);
+			} else if (ch == &chans[CH_IDX_FASTRPC]) {
+				fastrpc_on_packet(ptr, msg_len);
 			}
 			return 1;
 		}
@@ -659,6 +673,7 @@ adsp_glink_bringup(unsigned timeout_ms)
 	uint64_t start, end;
 	bool opened_ipcrtr_proactive = false;
 	bool opened_apr_proactive = false;
+	bool opened_fastrpc_proactive = false;
 	bool rekick_500 = false, rekick_2000 = false;
 
 	if (glink_ring_init() != 0) {
@@ -689,21 +704,28 @@ adsp_glink_bringup(unsigned timeout_ms)
 			opened_ipcrtr_proactive = true;
 			chan_send_open(&chans[CH_IDX_IPCRTR]);
 		}
+		if (version_acked && !opened_fastrpc_proactive && elapsed > 250ULL) {
+			opened_fastrpc_proactive = true;
+			chan_send_open(&chans[CH_IDX_FASTRPC]);
+		}
 		if (g_status.glink_ipcrtr_up && !opened_apr_proactive && elapsed > 600ULL) {
 			opened_apr_proactive = true;
 			chan_send_open(&chans[CH_IDX_APR]);
 		}
-		if (g_status.glink_ipcrtr_up && g_status.glink_apr_up) {
-			adsp_log("glink: both IPCRTR (rcid=%u) and apr_audio_svc (rcid=%u) UP",
-			    chans[CH_IDX_IPCRTR].rcid, chans[CH_IDX_APR].rcid);
+		if (g_status.glink_ipcrtr_up && g_status.glink_apr_up &&
+		    (g_status.glink_fastrpc_up || elapsed > 3500ULL)) {
+			adsp_log("glink: IPCRTR (rcid=%u), apr_audio_svc (rcid=%u), fastrpc (rcid=%u up=%d) UP",
+			    chans[CH_IDX_IPCRTR].rcid, chans[CH_IDX_APR].rcid,
+			    chans[CH_IDX_FASTRPC].rcid, g_status.glink_fastrpc_up ? 1 : 0);
 			return 0;
 		}
 	}
 
-	adsp_log("glink: bringup status after %u ms: ver=%d IPCRTR=%d apr_audio_svc=%d idx tx=%u/%u rx=%u/%u",
+	adsp_log("glink: bringup status after %u ms: ver=%d IPCRTR=%d apr_audio_svc=%d fastrpc=%d idx tx=%u/%u rx=%u/%u",
 	    timeout_ms, version_acked ? 1 : 0,
 	    g_status.glink_ipcrtr_up ? 1 : 0,
 	    g_status.glink_apr_up ? 1 : 0,
+	    g_status.glink_fastrpc_up ? 1 : 0,
 	    rd32(DESC_TX_TAIL), rd32(DESC_TX_HEAD),
 	    rd32(DESC_RX_TAIL), rd32(DESC_RX_HEAD));
 	return g_status.glink_apr_up ? 0 : -1;
@@ -1464,4 +1486,793 @@ qrtr_on_packet(const uint8_t *pkt, uint32_t len)
 			qrtr_announce_servers(h.src_node);
 		}
 	}
+}
+
+/* ============================================================================
+ * FastRPC Static PD Spawner ("audiopd") & Reverse-RPC (apps_remotectl/apps_std)
+ * Verified against RMX1931 MSM-4.14 drivers/char/adsprpc.c & libadsprpc.so
+ * ============================================================================ */
+
+#define FASTRPC_PGID                    1000
+#define FASTRPC_TID_MAIN                1000u
+#define FASTRPC_TID_LISTENER            1001u
+
+#define FASTRPC_CTX_CREATE_STATIC       0x11ULL /* (1 << 4) | pd(1) */
+#define FASTRPC_CTX_LISTENER_INIT2      0x21ULL /* (2 << 4) | pd(1) */
+#define FASTRPC_CTX_LISTENER_NEXT2      0x31ULL /* (3 << 4) | pd(1) */
+
+#define FASTRPC_SC_CREATE_STATIC        0x08030000u /* method=8, in=3, out=0 */
+#define FASTRPC_SC_LISTENER_INIT2       0x03000000u /* method=3, in=0, out=0 */
+#define FASTRPC_SC_LISTENER_NEXT2       0x04020200u /* method=4, in=2, out=2 */
+
+#define FASTRPC_HANDLE_REMOTECTL        0u
+#define FASTRPC_HANDLE_STATIC_PD        1u
+#define FASTRPC_HANDLE_LISTENER         3u
+#define FASTRPC_HANDLE_APPS_STD         0x100u
+
+#define AEE_ENOSUCH                     0x80000406u
+#define APPS_STD_ENOENT                 0x00000201u
+#define FASTRPC_LST_IN_CAP              16384u
+
+struct fastrpc_smq_msg {
+	uint32_t pid;
+	uint32_t tid;
+	uint64_t ctx;
+	uint32_t handle;
+	uint32_t sc;
+	uint64_t page_addr;
+	uint64_t page_size;
+} __attribute__((packed));
+
+struct fastrpc_smq_rsp {
+	uint64_t ctx;
+	int32_t  retval;
+	int32_t  pad;
+} __attribute__((packed));
+
+static struct {
+	bool     waiting;
+	uint64_t want_ctx;
+	bool     done;
+	int32_t  retval;
+} frpc_sync_wait;
+
+static bool     frpc_lst_parked;
+static uint64_t frpc_lst_out0_pa;
+static uint64_t frpc_lst_out1_pa;
+
+#define MAX_APPS_STD_FILES 16
+static struct {
+	bool used;
+	int  fd;
+} apps_std_files[MAX_APPS_STD_FILES];
+
+static int
+fastrpc_build_and_send(bool kernel, uint32_t tid, uint64_t ctx, uint32_t handle,
+    uint32_t sc, uint64_t base_pa, uint64_t max_bytes,
+    unsigned n_in, const void *const *in_ptrs, const uint32_t *in_lens,
+    unsigned n_out, const uint32_t *out_lens, uint64_t *out_pa_addrs)
+{
+	static uint8_t page_img[ADSP_FASTRPC_LST_SIZE];
+	unsigned n_total = n_in + n_out;
+	uint32_t metalen = 40u * n_total + 384u; /* rpra + list + pages + fdlist[16] + crclist[64] */
+	uint32_t cur_off = (metalen + 127u) & ~127u;
+	uint32_t page_aligned_used;
+	struct fastrpc_smq_msg msg;
+
+	if (n_total > 8 || max_bytes > sizeof(page_img) || cur_off > max_bytes) {
+		return -1;
+	}
+	memset(page_img, 0, metalen < sizeof(page_img) ?
+	    ((metalen + 0xfffu) & ~0xfffu) : sizeof(page_img));
+
+	for (unsigned i = 0; i < n_total; i++) {
+		uint32_t blen = (i < n_in) ? in_lens[i] : out_lens[i - n_in];
+		struct {
+			int32_t num;
+			int32_t pgidx;
+		} lb = { .num = blen ? 1 : 0, .pgidx = (int32_t)i };
+
+		memcpy(page_img + 16u * n_total + 8u * i, &lb, sizeof(lb));
+		if (blen == 0) {
+			if (i >= n_in && out_pa_addrs != NULL) {
+				out_pa_addrs[i - n_in] = 0;
+			}
+			continue;
+		}
+		cur_off = (cur_off + 127u) & ~127u;
+		if ((uint64_t)cur_off + blen > max_bytes) {
+			return -1;
+		}
+
+		uint64_t buf_pa = base_pa + cur_off;
+		uint64_t pg_start = buf_pa & ~0xfffULL;
+		uint64_t pg_end = (buf_pa + blen + 0xfffULL) & ~0xfffULL;
+		struct {
+			uint64_t pv;
+			uint64_t len;
+		} rp = { .pv = buf_pa, .len = blen };
+		struct {
+			uint64_t addr;
+			uint64_t size;
+		} pg = {
+			.addr = ((uint64_t)ADSP_FASTRPC_CB_HIGH << 32) | pg_start,
+			.size = pg_end - pg_start,
+		};
+
+		memcpy(page_img + 16u * i, &rp, sizeof(rp));
+		memcpy(page_img + 24u * n_total + 16u * i, &pg, sizeof(pg));
+
+		memset(page_img + cur_off, 0, (blen + 127u) & ~127u);
+		if (i < n_in && in_ptrs[i] != NULL) {
+			memcpy(page_img + cur_off, in_ptrs[i], blen);
+		} else if (i >= n_in && out_pa_addrs != NULL) {
+			out_pa_addrs[i - n_in] = buf_pa;
+		}
+		cur_off += blen;
+	}
+
+	page_aligned_used = (cur_off + 0xfffu) & ~0xfffu;
+	if (page_aligned_used == 0) {
+		page_aligned_used = 0x1000u;
+	}
+	if (page_aligned_used > max_bytes) {
+		return -1;
+	}
+	(void)pm_wr(base_pa, page_img, page_aligned_used);
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	msg.pid = kernel ? 0u : (uint32_t)FASTRPC_PGID;
+	msg.tid = tid;
+	msg.ctx = ctx;
+	msg.handle = handle;
+	msg.sc = sc;
+	msg.page_addr = ((uint64_t)ADSP_FASTRPC_CB_HIGH << 32) | base_pa;
+	msg.page_size = page_aligned_used;
+
+	return chan_send_pkt(&chans[CH_IDX_FASTRPC], &msg, sizeof(msg));
+}
+
+static int
+fastrpc_post_listener_next2(uint32_t prev_ctx, uint32_t prev_result,
+    const uint8_t *out_stream, uint32_t out_stream_len)
+{
+	struct {
+		uint32_t prev_ctx;
+		uint32_t prev_result;
+		uint32_t prev_out_len;
+		uint32_t next_in_cap;
+	} in0 = {
+		.prev_ctx     = prev_ctx,
+		.prev_result  = prev_result,
+		.prev_out_len = out_stream_len,
+		.next_in_cap  = FASTRPC_LST_IN_CAP,
+	};
+	const void *in_ptrs[2] = { &in0, out_stream_len ? out_stream : NULL };
+	uint32_t in_lens[2] = { sizeof(in0), out_stream_len };
+	uint32_t out_lens[2] = { 16u, FASTRPC_LST_IN_CAP };
+	uint64_t out_pas[2] = { 0, 0 };
+
+	if (fastrpc_build_and_send(false, FASTRPC_TID_LISTENER, FASTRPC_CTX_LISTENER_NEXT2,
+	    FASTRPC_HANDLE_LISTENER, FASTRPC_SC_LISTENER_NEXT2,
+	    ADSP_FASTRPC_LST_PA, ADSP_FASTRPC_LST_SIZE,
+	    2, in_ptrs, in_lens, 2, out_lens, out_pas) != 0) {
+		frpc_lst_parked = false;
+		return -1;
+	}
+	frpc_lst_out0_pa = out_pas[0];
+	frpc_lst_out1_pa = out_pas[1];
+	frpc_lst_parked = true;
+	return 0;
+}
+
+static int
+apps_std_open_modem_ro(const char *raw_name)
+{
+	const char *base;
+	char local[256];
+	int fd;
+
+	if (raw_name == NULL || raw_name[0] == '\0') {
+		return -1;
+	}
+	base = strrchr(raw_name, '/');
+	base = base != NULL ? base + 1 : raw_name;
+	if (base[0] == '\0' || base[0] == '.' || strstr(base, "..") != NULL) {
+		return -1;
+	}
+	snprintf(local, sizeof(local), "%s/%s", ADSP_FW_DIR, base);
+	fd = open(local, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		return fd;
+	}
+	for (char *c = local + strlen(ADSP_FW_DIR) + 1; *c != '\0'; c++) {
+		*c = (char)tolower((unsigned char)*c);
+	}
+	return open(local, O_RDONLY | O_CLOEXEC);
+}
+
+static int
+apps_std_alloc_sin(int fd)
+{
+	for (int i = 0; i < MAX_APPS_STD_FILES; i++) {
+		if (!apps_std_files[i].used) {
+			apps_std_files[i].used = true;
+			apps_std_files[i].fd = fd;
+			return 100 + i;
+		}
+	}
+	close(fd);
+	return -1;
+}
+
+static int
+apps_std_lookup_fd(int32_t sin, int *out_slot)
+{
+	int slot = (int)sin - 100;
+
+	if (slot < 0 || slot >= MAX_APPS_STD_FILES || !apps_std_files[slot].used) {
+		return -1;
+	}
+	if (out_slot != NULL) {
+		*out_slot = slot;
+	}
+	return apps_std_files[slot].fd;
+}
+
+struct rev_buf_desc {
+	const uint8_t *pv;
+	uint32_t       len;
+};
+
+struct rev_out_desc {
+	uint8_t  *pv;
+	uint32_t  len;
+};
+
+static uint32_t
+fastrpc_dispatch_apps_std(uint32_t method, unsigned n_in, const struct rev_buf_desc *inb,
+    unsigned n_out, struct rev_out_desc *outb)
+{
+	switch (method) {
+	case 0: { /* fopen(name, mode) -> sin */
+		char name[256] = "";
+		int fd, sin;
+
+		if (n_in < 3 || n_out < 1 || outb[0].len < 4) {
+			return 14u;
+		}
+		if (inb[1].pv != NULL && inb[1].len > 0) {
+			size_t cp = inb[1].len < sizeof(name) - 1 ? inb[1].len : sizeof(name) - 1;
+			memcpy(name, inb[1].pv, cp);
+			name[cp] = '\0';
+		}
+		fd = apps_std_open_modem_ro(name);
+		if (fd < 0) {
+			adsp_log("fastrpc: apps_std fopen('%s') -> ENOENT", name);
+			return 2u; /* ENOENT */
+		}
+		sin = apps_std_alloc_sin(fd);
+		if (sin < 0) {
+			return 24u; /* EMFILE */
+		}
+		int32_t s32 = (int32_t)sin;
+		memcpy(outb[0].pv, &s32, 4);
+		adsp_log("fastrpc: apps_std fopen('%s') -> sin=%d", name, sin);
+		return 0;
+	}
+
+	case 19: { /* fopen_with_env(envvarname, delim, name, mode) -> sin */
+		char envn[64] = "", name[256] = "";
+		int fd, sin;
+
+		if (n_in < 5 || n_out < 1 || outb[0].len < 4) {
+			return 14u;
+		}
+		if (inb[1].pv != NULL && inb[1].len > 0) {
+			size_t cp = inb[1].len < sizeof(envn) - 1 ? inb[1].len : sizeof(envn) - 1;
+			memcpy(envn, inb[1].pv, cp);
+			envn[cp] = '\0';
+		}
+		if (inb[3].pv != NULL && inb[3].len > 0) {
+			size_t cp = inb[3].len < sizeof(name) - 1 ? inb[3].len : sizeof(name) - 1;
+			memcpy(name, inb[3].pv, cp);
+			name[cp] = '\0';
+		}
+		fd = apps_std_open_modem_ro(name);
+		if (fd < 0) {
+			adsp_log("fastrpc: apps_std fopen_with_env('%s', '%s') -> ENOENT", envn, name);
+			return APPS_STD_ENOENT;
+		}
+		sin = apps_std_alloc_sin(fd);
+		if (sin < 0) {
+			return 24u;
+		}
+		int32_t s32 = (int32_t)sin;
+		memcpy(outb[0].pv, &s32, 4);
+		adsp_log("fastrpc: apps_std fopen_with_env('%s', '%s') -> sin=%d", envn, name, sin);
+		return 0;
+	}
+
+	case 2: /* fflush(sin) */
+	case 14: /* clearerr(sin) */
+		return 0;
+
+	case 3: { /* fclose(sin) */
+		int32_t sin = 0;
+		int slot = -1, fd;
+
+		if (n_in < 1 || inb[0].len < 4) {
+			return 14u;
+		}
+		memcpy(&sin, inb[0].pv, 4);
+		fd = apps_std_lookup_fd(sin, &slot);
+		if (fd < 0) {
+			return 9u; /* EBADF */
+		}
+		close(fd);
+		apps_std_files[slot].fd = -1;
+		apps_std_files[slot].used = false;
+		return 0;
+	}
+
+	case 4: { /* fread(sin, buf_len) -> (bytesRead, bEOF), buf */
+		int32_t hdr[2] = { 0, 0 };
+		int32_t out_hdr[2] = { 0, 0 };
+		int fd;
+		ssize_t got;
+		uint32_t want;
+
+		if (n_in < 1 || inb[0].len < 8 || n_out < 2 || outb[0].len < 8) {
+			return 14u;
+		}
+		memcpy(hdr, inb[0].pv, 8);
+		fd = apps_std_lookup_fd(hdr[0], NULL);
+		if (fd < 0) {
+			return 9u;
+		}
+		want = hdr[1] > 0 ? (uint32_t)hdr[1] : 0u;
+		if (want > outb[1].len) {
+			want = outb[1].len;
+		}
+		got = want > 0 ? read(fd, outb[1].pv, want) : 0;
+		if (got < 0) {
+			return 5u; /* EIO */
+		}
+		out_hdr[0] = (int32_t)got;
+		if ((uint32_t)got < want) {
+			out_hdr[1] = 1; /* bEOF */
+		} else {
+			struct stat st;
+			off_t cur = lseek(fd, 0, SEEK_CUR);
+			if (fstat(fd, &st) == 0 && cur >= st.st_size) {
+				out_hdr[1] = 1;
+			}
+		}
+		memcpy(outb[0].pv, out_hdr, 8);
+		return 0;
+	}
+
+	case 8: { /* ftell(sin) -> pos */
+		int32_t sin = 0, pos32 = 0;
+		int fd;
+		off_t pos;
+
+		if (n_in < 1 || inb[0].len < 4 || n_out < 1 || outb[0].len < 4) {
+			return 14u;
+		}
+		memcpy(&sin, inb[0].pv, 4);
+		fd = apps_std_lookup_fd(sin, NULL);
+		if (fd < 0) {
+			return 9u;
+		}
+		pos = lseek(fd, 0, SEEK_CUR);
+		if (pos < 0) {
+			return 29u;
+		}
+		pos32 = (int32_t)pos;
+		memcpy(outb[0].pv, &pos32, 4);
+		return 0;
+	}
+
+	case 9: { /* fseek(sin, offset, whence) */
+		int32_t args[3] = { 0, 0, 0 };
+		int fd, whence;
+
+		if (n_in < 1 || inb[0].len < 12) {
+			return 14u;
+		}
+		memcpy(args, inb[0].pv, 12);
+		fd = apps_std_lookup_fd(args[0], NULL);
+		if (fd < 0) {
+			return 9u;
+		}
+		whence = (args[2] == 1) ? SEEK_CUR : (args[2] == 2) ? SEEK_END : SEEK_SET;
+		return lseek(fd, (off_t)args[1], whence) < 0 ? 22u : 0u;
+	}
+
+	case 10: { /* flen(sin) -> uint64_t size */
+		int32_t sin = 0;
+		int fd;
+		struct stat st;
+		uint64_t sz64;
+
+		if (n_in < 1 || inb[0].len < 4 || n_out < 1 || outb[0].len < 8) {
+			return 14u;
+		}
+		memcpy(&sin, inb[0].pv, 4);
+		fd = apps_std_lookup_fd(sin, NULL);
+		if (fd < 0 || fstat(fd, &st) != 0) {
+			return 9u;
+		}
+		sz64 = (uint64_t)st.st_size;
+		memcpy(outb[0].pv, &sz64, 8);
+		return 0;
+	}
+
+	case 11: { /* rewind(sin) */
+		int32_t sin = 0;
+		int fd;
+
+		if (n_in < 1 || inb[0].len < 4) {
+			return 14u;
+		}
+		memcpy(&sin, inb[0].pv, 4);
+		fd = apps_std_lookup_fd(sin, NULL);
+		if (fd < 0) {
+			return 9u;
+		}
+		(void)lseek(fd, 0, SEEK_SET);
+		return 0;
+	}
+
+	case 12: /* feof(sin) */
+	case 13: { /* ferror(sin) */
+		int32_t sin = 0, flag = 0;
+		int fd;
+
+		if (n_in < 1 || inb[0].len < 4 || n_out < 1 || outb[0].len < 4) {
+			return 14u;
+		}
+		memcpy(&sin, inb[0].pv, 4);
+		fd = apps_std_lookup_fd(sin, NULL);
+		if (fd < 0) {
+			return 9u;
+		}
+		if (method == 12) {
+			struct stat st;
+			off_t cur = lseek(fd, 0, SEEK_CUR);
+			if (fstat(fd, &st) == 0 && cur >= st.st_size) {
+				flag = 1;
+			}
+		}
+		memcpy(outb[0].pv, &flag, 4);
+		return 0;
+	}
+
+	case 15: { /* print_string(str) */
+		if (n_in >= 2 && inb[1].pv != NULL && inb[1].len > 0) {
+			adsp_log("fastrpc: dsp_print: %.*s", (int)inb[1].len, (const char *)inb[1].pv);
+		}
+		return 0;
+	}
+
+	case 16: { /* getenv(name) -> (valLenReq, val) */
+		char envn[64] = "";
+		const char *val = ADSP_FW_DIR;
+		int32_t vlen = (int32_t)strlen(val) + 1;
+
+		if (n_in < 2 || inb[0].len < 8 || n_out < 2 || outb[0].len < 4) {
+			return 14u;
+		}
+		if (inb[1].pv != NULL && inb[1].len > 0) {
+			size_t cp = inb[1].len < sizeof(envn) - 1 ? inb[1].len : sizeof(envn) - 1;
+			memcpy(envn, inb[1].pv, cp);
+			envn[cp] = '\0';
+		}
+		if (strstr(envn, "ADSP") == NULL && strstr(envn, "DSP") == NULL) {
+			return 0xffffffffu;
+		}
+		memcpy(outb[0].pv, &vlen, 4);
+		if (outb[1].len > 0) {
+			size_t cp = (uint32_t)vlen < outb[1].len ? (uint32_t)vlen : outb[1].len;
+			memcpy(outb[1].pv, val, cp);
+			outb[1].pv[cp - 1] = '\0';
+		}
+		return 0;
+	}
+
+	case 21: { /* get_search_paths_with_env -> 1 path: /var/local/fw/modem */
+		const char *val = ADSP_FW_DIR;
+		uint32_t npaths = 1u;
+		uint16_t max_plen = (uint16_t)(strlen(val) + 1u);
+
+		if (n_out < 1 || outb[0].len < 6) {
+			return 14u;
+		}
+		memcpy(outb[0].pv + 0, &npaths, 4);
+		memcpy(outb[0].pv + 4, &max_plen, 2);
+		if (n_out >= 2 && outb[1].len > 0) {
+			size_t cp = max_plen < outb[1].len ? max_plen : outb[1].len;
+			memcpy(outb[1].pv, val, cp);
+			outb[1].pv[cp - 1] = '\0';
+		}
+		return 0;
+	}
+
+	case 22: { /* fileExists(path) -> bool */
+		char name[256] = "";
+		int fd;
+
+		if (n_in < 2 || n_out < 1 || outb[0].len < 1) {
+			return 14u;
+		}
+		if (inb[1].pv != NULL && inb[1].len > 0) {
+			size_t cp = inb[1].len < sizeof(name) - 1 ? inb[1].len : sizeof(name) - 1;
+			memcpy(name, inb[1].pv, cp);
+			name[cp] = '\0';
+		}
+		fd = apps_std_open_modem_ro(name);
+		if (fd >= 0) {
+			close(fd);
+			outb[0].pv[0] = 1u;
+		} else {
+			outb[0].pv[0] = 0u;
+		}
+		return 0;
+	}
+
+	default:
+		adsp_log("fastrpc: apps_std unsupported method=%u", method);
+		return 20u; /* AEE_EUNSUPPORTED */
+	}
+}
+
+static void
+fastrpc_handle_reverse_rpc(void)
+{
+	static uint8_t in_stream[FASTRPC_LST_IN_CAP];
+	static uint8_t out_stream[FASTRPC_LST_IN_CAP];
+	struct {
+		uint32_t rev_ctx;
+		uint32_t rev_handle;
+		uint32_t rev_sc;
+		int32_t  in_sz;
+	} hdr = { 0 };
+	struct rev_buf_desc inb[8];
+	struct rev_out_desc outb[8];
+	uint32_t method, n_in, n_out, n_inh, n_outh;
+	uint32_t pos = 0, opos = 0, result = AEE_ENOSUCH;
+
+	if (frpc_lst_out0_pa == 0 || pm_rd(frpc_lst_out0_pa, &hdr, sizeof(hdr)) != 0) {
+		(void)fastrpc_post_listener_next2(0, AEE_ENOSUCH, NULL, 0);
+		return;
+	}
+	if (hdr.in_sz < 0 || (uint32_t)hdr.in_sz > sizeof(in_stream)) {
+		adsp_log("fastrpc: rev_rpc ctx=0x%x oversized in_sz=%d", hdr.rev_ctx, hdr.in_sz);
+		(void)fastrpc_post_listener_next2(hdr.rev_ctx, 14u, NULL, 0);
+		return;
+	}
+	if (hdr.in_sz > 0 && frpc_lst_out1_pa != 0) {
+		uint32_t rd_aligned = ((uint32_t)hdr.in_sz + 3u) & ~3u;
+		(void)pm_rd(frpc_lst_out1_pa, in_stream, rd_aligned);
+	}
+
+	method = (hdr.rev_sc >> 24) & 0x1fu;
+	n_in   = (hdr.rev_sc >> 16) & 0xffu;
+	n_out  = (hdr.rev_sc >> 8) & 0xffu;
+	n_inh  = (hdr.rev_sc >> 4) & 0x0fu;
+	n_outh = hdr.rev_sc & 0x0fu;
+	g_status.fastrpc_rev_calls++;
+
+	if (n_in > 8 || n_out > 8 || n_inh != 0 || n_outh != 0) {
+		adsp_log("fastrpc: rev_rpc unsupported sc=0x%x (h=0x%x)", hdr.rev_sc, hdr.rev_handle);
+		(void)fastrpc_post_listener_next2(hdr.rev_ctx, 20u, NULL, 0);
+		return;
+	}
+
+	memset(inb, 0, sizeof(inb));
+	memset(outb, 0, sizeof(outb));
+	for (unsigned i = 0; i < n_in; i++) {
+		uint32_t l = 0;
+		if (pos + 4u > (uint32_t)hdr.in_sz) {
+			(void)fastrpc_post_listener_next2(hdr.rev_ctx, 14u, NULL, 0);
+			return;
+		}
+		memcpy(&l, in_stream + pos, 4);
+		pos += 4u;
+		if (l > 0) {
+			pos = (pos + 7u) & ~7u;
+			if (pos + l > (uint32_t)hdr.in_sz) {
+				(void)fastrpc_post_listener_next2(hdr.rev_ctx, 14u, NULL, 0);
+				return;
+			}
+			inb[i].pv = in_stream + pos;
+			inb[i].len = l;
+			pos += l;
+		}
+	}
+
+	memset(out_stream, 0, sizeof(out_stream));
+	for (unsigned j = 0; j < n_out; j++) {
+		uint32_t l = 0;
+		if (pos + 4u <= (uint32_t)hdr.in_sz) {
+			memcpy(&l, in_stream + pos, 4);
+			pos += 4u;
+		}
+		if (opos + 4u > sizeof(out_stream)) {
+			(void)fastrpc_post_listener_next2(hdr.rev_ctx, 14u, NULL, 0);
+			return;
+		}
+		memcpy(out_stream + opos, &l, 4);
+		opos += 4u;
+		if (l > 0) {
+			opos = (opos + 7u) & ~7u;
+			if (opos + l > sizeof(out_stream)) {
+				(void)fastrpc_post_listener_next2(hdr.rev_ctx, 14u, NULL, 0);
+				return;
+			}
+			outb[j].pv = out_stream + opos;
+			outb[j].len = l;
+			opos += l;
+		}
+	}
+
+	if (hdr.rev_handle == FASTRPC_HANDLE_REMOTECTL) {
+		if (method == 0 && n_in >= 2 && n_out >= 1 && outb[0].len >= 8) {
+			char mod[128] = "";
+			if (inb[1].pv != NULL && inb[1].len > 0) {
+				size_t cp = inb[1].len < sizeof(mod) - 1 ? inb[1].len : sizeof(mod) - 1;
+				memcpy(mod, inb[1].pv, cp);
+				mod[cp] = '\0';
+			}
+			if (strstr(mod, "apps_std") != NULL) {
+				uint32_t h_out[2] = { FASTRPC_HANDLE_APPS_STD, 0u };
+				memcpy(outb[0].pv, h_out, 8);
+				result = 0;
+				adsp_log("fastrpc: remotectl open('%s') -> handle=0x%x", mod, FASTRPC_HANDLE_APPS_STD);
+			} else {
+				result = AEE_ENOSUCH;
+				adsp_log("fastrpc: remotectl open('%s') -> ENOSUCH", mod);
+			}
+		} else if (method == 1) {
+			result = 0;
+		} else {
+			result = 20u;
+		}
+	} else if (hdr.rev_handle == FASTRPC_HANDLE_APPS_STD) {
+		result = fastrpc_dispatch_apps_std(method, n_in, inb, n_out, outb);
+	} else {
+		adsp_log("fastrpc: rev_rpc unknown handle=0x%x sc=0x%x", hdr.rev_handle, hdr.rev_sc);
+		result = AEE_ENOSUCH;
+	}
+
+	if (result != 0) {
+		opos = 0;
+	}
+	(void)fastrpc_post_listener_next2(hdr.rev_ctx, result, opos ? out_stream : NULL, opos);
+}
+
+static void
+fastrpc_on_packet(const uint8_t *pkt, uint32_t len)
+{
+	struct fastrpc_smq_rsp rsp;
+
+	if (len < sizeof(rsp)) {
+		return;
+	}
+	memcpy(&rsp, pkt, sizeof(rsp));
+
+	if (frpc_sync_wait.waiting && rsp.ctx == frpc_sync_wait.want_ctx) {
+		frpc_sync_wait.retval = rsp.retval;
+		frpc_sync_wait.done = true;
+		return;
+	}
+	if (rsp.ctx == FASTRPC_CTX_LISTENER_NEXT2) {
+		frpc_lst_parked = false;
+		if (rsp.retval == 0) {
+			fastrpc_handle_reverse_rpc();
+		} else {
+			adsp_log("fastrpc: listener_next2 returned %d", rsp.retval);
+		}
+		return;
+	}
+	adsp_log("fastrpc: rx unhandled rsp ctx=0x%llx retval=%d",
+	    (unsigned long long)rsp.ctx, rsp.retval);
+}
+
+static int
+fastrpc_call_sync(bool kernel, uint32_t tid, uint64_t ctx, uint32_t handle,
+    uint32_t sc, unsigned n_in, const void *const *in_ptrs, const uint32_t *in_lens,
+    unsigned timeout_ms)
+{
+	uint64_t deadline;
+
+	memset(&frpc_sync_wait, 0, sizeof(frpc_sync_wait));
+	frpc_sync_wait.waiting = true;
+	frpc_sync_wait.want_ctx = ctx;
+
+	if (fastrpc_build_and_send(kernel, tid, ctx, handle, sc,
+	    ADSP_FASTRPC_MSG_PA, ADSP_FASTRPC_MSG_SIZE,
+	    n_in, in_ptrs, in_lens, 0, NULL, NULL) != 0) {
+		frpc_sync_wait.waiting = false;
+		return -1;
+	}
+
+	deadline = now_ms() + timeout_ms;
+	while (!frpc_sync_wait.done && now_ms() < deadline && !g_stop_requested) {
+		(void)adsp_glink_poll(5);
+	}
+	frpc_sync_wait.waiting = false;
+	if (!frpc_sync_wait.done) {
+		adsp_log("fastrpc: timeout waiting for ctx=0x%llx (sc=0x%x)",
+		    (unsigned long long)ctx, sc);
+		return -1;
+	}
+	if (frpc_sync_wait.retval != 0) {
+		adsp_log("fastrpc: ctx=0x%llx (sc=0x%x) failed retval=%d (0x%x)",
+		    (unsigned long long)ctx, sc, frpc_sync_wait.retval,
+		    (uint32_t)frpc_sync_wait.retval);
+		return -1;
+	}
+	return 0;
+}
+
+int
+adsp_fastrpc_spawn_audiopd(void)
+{
+	struct {
+		int32_t  pgid;
+		uint32_t namelen;
+		uint32_t pageslen;
+	} __attribute__((packed)) create_hdr = {
+		.pgid     = FASTRPC_PGID,
+		.namelen  = 8u,
+		.pageslen = 1u,
+	};
+	static const char pd_name[8] = "audiopd";
+	struct {
+		uint64_t addr;
+		uint64_t size;
+	} __attribute__((packed)) rh_page = {
+		.addr = ADSP_FASTRPC_HEAP_PA,   /* pure 32-bit PA per adsprpc.c:838 */
+		.size = ADSP_FASTRPC_HEAP_SIZE, /* 2 MiB */
+	};
+	const void *in_ptrs[3] = { &create_hdr, pd_name, &rh_page };
+	uint32_t in_lens[3] = { sizeof(create_hdr), sizeof(pd_name), sizeof(rh_page) };
+
+	if (g_status.audiopd_spawned) {
+		return 0;
+	}
+	if (!g_status.glink_fastrpc_up) {
+		uint64_t end = now_ms() + 3000ULL;
+		chan_send_open(&chans[CH_IDX_FASTRPC]);
+		while (!g_status.glink_fastrpc_up && now_ms() < end && !g_stop_requested) {
+			(void)adsp_glink_poll(10);
+		}
+		if (!g_status.glink_fastrpc_up) {
+			adsp_log("fastrpc: 'fastrpcglink-apps-dsp' channel did not come up");
+			return -1;
+		}
+	}
+
+	adsp_log("fastrpc: spawning static PD 'audiopd' (heap=0x%llx size=0x%llx)...",
+	    (unsigned long long)rh_page.addr, (unsigned long long)rh_page.size);
+	if (fastrpc_call_sync(true, FASTRPC_TID_MAIN, FASTRPC_CTX_CREATE_STATIC,
+	    FASTRPC_HANDLE_STATIC_PD, FASTRPC_SC_CREATE_STATIC,
+	    3, in_ptrs, in_lens, 6000) != 0) {
+		return -1;
+	}
+	g_status.audiopd_spawned = true;
+	adsp_log("fastrpc: static PD 'audiopd' spawned (retval=0)");
+
+	if (fastrpc_call_sync(false, FASTRPC_TID_LISTENER, FASTRPC_CTX_LISTENER_INIT2,
+	    FASTRPC_HANDLE_LISTENER, FASTRPC_SC_LISTENER_INIT2,
+	    0, NULL, NULL, 2500) == 0) {
+		adsp_log("fastrpc: adsp_listener_init2 -> ok, parking adsp_listener_next2");
+		(void)fastrpc_post_listener_next2(0, 0xffffffffu, NULL, 0);
+	} else {
+		adsp_log("fastrpc: warning: adsp_listener_init2 did not ACK");
+	}
+	return 0;
 }

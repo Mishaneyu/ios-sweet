@@ -445,7 +445,7 @@ q6afe_stop_port(uint16_t port_id)
 }
 
 /* ============================================================================
- * 2. Q6ADM + Q6ASM Stereo 48 kHz PCM Stream & Ring Feeder
+ * 2. Q6ADM + Q6ASM Stereo 48 kHz PCM Stream & Ring Feede
  * ============================================================================ */
 
 static int
@@ -1069,18 +1069,46 @@ q6_voice_stop(void)
 int
 adsp_q6_bringup_playback(void)
 {
-	if (q6core_wait_ready(15000) != 0) {
-		snprintf(g_status.last_error, sizeof(g_status.last_error), "Q6Core AVCS not ready");
-		return -1;
-	}
+	/*
+	 * Configure apps_smmu (SID 0x1b21 mask 0x0f -> covers 0x1b21 audio DMA &
+	 * 0x1b23 adsprpc-smd!), hyp_assign the 4 MiB-aligned remote heap, and spawn
+	 * the "audiopd" static PD over FastRPC BEFORE issuing Q6AFE/Q6ADM/Q6ASM APR
+	 * commands so audio_pd registers all Elite/AVS APR services first.
+	 */
 	if (adsp_smmu_setup() != 0) {
 		snprintf(g_status.last_error, sizeof(g_status.last_error), "apps_smmu 0x1b21 setup failed");
 		return -1;
 	}
+	(void)adsp_hyp_assign_fastrpc_heap();
+	if (adsp_fastrpc_spawn_audiopd() != 0) {
+		adsp_log("fastrpc: warning: audiopd static PD spawn did not ACK, continuing");
+	}
+	/* Pump reverse-RPC (apps_remotectl / apps_std ACDB load) briefly while audiopd initializes */
+	(void)adsp_glink_poll(250);
+
+	if (q6core_wait_ready(15000) != 0) {
+		snprintf(g_status.last_error, sizeof(g_status.last_error), "Q6Core AVCS not ready");
+		return -1;
+	}
 	tlmm_setup_quat_mi2s();
 
-	if (q6afe_set_quad_mi2s_clk(1536000u) != 0) {
-		adsp_log("q6afe: warning: QUAD_MI2S_IBIT clock set returned error, continuing");
+	/*
+	 * Right after CREATE_STATIC("audiopd") returns, audio_pd finishes loading
+	 * adsp_avs_config.acdb via apps_std reverse-RPC and registering Q6AFE (svc=4).
+	 * Retry Q6AFE clock setup for up to ~4s while pumping GLINK/reverse-RPC.
+	 */
+	{
+		int clk_rc = -1;
+		for (int attempt = 0; attempt < 8 && !g_stop_requested; attempt++) {
+			clk_rc = q6afe_set_quad_mi2s_clk(1536000u);
+			if (clk_rc == 0) {
+				break;
+			}
+			(void)adsp_glink_poll(300);
+		}
+		if (clk_rc != 0) {
+			adsp_log("q6afe: warning: QUAD_MI2S_IBIT clock set returned error, continuing");
+		}
 	}
 	if (q6afe_start_i2s_port(AFE_PORT_ID_QUATERNARY_MI2S_RX, AFE_PORT_I2S_SD1, 1) != 0) {
 		snprintf(g_status.last_error, sizeof(g_status.last_error), "Q6AFE 0x1006 start failed");

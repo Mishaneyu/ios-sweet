@@ -28,7 +28,7 @@
 #define BUF_EFS_SIZE	0x200000u
 #define BUF_OEM_SIZE	0x100000u
 #define BUF_TOTAL_SIZE	(BUF_EFS_SIZE + BUF_OEM_SIZE)
-#define BUF_VERSION	4u
+#define BUF_VERSION	5u
 #define SECTOR		512
 #define CNV_GOOD_CRC	0xe2f0u
 
@@ -238,10 +238,49 @@ static void prepare_oppo_oem_cache(void)
 			off += sta_sz;
 	}
 	if (extra_sz == 0x190u) {
-		/* buf3 trailer: [0] = trailer offset, [0x18c] = svn_valid(1), [0x18d] = svn(37) */
+		/*
+		 * Oppo buf3 trailer (0x190 B, rmt_storage 0x9930..0xa188):
+		 *   +0x000: uint32_t trailer_off
+		 *   +0x004: uint16_t pcb_data_sz (0x0100 when valid)
+		 *   +0x006: uint8_t  pcb_data[256] = [L][raw[1..L+6]][raw[0x27..0xb6] (IMEI+RSA)]
+		 *   +0x188: uint32_t hw_emmcID
+		 *   +0x18c: uint8_t  svn_valid (1)
+		 *   +0x18d: uint8_t  svn (37)
+		 */
 		memcpy(oem_cache + off + 0x000, &off, 4);
 		oem_cache[off + 0x18c] = 1u;
 		oem_cache[off + 0x18d] = 37u;
+
+		int pfd = open(RMTFS_DIR "/oppo_pcba.bin", O_RDONLY);
+		if (pfd >= 0) {
+			uint8_t pcba[187];
+			ssize_t pr = read(pfd, pcba, sizeof(pcba));
+			close(pfd);
+			if (pr == (ssize_t)sizeof(pcba)) {
+				const uint8_t *emmc4 = pcba;
+				const uint8_t *raw = pcba + 4;
+				uint8_t L = raw[0];
+				if (L >= 1u && L <= 60u && (uint32_t)L + 7u + 0x90u <= 256u) {
+					uint16_t pcb_sz = 0x0100u;
+					uint8_t *pcb_data = oem_cache + off + 0x006;
+					memcpy(oem_cache + off + 0x004, &pcb_sz, 2);
+					pcb_data[0] = L;
+					memcpy(&pcb_data[1], &raw[1], (size_t)L + 6u);
+					memcpy(&pcb_data[(size_t)L + 7u], &raw[0x27], 0x90u);
+					memcpy(oem_cache + off + 0x188, emmc4, 4);
+					printf("rmtfs: loaded oppo_pcba record (len=%u)\n", (unsigned)L);
+				} else {
+					printf("rmtfs: oppo_pcba invalid length %u\n", (unsigned)L);
+				}
+			} else {
+				printf("rmtfs: oppo_pcba unexpected size %zd\n", pr);
+			}
+			volatile uint8_t *vp = pcba;
+			for (size_t k = 0; k < sizeof(pcba); k++)
+				vp[k] = 0;
+		} else {
+			printf("rmtfs: optional " RMTFS_DIR "/oppo_pcba.bin not present\n");
+		}
 		off += 0x190u;
 	}
 
@@ -287,7 +326,7 @@ int rmtfs_prepare(void)
 		return 0;
 	}
 	/*
-	 * One 3 MB buffer per phone boot (2 MB EFS for callers 1..4 + 1 MB OEM NV backup for
+	 * One 3 MB buffer per phone boot (2 MB EFS for callers 1..4 + 1 MB OEM NV backup fo
 	 * callers 5..7), kept across modem restarts: a fresh hyp_assign after every restart
 	 * (the old ones never handed back) ends with an SMC that never returns.
 	 */
