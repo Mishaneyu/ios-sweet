@@ -1,0 +1,695 @@
+From ec530f419846d09d9ec1fd1771cd83a82c9afbbb Mon Sep 17 00:00:00 2001
+From: XNU 26 Rebase <rebase@local>
+Date: Wed, 28 Oct 2026 00:54:50 +0000
+Subject: [PATCH] 0146: flame: fix IO80211 split-scan/44B link event and add
+ dynamic OSM CPU governor
+
+---
+ EXTERNAL_HEADERS/sweet_diag.h         |   2 +
+ bsd/dev/flame_sta.c                   |  11 +-
+ bsd/dev/flame_wlan.c                  |  29 +++-
+ bsd/dev/redwood_apple80211.c          | 140 +++++++++++++-----
+ bsd/dev/redwood_sta.c                 |  14 +-
+ bsd/dev/sweet_cpufreq.c               | 198 +++++++++++++++++++++++---
+ bsd/dev/sweet_gpu.c                   |   2 +-
+ bsd/sys/redwood_sta.h                 |   1 +
+ iokit/Kernel/arm/SweetFramebuffer.cpp |   1 +
+ iokit/Kernel/arm/hid/SweetHID.cpp     |   2 +
+ 10 files changed, 336 insertions(+), 64 deletions(-)
+
+diff --git a/EXTERNAL_HEADERS/sweet_diag.h b/EXTERNAL_HEADERS/sweet_diag.h
+index 4e5ae30..42948ad 100644
+--- a/EXTERNAL_HEADERS/sweet_diag.h
++++ b/EXTERNAL_HEADERS/sweet_diag.h
+@@ -197,6 +197,8 @@ void sweet_diag_init(void);
+ size_t sweet_diag_format_json(char *buf, size_t cap);
+ 
+ void sweet_cpufreq_record(unsigned cluster, unsigned mhz);
++void sweet_cpufreq_boost(void);
++void sweet_cpufreq_note_swap(void);
+ void sweet_wdt_record(bool enabled, int reboot_s, int elapsed_s);
+ void sweet_touch_driver_record(const char *driver, bool ready, uint32_t poll_ms, uint64_t errors);
+ void sweet_crash_record(const char *name, int pid, int sig, uint64_t code, uint64_t subcode,
+diff --git a/bsd/dev/flame_sta.c b/bsd/dev/flame_sta.c
+index 8abc042..b664e9c 100644
+--- a/bsd/dev/flame_sta.c
++++ b/bsd/dev/flame_sta.c
+@@ -174,8 +174,15 @@ sta_channels(struct redwood_sta_channel *channels, unsigned most)
+ {
+ 	unsigned n = 0;
+ 	for (; n < most && n < sizeof(sta_freqs) / sizeof(sta_freqs[0]); n++) {
+-		channels[n].frequency = sta_freqs[n];
+-		channels[n].flags = REDWOOD_STA_CHANNEL_PASSIVE;
++		uint16_t f = sta_freqs[n];
++		uint16_t flags = 0;
++		if (f >= 5260 && f <= 5700) {
++			flags = REDWOOD_STA_CHANNEL_PASSIVE | REDWOOD_STA_CHANNEL_RADAR;
++		} else if (f >= 2467 && f <= 2484) {
++			flags = REDWOOD_STA_CHANNEL_PASSIVE;
++		}
++		channels[n].frequency = f;
++		channels[n].flags = flags;
+ 	}
+ 	return n;
+ }
+diff --git a/bsd/dev/flame_wlan.c b/bsd/dev/flame_wlan.c
+index aad7605..f428907 100644
+--- a/bsd/dev/flame_wlan.c
++++ b/bsd/dev/flame_wlan.c
+@@ -18,6 +18,7 @@
+ #include <sys/uio.h>
+ #include <sys/vnode.h>
+ #include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
+ #include <kern/locks.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
+@@ -64,6 +65,7 @@ static bool fw_link_bss_heard;
+ #define FW_BSS_MAX      64
+ static struct flame_wlan_bss fw_bss[FW_BSS_MAX];
+ static unsigned fw_nbss;
++static uint64_t fw_last_scan_abs;
+ static int32_t fw_scan_status = FW_PENDING, fw_join_status = FW_PENDING, fw_left_status = FW_PENDING;
+ 
+ /* with fw_lock */
+@@ -130,6 +132,19 @@ flame_wlan_ready(void)
+ int
+ flame_wlan_scan(void)
+ {
++	lck_mtx_lock(&fw_lock);
++	if (fw_nbss > 0 && fw_last_scan_abs != 0) {
++		uint64_t now = mach_absolute_time();
++		if (now >= fw_last_scan_abs) {
++			uint64_t age_ns = 0;
++			absolutetime_to_nanoseconds(now - fw_last_scan_abs, &age_ns);
++			if (age_ns < 4ULL * NSEC_PER_SEC) {
++				lck_mtx_unlock(&fw_lock);
++				return 0;
++			}
++		}
++	}
++	lck_mtx_unlock(&fw_lock);
+ 	return fw_request(FW_SCAN, NULL, 0, &fw_scan_status, 20);
+ }
+ 
+@@ -373,9 +388,21 @@ fw_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		lck_mtx_unlock(&fw_lock);
+ 		break;
+ 	}
+-	case FW_SCAN_DONE:
++	case FW_SCAN_DONE: {
++		int32_t st = EIO;
++		if (h.len >= sizeof(st)) {
++			memcpy(&st, p, sizeof(st));
++		}
++		if (st == 0) {
++			lck_mtx_lock(&fw_lock);
++			if (fw_nbss > 0) {
++				fw_last_scan_abs = mach_absolute_time();
++			}
++			lck_mtx_unlock(&fw_lock);
++		}
+ 		fw_wake_status(&fw_scan_status, p, h.len);
+ 		break;
++	}
+ 	case FW_JOIN_DONE:
+ 		fw_wake_status(&fw_join_status, p, h.len);
+ 		break;
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index ef2b9da..9ef95a0 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -74,7 +74,8 @@ type_name(int32_t type)
+ 		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
+ 		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 96, "VIRTUAL_IF_ROLE" },
+ 		{ 97, "VIRTUAL_IF_PARENT" }, { 103, "CURRENT_NETWORK" }, { 106, "RSSI_BOUNDS" }, { 107, "ROAM" },
+-		{ 115, "POWER_DEBUG_INFO" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" }, { 383, "SET_PROPERTY" },
++		{ 115, "POWER_DEBUG_INFO" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" }, { 365, "SENSING_ENABLE" },
++		{ 383, "SET_PROPERTY" },
+ 		{ 473, "MIMO_CONFIG" }, { 481, "HEARTBEAT" }, { 483, "EXTERNAL_POWER_STATE" }, { 485, "APP_STATE" },
+ 		{ 512, "INFRA_ENUMERATED" }, { 560, "PROTOCOL_CLEANUP_COMPLETE" }, { 564, "FILTER_MONITOR_EVENTS" },
+ 		{ 582, "REAL_TIME_3PARTY_APP" },
+@@ -192,15 +193,21 @@ struct apple80211_assoc_ios16 {
+ #define CIPHER_PMK              6
+ #define CIPHER_PASSPHRASE       10
+ 
+-/* the link event's data (at least 32 bytes, or the framework drops the event) */
++/* the link event's data: 44 bytes in iOS 26 (IO80211 checks w2 == 44 at 0x25ca90a7c) */
+ struct apple80211_link_changed {
+-	uint8_t down, unused_0[3];
++	uint8_t down;
++	uint8_t involuntary;
++	int8_t snr;
++	int8_t noise;
+ 	int32_t rssi;
+-	uint16_t snr, noise;
+-	uint8_t unused_1[4];
+-	uint8_t involuntary, unused_2[3];
+-	uint32_t reason, subreason;
+-	uint8_t unused_3[4];
++	uint32_t reason;
++	uint32_t subreason;
++	uint32_t flags;
++	int32_t rssi_ext;
++	int8_t per_chain_rssi[8];
++	int8_t per_chain_noise[8];
++	int8_t bt_coex;
++	uint8_t pad[3];
+ };
+ 
+ _Static_assert(sizeof(struct apple80211_assoc) == 908 && offsetof(struct apple80211_assoc, ssid_length) == 0x10 &&
+@@ -208,8 +215,12 @@ _Static_assert(sizeof(struct apple80211_assoc) == 908 && offsetof(struct apple80
+     "the association request as iOS 26 has it");
+ _Static_assert(sizeof(struct apple80211_assoc_ios16) == 592 && offsetof(struct apple80211_assoc_ios16, key) == 0x48,
+     "the association request as iOS 16.5 has it");
+-_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
+-    "the link event as iOS 16.5 reads it");
++_Static_assert(sizeof(struct apple80211_link_changed) == 44 &&
++    offsetof(struct apple80211_link_changed, rssi) == 0x04 &&
++    offsetof(struct apple80211_link_changed, reason) == 0x08 &&
++    offsetof(struct apple80211_link_changed, rssi_ext) == 0x14 &&
++    offsetof(struct apple80211_link_changed, bt_coex) == 0x28,
++    "the link event as iOS 26 reads it");
+ _Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as iOS 16.5 has it");
+ _Static_assert(sizeof(struct apple80211_channels_info) == 10016 && offsetof(struct apple80211_channels_info, number) == 0x32e &&
+     offsetof(struct apple80211_channels_info, flags) == 0x12d0, "the channels' description as iOS 16.5 has it");
+@@ -234,6 +245,10 @@ static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
+ static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
+ static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+ static char last_scan_uuid[64];                 /* UUID of the last SCAN_REQ, for SCAN_RESULT / CURRENT_NETWORK */
++static uint16_t scan_filter_freqs[64];          /* IO80211 split-scan stage channel filter */
++static unsigned scan_filter_count;
++static bool scan_filter_active;
++static bool scan_directed;                      /* true when SCAN_REQ asked for specific SSID(s) */
+ 
+ /* ---- channels ---------------------------------------------------------------------------------------- */
+ 
+@@ -329,6 +344,9 @@ give_network(const struct apple80211req *request, const struct redwood_sta_bss *
+ 	bzero(result, sizeof(*result));
+ 	result->version = 1;
+ 	channel_fill(&result->channel, bss->frequency, 0);
++	result->noise_known = 1;
++	result->noise = -95;
++	result->snr = bss->rssi > -95 ? (int16_t)(bss->rssi + 95) : 0;
+ 	result->rssi = bss->rssi;
+ 	result->beacon_interval = bss->beacon_interval;
+ 	result->capability = bss->capability;
+@@ -451,16 +469,47 @@ get(struct apple80211req *request)
+ 		return 0;
+ 	case 11: {                              /* what the last scan heard, one access point a request; EIO: that was all */
+ 		struct redwood_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
+-		unsigned index;
+-		bool there;
++		uint16_t freqs[64];
++		unsigned freq_count;
++		bool filter, directed, there = false;
+ 
+ 		if (bss == NULL) {
+ 			return ENOMEM;
+ 		}
+ 		lck_mtx_lock(&apple80211_lock);
+-		index = result_next++;
++		filter = scan_filter_active;
++		directed = scan_directed;
++		freq_count = scan_filter_count;
++		if (freq_count > 0) {
++			memcpy(freqs, scan_filter_freqs, freq_count * sizeof(freqs[0]));
++		}
+ 		lck_mtx_unlock(&apple80211_lock);
+-		there = redwood_sta_heard(index, bss);
++		for (;;) {
++			unsigned index;
++			lck_mtx_lock(&apple80211_lock);
++			index = result_next++;
++			lck_mtx_unlock(&apple80211_lock);
++			if (!redwood_sta_heard(index, bss)) {
++				break;
++			}
++			if (!directed && (bss->ssid_length == 0 || bss->ssid[0] == '\0')) {
++				continue;
++			}
++			if (filter) {
++				bool match = false;
++				for (unsigned j = 0; j < freq_count; j++) {
++					if (freqs[j] == bss->frequency) {
++						match = true;
++						break;
++					}
++				}
++				if (!match) {
++					continue;
++				}
++			}
++			there = true;
++			break;
++		}
+ 		error = there ? give_network(request, bss) : EIO;
+ 		kfree_data(bss, sizeof(*bss));
+ 		return error;
+@@ -562,31 +611,43 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
+ 	}
+ 	what->passive = asked->scan_type == 2;
+ 	what->dwell_ms = asked->dwell_ms;
+-	/* (more channels than there is room to name: every channel) */
+-	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
++	for (unsigned i = 0; i < asked->channel_count && i < 400; i++) {
+ 		unsigned frequency = channel_frequency(&asked->channels[i]);
+ 
+ 		if (frequency != 0) {
+-			what->frequencies[what->frequency_count++] = (uint16_t)frequency;
++			if (what->frequency_count < 64) {
++				what->frequencies[what->frequency_count++] = (uint16_t)frequency;
++			}
+ 		} else {
+ 			unknown++;
+ 		}
+ 	}
+-	snprintf(said, said_size, " (a scan: type %u, %u channels of which %u are not the radio's, %u ms on each, a name of %u bytes, "
+-	    "%u more names, flags %#llx)", asked->scan_type, asked->channel_count, unknown, asked->dwell_ms, asked->ssid_length,
++	if (asked->channel_count != 0 && what->frequency_count == 0) {
++		/*
++		 * IO80211 splits full scans into per-band stages (including a 6 GHz-only
++		 * stage on iOS 26) and aborts the whole scan if any stage returns EINVAL.
++		 * Complete unsupported-band stages immediately with 0 matching results.
++		 */
++		what->skip_radio = true;
++	}
++	snprintf(said, said_size, " (a scan: type %u, %u channels of which %u are not the radio's%s, %u ms on each, a name of %u bytes, "
++	    "%u more names, flags %#llx)", asked->scan_type, asked->channel_count, unknown,
++	    what->skip_radio ? " [skip-band]" : "", asked->dwell_ms, asked->ssid_length,
+ 	    asked->name_count, asked->flags);
+-	if (asked->channel_count != 0 && asked->channel_count <= 64 && what->frequency_count == 0) {
+-		error = EINVAL;                 /* (nothing of what is asked for is a channel of this radio's) */
+-	} else {
+-		lck_mtx_lock(&apple80211_lock);
+-		result_next = 0;
+-		bzero(last_scan_uuid, sizeof(last_scan_uuid));
+-		if (valid_scan_uuid(asked->scan_uuid)) {
+-			memcpy(last_scan_uuid, asked->scan_uuid, sizeof(last_scan_uuid));
+-		}
+-		lck_mtx_unlock(&apple80211_lock);
+-		error = redwood_sta_ask_scan(what);
++	lck_mtx_lock(&apple80211_lock);
++	result_next = 0;
++	scan_directed = (asked->ssid_length != 0 || asked->name_count != 0);
++	scan_filter_active = (asked->channel_count != 0 && what->frequency_count < 64);
++	scan_filter_count = what->frequency_count;
++	if (what->frequency_count > 0) {
++		memcpy(scan_filter_freqs, what->frequencies, what->frequency_count * sizeof(what->frequencies[0]));
++	}
++	bzero(last_scan_uuid, sizeof(last_scan_uuid));
++	if (valid_scan_uuid(asked->scan_uuid)) {
++		memcpy(last_scan_uuid, asked->scan_uuid, sizeof(last_scan_uuid));
+ 	}
++	lck_mtx_unlock(&apple80211_lock);
++	error = redwood_sta_ask_scan(what);
+ out:
+ 	if (asked != NULL) {
+ 		kfree_data(asked, sizeof(*asked));
+@@ -709,6 +770,7 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+ 	}
+ 	case 10:
+ 		return set_scan(request, said, said_size);
++	case 365:                               /* SENSING_ENABLE */
+ 	case 383:                               /* SET_PROPERTY */
+ 	case 473:                               /* MIMO_CONFIG */
+ 	case 481:                               /* HEARTBEAT */
+@@ -771,13 +833,25 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+ 		post(EVENT_ASSOC_DONE, NULL, 0);
+ 		break;
+ 	case REDWOOD_STA_LINK: {
+-		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
+-			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
++		struct apple80211_link_changed link = {
++			.down = status != 1,
++			.involuntary = status != 1 && status != 0,
++			.noise = -95,
++			.reason = status != 1 && status != 0 ? 4 : 0,   /* (4: gone, not asked) */
++		};
+ 		struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+ 
+ 		if (state != NULL) {
+ 			redwood_sta_state(state);
+-			link.rssi = status == 1 ? state->bss.rssi : 0;
++			if (status == 1) {
++				int snr = (int)state->bss.rssi + 95;
++				link.rssi = state->bss.rssi;
++				link.rssi_ext = state->bss.rssi;
++				link.snr = (int8_t)(snr < 0 ? 0 : snr > 127 ? 127 : snr);
++				link.per_chain_rssi[0] = (int8_t)(state->bss.rssi < -127 ? -127 :
++				    state->bss.rssi > 0 ? 0 : state->bss.rssi);
++				link.per_chain_noise[0] = -95;
++			}
+ 			kfree_data(state, sizeof(*state));
+ 		}
+ 		post(EVENT_SSID_CHANGED, NULL, 0);
+diff --git a/bsd/dev/redwood_sta.c b/bsd/dev/redwood_sta.c
+index f4e0490..4c73786 100644
+--- a/bsd/dev/redwood_sta.c
++++ b/bsd/dev/redwood_sta.c
+@@ -141,11 +141,15 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
+ 			bzero(&fallback, sizeof(fallback));
+ 			lck_mtx_unlock(&sta_lock);
+ 		} else if (do_scan) {
+-			error = ops->scan(&scan);
+-			lck_mtx_lock(&sta_lock);
+-			heard_count = 0;
+-			lck_mtx_unlock(&sta_lock);
+-			ops->heard(heard_one, NULL);
++			if (scan.skip_radio) {
++				error = 0;
++			} else {
++				error = ops->scan(&scan);
++				lck_mtx_lock(&sta_lock);
++				heard_count = 0;
++				lck_mtx_unlock(&sta_lock);
++				ops->heard(heard_one, NULL);
++			}
+ 			redwood_apple80211_event(REDWOOD_STA_SCAN_DONE, error);
+ 		}
+ 
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index dec8764..1d5cc18 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -6,36 +6,68 @@
+  * Boot-arg flamecpufreq:
+  *   0       leave ABL boot clocks untouched
+  *   1       all-core max turbo (1785 / 2419 / 2956 MHz; high voltage/heat)
+- *   2       (default) Kryo 485 voltage-knee sweet spot (1632 / 1804 / 2016 MHz;
+- *           -47% package power, runs cool continuously)
+- *   N > 2   highest entry at or below N MHz across all clusters
++ *   2       static voltage-knee sweet spot (1632 / 1805 / 2016 MHz)
++ *   3       (default) dynamic touch + frame-rate OSM governor:
++ *             - Active / Touch / Boot (<45s): 1785 / 2131 / 2419 MHz
++ *             - Screen-On Idle:                941 / 1056 / 1056 MHz
++ *             - Screen-Off Sleep:              576 /  710 /  825 MHz
++ *   N > 3   static highest entry at or below N MHz across all clusters
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <sweet_diag.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern bool sweet_fb_is_blanked(void);
+ void sweet_cpufreq_init(void);
+ 
+-#define OSM_FREQ_REG    0x110u          /* + 32 * index */
+-#define OSM_ROW         32u
+-#define OSM_ROWS        40u
+-#define OSM_DESIRED     0x920u          /* + 4 * core in cluster; core 0 drives the policy */
+-#define OSM_XO_KHZ      19200u
++#define OSM_FREQ_REG            0x110u          /* + 32 * index */
++#define OSM_ROW                 32u
++#define OSM_ROWS                40u
++#define OSM_DESIRED             0x920u          /* + 4 * core in cluster; core 0 drives the policy */
++#define OSM_XO_KHZ              19200u
++#define OSM_CLUSTERS            3u
++#define OSM_GOV_TICK_MS         250u
++#define OSM_BOOT_BOOST_NS       (45ULL * NSEC_PER_SEC)
++#define OSM_TOUCH_BOOST_NS      (1200ULL * NSEC_PER_MSEC)
++
++enum {
++	OSM_TIER_SLEEP  = 0,
++	OSM_TIER_IDLE   = 1,
++	OSM_TIER_ACTIVE = 2,
++	OSM_TIERS       = 3,
++};
+ 
+ static const struct {
+ 	const char *name;
+ 	uint32_t pa;
+ 	unsigned sweet_mhz;
+-} osm_clusters[] = {
+-	{"pwrcl (A55 x4)",    0x18323000u, 1632u},
+-	{"perfcl (A76 x3)",   0x18325800u, 1805u},
+-	{"perfpcl (A76 prime)", 0x18327800u, 2016u},
++	unsigned tier_cap_mhz[OSM_TIERS];       /* SLEEP, IDLE, ACTIVE */
++} osm_clusters[OSM_CLUSTERS] = {
++	{"pwrcl (A55 x4)",     0x18323000u, 1632u, { 576u,  941u, 1786u}},
++	{"perfcl (A76 x3)",    0x18325800u, 1805u, { 711u, 1056u, 2132u}},
++	{"perfpcl (A76 prime)",0x18327800u, 2016u, { 826u, 1056u, 2420u}},
+ };
+ 
++static vm_offset_t osm_base[OSM_CLUSTERS];
++static unsigned osm_tier_idx[OSM_CLUSTERS][OSM_TIERS];
++static unsigned osm_tier_mhz[OSM_CLUSTERS][OSM_TIERS];
++static volatile int osm_cur_tier = OSM_TIER_ACTIVE;
++static volatile bool osm_dyn_ready = false;
++static uint64_t osm_boot_abs;
++static _Atomic uint64_t osm_boost_abs;
++static _Atomic uint64_t osm_swaps;
++static uint64_t osm_last_swaps;
++static thread_call_t osm_gov_call;
++static LCK_GRP_DECLARE(osm_lock_grp, "sweet-cpufreq");
++static LCK_SPIN_DECLARE(osm_lock, &osm_lock_grp);
++
+ static uint32_t
+ osm_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -44,21 +76,119 @@ osm_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++static inline void
++osm_wr_desired(unsigned c, unsigned idx, unsigned mhz)
++{
++	vm_offset_t base = osm_base[c];
++	if (!base) {
++		return;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + OSM_DESIRED) = idx;
++	__asm__ volatile("dsb osh" ::: "memory");
++	sweet_cpufreq_record(c, mhz);
++}
++
++static void
++osm_apply_tier(int tier)
++{
++	if (tier < 0 || tier >= OSM_TIERS) {
++		return;
++	}
++	lck_spin_lock(&osm_lock);
++	if (tier < OSM_TIER_ACTIVE) {
++		uint64_t boost = __c11_atomic_load(&osm_boost_abs, __ATOMIC_RELAXED);
++		uint64_t now = mach_absolute_time(), age_ns = UINT64_MAX;
++		if (boost != 0 && now >= boost) {
++			absolutetime_to_nanoseconds(now - boost, &age_ns);
++		}
++		if (age_ns < OSM_TOUCH_BOOST_NS) {
++			tier = OSM_TIER_ACTIVE;
++		}
++	}
++	if (tier != osm_cur_tier) {
++		osm_cur_tier = tier;
++		for (unsigned c = 0; c < OSM_CLUSTERS; ++c) {
++			osm_wr_desired(c, osm_tier_idx[c][tier], osm_tier_mhz[c][tier]);
++		}
++	}
++	lck_spin_unlock(&osm_lock);
++}
++
++void
++sweet_cpufreq_boost(void)
++{
++	if (!osm_dyn_ready) {
++		return;
++	}
++	__c11_atomic_store(&osm_boost_abs, mach_absolute_time(), __ATOMIC_RELAXED);
++	if (osm_cur_tier != OSM_TIER_ACTIVE) {
++		osm_apply_tier(OSM_TIER_ACTIVE);
++	}
++}
++
++void
++sweet_cpufreq_note_swap(void)
++{
++	__c11_atomic_fetch_add(&osm_swaps, 1u, __ATOMIC_RELAXED);
++	if (osm_dyn_ready && osm_cur_tier == OSM_TIER_SLEEP) {
++		osm_apply_tier(OSM_TIER_IDLE);
++	}
++}
++
++static void
++osm_gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	uint64_t now = mach_absolute_time();
++	uint64_t boot_ns = 0, touch_ns = UINT64_MAX;
++	if (now >= osm_boot_abs) {
++		absolutetime_to_nanoseconds(now - osm_boot_abs, &boot_ns);
++	}
++	uint64_t boost = __c11_atomic_load(&osm_boost_abs, __ATOMIC_RELAXED);
++	if (boost != 0 && now >= boost) {
++		absolutetime_to_nanoseconds(now - boost, &touch_ns);
++	}
++	uint64_t swaps = __c11_atomic_load(&osm_swaps, __ATOMIC_RELAXED);
++	uint64_t delta_swaps = swaps - osm_last_swaps;
++	osm_last_swaps = swaps;
++
++	int want_tier;
++	if (boot_ns < OSM_BOOT_BOOST_NS || touch_ns < OSM_TOUCH_BOOST_NS || delta_swaps >= 4u) {
++		want_tier = OSM_TIER_ACTIVE;
++	} else if (sweet_fb_is_blanked()) {
++		want_tier = OSM_TIER_SLEEP;
++	} else {
++		want_tier = OSM_TIER_IDLE;
++	}
++	osm_apply_tier(want_tier);
++
++	uint64_t deadline = 0;
++	clock_interval_to_deadline(OSM_GOV_TICK_MS, NSEC_PER_MSEC, &deadline);
++	thread_call_enter_delayed(osm_gov_call, deadline);
++}
++
+ void
+ sweet_cpufreq_init(void)
+ {
+-	unsigned want = 2;
++	unsigned want = 3;
+ 	(void)PE_parse_boot_argn("flamecpufreq", &want, sizeof(want));
+-	for (unsigned c = 0; c < sizeof(osm_clusters) / sizeof(osm_clusters[0]); ++c) {
++	osm_boot_abs = mach_absolute_time();
++	unsigned mapped = 0;
++
++	for (unsigned c = 0; c < OSM_CLUSTERS; ++c) {
+ 		vm_offset_t base = ml_io_map(osm_clusters[c].pa, 0x1000);
+ 		if (!base) {
+ 			printf("SWEET CPUFREQ: %s: map failed\n", osm_clusters[c].name);
+ 			continue;
+ 		}
++		osm_base[c] = base;
+ 		unsigned cap_mhz = (want == 2) ? osm_clusters[c].sweet_mhz :
+-		    ((want > 2) ? want : 0u);
++		    (want == 3) ? osm_clusters[c].tier_cap_mhz[OSM_TIER_ACTIVE] :
++		    ((want > 3) ? want : 0u);
+ 		uint32_t cur = osm_rd(base, OSM_DESIRED);
+ 		unsigned best = cur, best_khz = 0, prev_khz = 0, n = 0;
++		unsigned t_idx[OSM_TIERS] = { cur, cur, cur };
++		unsigned t_khz[OSM_TIERS] = { 0, 0, 0 };
+ 		char line[256];
+ 		unsigned len = 0;
+ 		for (unsigned i = 0; i < OSM_ROWS; ++i) {
+@@ -74,7 +204,16 @@ sweet_cpufreq_init(void)
+ 				len += snprintf(line + len, sizeof(line) - len, " %u%s", khz / 1000,
+ 				    cores == 1 ? "*" : "");
+ 			}
+-			if (cores == 1 || (cap_mhz > 0 && khz / 1000 > cap_mhz)) {
++			if (cores == 1) {
++				continue;
++			}
++			for (unsigned t = 0; t < OSM_TIERS; ++t) {
++				if (khz / 1000 <= osm_clusters[c].tier_cap_mhz[t] && khz > t_khz[t]) {
++					t_khz[t] = khz;
++					t_idx[t] = i;
++				}
++			}
++			if (cap_mhz > 0 && khz / 1000 > cap_mhz) {
+ 				continue;
+ 			}
+ 			if (khz > best_khz) {
+@@ -82,17 +221,32 @@ sweet_cpufreq_init(void)
+ 				best = i;
+ 			}
+ 		}
++		for (unsigned t = 0; t < OSM_TIERS; ++t) {
++			osm_tier_idx[c][t] = t_khz[t] ? t_idx[t] : best;
++			osm_tier_mhz[c][t] = (t_khz[t] ? t_khz[t] : best_khz) / 1000;
++		}
+ 		printf("SWEET CPUFREQ: %s table (MHz, *=1-core boost):%s\n", osm_clusters[c].name, line);
+ 		if (want == 0 || best_khz == 0 || best >= n) {
+ 			printf("SWEET CPUFREQ: %s index %u kept\n", osm_clusters[c].name, cur);
+ 			continue;
+ 		}
+-		__asm__ volatile("dmb oshst" ::: "memory");
+-		*(volatile uint32_t *)(base + OSM_DESIRED) = best;
+-		__asm__ volatile("dsb osh" ::: "memory");
+-		sweet_cpufreq_record(c, best_khz / 1000);
+-		printf("SWEET CPUFREQ: %s index %u -> %u (%u MHz), reads back %u\n",
+-		    osm_clusters[c].name, cur, best, best_khz / 1000, osm_rd(base, OSM_DESIRED));
++		osm_wr_desired(c, best, best_khz / 1000);
++		mapped++;
++		printf("SWEET CPUFREQ: %s index %u -> %u (%u MHz), reads back %u (sleep=%u idle=%u active=%u MHz)\n",
++		    osm_clusters[c].name, cur, best, best_khz / 1000, osm_rd(base, OSM_DESIRED),
++		    osm_tier_mhz[c][OSM_TIER_SLEEP], osm_tier_mhz[c][OSM_TIER_IDLE], osm_tier_mhz[c][OSM_TIER_ACTIVE]);
++	}
++
++	if (want == 3 && mapped > 0) {
++		osm_gov_call = thread_call_allocate(osm_gov_tick, NULL);
++		if (osm_gov_call != NULL) {
++			osm_cur_tier = OSM_TIER_ACTIVE;
++			osm_dyn_ready = true;
++			uint64_t deadline = 0;
++			clock_interval_to_deadline(OSM_GOV_TICK_MS, NSEC_PER_MSEC, &deadline);
++			thread_call_enter_delayed(osm_gov_call, deadline);
++			printf("SWEET CPUFREQ: dynamic OSM governor active (tick=%u ms)\n", OSM_GOV_TICK_MS);
++		}
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 8b0fbda..4a6148f 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -293,7 +293,7 @@ sweet_gpu_init(void)
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+ 	a6_init_state(&gpu, ptoa_64(pn));
+-	uint32_t lvl = 6;	/* 675 MHz on SM8150-AC (585 on SM8150); boot-arg sweetgpufreq=1..6 */
++	uint32_t lvl = 4;	/* 499 MHz SVS_L2 sweet spot on SM8150-AC; boot-arg sweetgpufreq=1..6 */
+ 	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
+ 	gpu.perf_level = lvl;
+ 	pool_kva = va;
+diff --git a/bsd/sys/redwood_sta.h b/bsd/sys/redwood_sta.h
+index c5ed067..15b2ce1 100644
+--- a/bsd/sys/redwood_sta.h
++++ b/bsd/sys/redwood_sta.h
+@@ -39,6 +39,7 @@ struct redwood_sta_scan {
+ 	uint8_t ssid[32], ssid_length;          /* ask for this network by name (a hidden one answers only then) */
+ 	uint16_t frequencies[64], frequency_count;      /* only these channels */
+ 	bool passive;                           /* only listen */
++	bool skip_radio;                        /* stage asks only for channels this radio lacks (e.g. 6 GHz) */
+ 	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
+ };
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index dc07f26..615e43d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -859,6 +859,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBSwapBegin:
++		sweet_cpufreq_note_swap();
+ 		IOLockLock(fFB->fLock);
+ 		out[0] = ++fFB->fSwapID;
+ 		IOLockUnlock(fFB->fLock);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 29ce4c7..fdc6d68 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -625,6 +625,7 @@ sweet_hid_key(int key, int down)
+ 		kHIDUsage_Csmr_VolumeDecrement, kHIDUsage_Csmr_Menu,
+ 	};
+ 
++	sweet_cpufreq_boost();
+ 	if (gSweetButtons && key >= 0 && key < (int)(sizeof(usages) / sizeof(usages[0]))) {
+ 		gSweetButtons->key(usages[key], down != 0);
+ 	}
+@@ -633,6 +634,7 @@ sweet_hid_key(int key, int down)
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
++	sweet_cpufreq_boost();
+ 	if (gSweetTouch) {
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+-- 
+2.43.0
+
