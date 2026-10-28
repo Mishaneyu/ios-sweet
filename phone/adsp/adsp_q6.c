@@ -197,7 +197,9 @@ apr_call_ex(uint8_t svc, uint16_t src_port, uint16_t dst_port, uint32_t opcode,
 		next_cmd_token = 1u;
 	}
 	if (svc == APR_SVC_ASM) {
-		tok = ((seq & 0x7fffu) << 16) | (src_port & 0xff00u);
+		uint16_t sess_bits = (src_port & 0xff00u) ?
+		    (src_port & 0xff00u) : (uint16_t)(ASM_SESSION_ID << 8);
+		tok = ((seq & 0x7fffu) << 16) | sess_bits;
 	} else {
 		tok = seq;
 	}
@@ -506,8 +508,8 @@ q6asm_map_dma_pool(void)
 	} __attribute__((packed)) map_cmd = {
 		.mem_pool_id    = 3u, /* ADSP_MEMORY_MAP_SHMEM8_4K_POOL */
 		.num_regions    = 1u,
-		.property_flag  = 0u, /* physical / S1-bypass IOVA */
-		.shm_addr_lsw   = (uint32_t)(ADSP_DMA_PA & 0xffffffffu),
+		.property_flag  = 0u, /* physical / SMMU Stage-1 IOVA */
+		.shm_addr_lsw   = ADSP_DMA_IOVA,
 		.shm_addr_msw   = ADSP_DSP_IOVA_HIGH,
 		.mem_size_bytes = ADSP_DMA_TOTAL_BYTES,
 	};
@@ -522,8 +524,8 @@ q6asm_map_dma_pool(void)
 		return -1;
 	}
 	g_status.asm_map_handle = words[0];
-	adsp_log("q6asm: mapped DMA 0x%x:%08x (%u B) -> handle=0x%x",
-	    ADSP_DSP_IOVA_HIGH, (uint32_t)ADSP_DMA_PA,
+	adsp_log("q6asm: mapped DMA IOVA 0x%x:%08x -> PA 0x%llx (%u B) handle=0x%x",
+	    ADSP_DSP_IOVA_HIGH, ADSP_DMA_IOVA, (unsigned long long)ADSP_DMA_PA,
 	    ADSP_DMA_TOTAL_BYTES, g_status.asm_map_handle);
 	return 0;
 }
@@ -531,7 +533,7 @@ q6asm_map_dma_pool(void)
 static int
 q6_send_period_write(uint32_t idx)
 {
-	uint64_t pa = ADSP_DMA_PA + (uint64_t)idx * ADSP_DMA_PERIOD_ALLOC;
+	uint32_t iova = ADSP_DMA_IOVA + idx * ADSP_DMA_PERIOD_ALLOC;
 	struct {
 		uint32_t buf_addr_lsw;
 		uint32_t buf_addr_msw;
@@ -542,14 +544,14 @@ q6_send_period_write(uint32_t idx)
 		uint32_t timestamp_msw;
 		uint32_t flags;
 	} __attribute__((packed)) wr = {
-		.buf_addr_lsw   = (uint32_t)(pa & 0xffffffffu),
+		.buf_addr_lsw   = iova,
 		.buf_addr_msw   = ADSP_DSP_IOVA_HIGH,
 		.mem_map_handle = g_status.asm_map_handle,
 		.avail_bytes    = ADSP_PCM_PERIOD_BYTES,
 		.uid            = idx,
 		.timestamp_lsw  = 0,
 		.timestamp_msw  = 0,
-		.flags          = 0,
+		.flags          = 0x80000000u, /* BIT(31): ignore timestamp (q6asm_write) */
 	};
 
 	period_ready[idx] = 0;
@@ -1145,12 +1147,14 @@ adsp_q6_bringup_playback(void)
 		snprintf(g_status.last_error, sizeof(g_status.last_error), "apps_smmu 0x1b21 setup failed");
 		return -1;
 	}
+	adsp_status_write();
 
 	if (q6core_wait_ready(15000) != 0) {
 		snprintf(g_status.last_error, sizeof(g_status.last_error), "Q6Core AVCS not ready");
 		return -1;
 	}
 	g_status.audiopd_spawned = true;
+	adsp_status_write();
 	tlmm_setup_quat_mi2s();
 
 	{
@@ -1171,11 +1175,13 @@ adsp_q6_bringup_playback(void)
 		return -1;
 	}
 	g_status.afe_quat_rx_up = true;
+	adsp_status_write();
 
 	/* Initialize MAX98937L@0x39 & MAX98937R@0x3a while I2S BCLK/WS are live */
 	if (max98927_init_stereo() != 0) {
 		adsp_log("max98937: warning: neither 0x39 nor 0x3a responded to probe");
 	}
+	adsp_status_write();
 
 	if (q6_open_media_stream() != 0) {
 		snprintf(g_status.last_error, sizeof(g_status.last_error), "Q6ADM/Q6ASM stream open failed");

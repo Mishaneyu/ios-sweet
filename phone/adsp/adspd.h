@@ -35,6 +35,7 @@
  * SID 0x1b21 maps via (1ULL << 32) through our apps_smmu Stage-1 L1 page table.
  */
 #define ADSP_DMA_PA                 0xC0000000ULL
+#define ADSP_DMA_IOVA               0x10000000u   /* msm_audio_ion va_start (bit 31=0) */
 #define ADSP_DMA_PERIODS            8u
 #define ADSP_DMA_PERIOD_ALLOC       4096u
 #define ADSP_DMA_TOTAL_BYTES        (ADSP_DMA_PERIODS * ADSP_DMA_PERIOD_ALLOC) /* 32768 B */
@@ -42,8 +43,10 @@
 #define ADSP_PCM_PERIOD_BYTES       (ADSP_PCM_PERIOD_FRAMES * HAKIOS_AUDIO_FRAME) /* 3840 B */
 #define ADSP_DSP_IOVA_HIGH          0x00000001u
 
-/* 4 KiB ARMv8-A Stage-1 Level-1 page table (1 GiB blocks) for apps_smmu */
-#define ADSP_SMMU_PT_PA             0xC0008000ULL
+/* 3-level VMSAv8-64 Stage-1 page tables (qcom,use-3-lvl-tables) for apps_smmu */
+#define ADSP_SMMU_PT_PA             0xC0008000ULL /* L1 table */
+#define ADSP_SMMU_L2_PA             0xC0009000ULL /* L2 table (0x10000000..0x101FFFFF) */
+#define ADSP_SMMU_L3_PA             0xC000A000ULL /* L3 4 KiB pages -> 0xC0000000 */
 #define ADSP_SMMU_PT_SIZE           0x00001000ULL
 
 /*

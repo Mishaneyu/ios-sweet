@@ -69,6 +69,9 @@ adsp_log(const char *fmt, ...)
 	line[n++] = '\n';
 	line[n] = '\0';
 	(void)write(STDOUT_FILENO, line, (size_t)n);
+	if (!g_status.asm_stream_up) {
+		(void)fsync(STDOUT_FILENO);
+	}
 }
 
 static void
@@ -194,6 +197,9 @@ adsp_status_write(void)
 	fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
 	if (fd >= 0) {
 		(void)write(fd, buf, (size_t)n);
+		if (!g_status.asm_stream_up) {
+			(void)fsync(fd);
+		}
 		close(fd);
 		(void)rename(tmp_path, ADSP_STATUS_PATH);
 	}
