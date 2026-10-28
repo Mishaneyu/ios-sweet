@@ -24,7 +24,7 @@ build() {	# NAME SOURCE [FLAGS...]
 		codesign -f -s - "out/$name"
 	fi
 }
-for c in membw pstack psx sweetdiag sweet-idle-xpc; do build $c $c.c; done
+for c in membw pstack psx sweetdiag sweet-idle-xpc sweet-bootprep; do build $c $c.c; done
 for m in expt exq nettest openapp oslog prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
 build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics
 build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices

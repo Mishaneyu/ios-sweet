@@ -84,6 +84,7 @@ SKIP_LABELS = {
     'com.apple.PerfPowerTelemetryClientRegistrationService',
     'com.apple.perfpowermetricd',
     'com.apple.audioaccessoryd',
+    'com.apple.cloudpaird',
     'com.apple.nfcd',
     'com.apple.seld',
     'com.apple.softposreaderd',
@@ -117,6 +118,7 @@ SKIP_PLISTS = {
     'com.apple.PerfPowerTelemetryClientRegistrationService.plist',
     'com.apple.perfpowermetricd.plist',
     'com.apple.audioaccessoryd.plist',
+    'com.apple.cloudpaird.plist',
     'com.apple.nfcd.plist',
     'com.apple.seld.plist',
     'com.apple.softposreaderd.plist',
@@ -137,6 +139,35 @@ SKIP_PLISTS = {
 SKIP_PREFIXES = (
     '/System/Library/NanoLaunchDaemons/',
 )
+
+IDLE_XPC_KEY = '/System/Library/LaunchDaemons/org.iosonpixel.idlexpc.plist'
+IDLE_XPC_MACH_SERVICES = (
+    'com.apple.BTAudioHALPlugin.xpc',
+    'com.apple.DeviceAccess.xpc',
+    'com.apple.bluetooth.xpc',
+)
+
+
+def ensure_idle_xpc_daemon(jobs):
+    """Claim absent Bluetooth/DeviceAccess XPC MachServices via sweet-idle-xpc to prevent lookup storms."""
+    claimed = {
+        svc
+        for k, j in jobs.items()
+        if k != IDLE_XPC_KEY and isinstance(j, dict) and isinstance(j.get('MachServices'), dict)
+        for svc in j['MachServices']
+    }
+    mach_svcs = {svc: True for svc in IDLE_XPC_MACH_SERVICES if svc not in claimed}
+    if mach_svcs:
+        jobs[IDLE_XPC_KEY] = {
+            'KeepAlive': False,
+            'Label': 'org.iosonpixel.idlexpc',
+            'MachServices': mach_svcs,
+            'ProcessType': 'Background',
+            'ProgramArguments': ['/var/local/bin/sweet-idle-xpc'],
+            'RunAtLoad': False,
+            'UserName': 'root',
+        }
+    return sorted(mach_svcs)
 
 
 def clean_launchd_plist(plist):
@@ -163,6 +194,8 @@ def launchd(root):
     st = os.stat(path)
     plist = load(path)
     renamed, removed = clean_launchd_plist(plist)
+    if os.path.isfile(os.path.join(root, 'private/var/local/bin/sweet-idle-xpc')):
+        ensure_idle_xpc_daemon(plist['LaunchDaemons'])
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} unsupported hw/ANE/Nano jobs removed')
 

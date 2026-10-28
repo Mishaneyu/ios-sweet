@@ -17,6 +17,12 @@ import stat
 import struct
 import sys
 import tarfile
+import zlib
+
+CPBITMAP_FORMAT_PNG = 4
+CPBITMAP_MAGIC = 0xDCB543A2
+TIMED_UID = 266
+MOBILE_UID = 501
 
 KEEP_DAEMON_KEYS = (
     '/System/Library/LaunchDaemons/com.apple.lsd.plist',
@@ -203,6 +209,240 @@ def add_ustar_symlink(tf, rel_path, target):
     tf.addfile(ti)
 
 
+def _decode_png_rgb(png_bytes):
+    """Decode an 8-bit non-interlaced PNG into contiguous 24-bit RGB bytes (pure stdlib)."""
+    if png_bytes[:8] != b'\x89PNG\r\n\x1a\n':
+        raise ValueError('input wallpaper is not a valid PNG file')
+    pos = 8
+    w = h = bit_depth = color_type = interlace = None
+    palette = None
+    idat_parts = []
+    while pos + 8 <= len(png_bytes):
+        clen, ctype = struct.unpack_from('>I4s', png_bytes, pos)
+        pos += 8
+        cdata = png_bytes[pos:pos + clen]
+        pos += clen + 4  # skip CRC
+        if ctype == b'IHDR':
+            w, h, bit_depth, color_type, comp, filt, interlace = struct.unpack('>IIBBBBB', cdata[:13])
+            if bit_depth != 8 or comp != 0 or filt != 0 or interlace != 0:
+                raise ValueError(f'unsupported PNG format: depth={bit_depth} color={color_type} interlace={interlace}')
+            if color_type not in (0, 2, 3, 4, 6):
+                raise ValueError(f'unsupported PNG color_type={color_type}')
+        elif ctype == b'PLTE':
+            palette = cdata
+        elif ctype == b'IDAT':
+            idat_parts.append(cdata)
+        elif ctype == b'IEND':
+            break
+    if not w or not h:
+        raise ValueError('PNG missing IHDR')
+    bpp = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
+    stride = w * bpp
+    raw = zlib.decompress(b''.join(idat_parts))
+    expected = h * (1 + stride)
+    if len(raw) < expected:
+        raise ValueError(f'short decompressed PNG stream ({len(raw)} < {expected})')
+
+    prev = bytearray(stride)
+    rgb = bytearray(w * h * 3)
+    src_off = 0
+    for y in range(h):
+        ftype = raw[src_off]
+        src_off += 1
+        cur = bytearray(raw[src_off:src_off + stride])
+        src_off += stride
+        if ftype == 1:  # Sub
+            for i in range(bpp, stride):
+                cur[i] = (cur[i] + cur[i - bpp]) & 0xFF
+        elif ftype == 2:  # Up
+            for i in range(stride):
+                cur[i] = (cur[i] + prev[i]) & 0xFF
+        elif ftype == 3:  # Average
+            for i in range(bpp):
+                cur[i] = (cur[i] + (prev[i] >> 1)) & 0xFF
+            for i in range(bpp, stride):
+                cur[i] = (cur[i] + ((cur[i - bpp] + prev[i]) >> 1)) & 0xFF
+        elif ftype == 4:  # Paeth
+            for i in range(bpp):
+                cur[i] = (cur[i] + prev[i]) & 0xFF
+            for i in range(bpp, stride):
+                a = cur[i - bpp]
+                b = prev[i]
+                c = prev[i - bpp]
+                p = a + b - c
+                pa = p - a if p >= a else a - p
+                pb = p - b if p >= b else b - p
+                pc = p - c if p >= c else c - p
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                cur[i] = (cur[i] + pr) & 0xFF
+        elif ftype != 0:
+            raise ValueError(f'unknown PNG scanline filter {ftype} at row {y}')
+
+        dst_off = y * w * 3
+        if color_type == 2:
+            rgb[dst_off:dst_off + w * 3] = cur
+        elif color_type == 6:
+            alphas = cur[3::4]
+            if min(alphas) == 255:
+                rgb[dst_off:dst_off + w * 3:3] = cur[0::4]
+                rgb[dst_off + 1:dst_off + w * 3:3] = cur[1::4]
+                rgb[dst_off + 2:dst_off + w * 3:3] = cur[2::4]
+            else:
+                for x in range(w):
+                    si = x * 4
+                    di = dst_off + x * 3
+                    al = cur[si + 3]
+                    rgb[di] = (cur[si] * al + 127) // 255
+                    rgb[di + 1] = (cur[si + 1] * al + 127) // 255
+                    rgb[di + 2] = (cur[si + 2] * al + 127) // 255
+        elif color_type == 0:
+            rgb[dst_off:dst_off + w * 3:3] = cur
+            rgb[dst_off + 1:dst_off + w * 3:3] = cur
+            rgb[dst_off + 2:dst_off + w * 3:3] = cur
+        elif color_type == 4:
+            for x in range(w):
+                v = (cur[x * 2] * cur[x * 2 + 1] + 127) // 255
+                di = dst_off + x * 3
+                rgb[di] = rgb[di + 1] = rgb[di + 2] = v
+        elif color_type == 3:
+            if not palette:
+                raise ValueError('indexed PNG missing PLTE chunk')
+            for x in range(w):
+                pi = cur[x] * 3
+                di = dst_off + x * 3
+                rgb[di:di + 3] = palette[pi:pi + 3]
+        prev = cur
+    return w, h, bytes(rgb)
+
+
+def _resize_rgb_cover(rgb, src_w, src_h, dst_w, dst_h):
+    """Center-crop (aspect-fill) and bilinear-resample 24-bit RGB to dst_w x dst_h."""
+    if src_w == dst_w and src_h == dst_h:
+        return rgb
+    src_aspect = src_w / src_h
+    dst_aspect = dst_w / dst_h
+    if src_aspect > dst_aspect:
+        crop_h = float(src_h)
+        crop_w = crop_h * dst_aspect
+        off_x = (src_w - crop_w) * 0.5
+        off_y = 0.0
+    else:
+        crop_w = float(src_w)
+        crop_h = crop_w / dst_aspect
+        off_x = 0.0
+        off_y = (src_h - crop_h) * 0.5
+
+    scale_x = crop_w / dst_w
+    scale_y = crop_h / dst_h
+    max_x = src_w - 1
+    max_y = src_h - 1
+
+    x_tab = []
+    for dx in range(dst_w):
+        sx = off_x + (dx + 0.5) * scale_x - 0.5
+        if sx <= 0.0:
+            ix0 = ix1 = 0
+            wx1 = 0
+        elif sx >= max_x:
+            ix0 = ix1 = max_x
+            wx1 = 0
+        else:
+            ix0 = int(sx)
+            ix1 = ix0 + 1
+            wx1 = int((sx - ix0) * 256.0 + 0.5)
+        x_tab.append((ix0 * 3, ix1 * 3, 256 - wx1, wx1))
+
+    h_cache = {}
+    src_stride = src_w * 3
+    dst_stride = dst_w * 3
+
+    def get_hrow(iy):
+        row = h_cache.get(iy)
+        if row is not None:
+            return row
+        base = iy * src_stride
+        srow = rgb[base:base + src_stride]
+        out_r = bytearray(dst_stride)
+        di = 0
+        for o0, o1, wx0, wx1 in x_tab:
+            out_r[di] = (srow[o0] * wx0 + srow[o1] * wx1 + 128) >> 8
+            out_r[di + 1] = (srow[o0 + 1] * wx0 + srow[o1 + 1] * wx1 + 128) >> 8
+            out_r[di + 2] = (srow[o0 + 2] * wx0 + srow[o1 + 2] * wx1 + 128) >> 8
+            di += 3
+        h_cache[iy] = out_r
+        return out_r
+
+    out = bytearray(dst_h * dst_stride)
+    for dy in range(dst_h):
+        sy = off_y + (dy + 0.5) * scale_y - 0.5
+        if sy <= 0.0:
+            iy0 = iy1 = 0
+            wy1 = 0
+        elif sy >= max_y:
+            iy0 = iy1 = max_y
+            wy1 = 0
+        else:
+            iy0 = int(sy)
+            iy1 = iy0 + 1
+            wy1 = int((sy - iy0) * 256.0 + 0.5)
+        r0 = get_hrow(iy0)
+        d_off = dy * dst_stride
+        if wy1 == 0 or iy0 == iy1:
+            out[d_off:d_off + dst_stride] = r0
+        else:
+            r1 = get_hrow(iy1)
+            wy0 = 256 - wy1
+            out[d_off:d_off + dst_stride] = bytes(
+                (a * wy0 + b * wy1 + 128) >> 8 for a, b in zip(r0, r1)
+            )
+    return bytes(out)
+
+
+def _png_chunk(ctype, cdata):
+    crc = zlib.crc32(ctype)
+    crc = zlib.crc32(cdata, crc) & 0xFFFFFFFF
+    return struct.pack('>I4s', len(cdata), ctype) + cdata + struct.pack('>I', crc)
+
+
+def _encode_png_rgb(rgb, width, height):
+    """Encode contiguous 24-bit RGB bytes as a standard 8-bit PNG (pure stdlib)."""
+    stride = width * 3
+    scanlines = bytearray(height * (1 + stride))
+    for y in range(height):
+        soff = y * stride
+        doff = y * (1 + stride)
+        scanlines[doff] = 1  # Sub filter
+        row = rgb[soff:soff + stride]
+        scanlines[doff + 1:doff + 4] = row[:3]
+        scanlines[doff + 4:doff + 1 + stride] = bytes(
+            (b - a) & 0xFF for a, b in zip(row, row[3:])
+        )
+    ihdr = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)
+    idat = zlib.compress(bytes(scanlines), 9)
+    return (
+        b'\x89PNG\r\n\x1a\n'
+        + _png_chunk(b'IHDR', ihdr)
+        + _png_chunk(b'IDAT', idat)
+        + _png_chunk(b'IEND', b'')
+    )
+
+
+def _encode_cpbitmap_png(png_bytes, width, height):
+    """Wrap PNG bytes in an AppSupport CPBitmap v2 container (format=4 PNG, magic=0xdcb543a2)."""
+    trailer = struct.pack('<7I', 0, 0, width, height, CPBITMAP_FORMAT_PNG, 1, CPBITMAP_MAGIC)
+    return png_bytes + trailer
+
+
+def _parse_wh(spec):
+    parts = spec.lower().split('x')
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        raise ValueError(f'invalid --wallpaper-size {spec!r}, expected WxH (e.g. 1125x2436)')
+    w, h = int(parts[0]), int(parts[1])
+    if w < 16 or h < 16:
+        raise ValueError(f'wallpaper dimensions too small: {w}x{h}')
+    return w, h
+
+
 def add_tree(tf, src_dir, dst_prefix, force_exec_names=()):
     dst_prefix = dst_prefix.strip('/')
     add_ustar_dir(tf, dst_prefix, 0o755)
@@ -234,8 +474,16 @@ def main():
     ap.add_argument('--userland-dir', help='optional extracted userland dir (Applications/, HAL/, bin/, lib/)')
     ap.add_argument('--dsc-stubs-dir', help='optional dir of de-PACd dyld_shared_cache_arm64e.* stub subcaches')
     ap.add_argument('--mtl2-clients',
-                    default='*\n-chronod\n-cameracaptured\n-iconservicesagent\n-WidgetRenderer_Default',
+                    default='*\n-cameracaptured\n-WidgetRenderer_Default',
                     help='/private/var/local/mtl2-clients content')
+    ap.add_argument('--wallpaper', help='optional PNG image to stage as Lock Screen and Home Screen wallpaper')
+    ap.add_argument('--wallpaper-size', default='1125x2499',
+                    help='target WxH for full-size wallpaper (default: 1125x2499)')
+    ap.add_argument('--timezone', default='Asia/Kolkata',
+                    help='system IANA timezone (default: Asia/Kolkata; empty string disables)')
+    ap.add_argument('--enable-cellular', action='store_true',
+                    help='register org.iosonpixel.cellulard LaunchDaemon (CoreTelephony XPC + QRTR QMI)')
+    ap.add_argument('--wland-wrapper', help='optional wrapper path for org.iosonpixel.wland ProgramArguments[0]')
     ap.add_argument('--selftest-bin', help='optional compiled arm64 self-test Mach-O for guarded test boots')
     ap.add_argument('--selftest-script', help='optional bring-up self-test shell script for guarded test boots')
     ap.add_argument('--extra', action='append', default=[],
@@ -243,10 +491,18 @@ def main():
     args = ap.parse_args()
 
     tweaks = _load_tweaks_module()
+    tz_name = (args.timezone or '').strip().strip('/')
 
     build_ver, prod_ver = '23F84', '26.5.2'
     jetsam_bytes, j_uid, j_gid, j_mode = None, 0, 0, 0o644
     blastdoor_plists = []
+    mobile_global_prefs = {'AppleLocale': 'en_US', 'AppleLanguages': ['en']}
+    sys_global_prefs = {}
+    sb_ff_plist = None
+    has_idle_xpc = bool(
+        args.userland_dir and os.path.isfile(os.path.join(args.userland_dir, 'bin', 'sweet-idle-xpc'))
+    )
+
     if args.launchd_plist:
         with open(args.launchd_plist, 'rb') as f:
             raw_plist = f.read()
@@ -286,6 +542,39 @@ def main():
                     blastdoor_plists.append((bd_rel, plistlib.dumps(bd_plist, fmt=plistlib.FMT_BINARY), bd_mode, bd_uid, bd_gid))
                 except FileNotFoundError:
                     pass
+            if not has_idle_xpc:
+                try:
+                    hfs.read_file('/private/var/local/bin/sweet-idle-xpc')
+                    has_idle_xpc = True
+                except FileNotFoundError:
+                    pass
+            if tz_name:
+                tz_rel = f'/usr/share/zoneinfo.default/{tz_name}'
+                raw_tz, _, _, _ = hfs.read_file(tz_rel)
+                if len(raw_tz) < 20 or raw_tz[:4] != b'TZif':
+                    raise ValueError(f'{tz_rel} in root image is not a valid TZif file')
+                try:
+                    raw_mgp, _, _, _ = hfs.read_file('/private/var/mobile/Library/Preferences/.GlobalPreferences.plist')
+                    loaded_mgp = plistlib.loads(raw_mgp)
+                    if isinstance(loaded_mgp, dict):
+                        mobile_global_prefs.update(loaded_mgp)
+                except FileNotFoundError:
+                    pass
+                try:
+                    raw_sgp, _, _, _ = hfs.read_file('/private/var/preferences/.GlobalPreferences.plist')
+                    loaded_sgp = plistlib.loads(raw_sgp)
+                    if isinstance(loaded_sgp, dict):
+                        sys_global_prefs.update(loaded_sgp)
+                except FileNotFoundError:
+                    pass
+            if args.wallpaper:
+                try:
+                    raw_ff, _, _, _ = hfs.read_file('/System/Library/FeatureFlags/Domain/SpringBoard.plist')
+                    loaded_ff = plistlib.loads(raw_ff)
+                    if isinstance(loaded_ff, dict):
+                        sb_ff_plist = loaded_ff
+                except FileNotFoundError:
+                    pass
         finally:
             hfs.close()
 
@@ -308,6 +597,9 @@ def main():
         jobs[wl_key]['ProcessType'] = 'Interactive'
         jobs[wl_key]['LowPriorityIO'] = False
         jobs[wl_key]['LegacyTimers'] = True
+        if args.wland_wrapper:
+            jobs[wl_key].pop('Program', None)
+            jobs[wl_key]['ProgramArguments'] = [args.wland_wrapper, 'auto']
 
     diag_key = '/System/Library/LaunchDaemons/org.iosonpixel.sweetdiag.plist'
     if diag_key in jobs:
@@ -325,6 +617,27 @@ def main():
         'StandardOutPath': '/var/local/sweetstored.log',
         'UserName': 'root',
     }
+
+    idle_svcs = []
+    if has_idle_xpc:
+        idle_svcs = tweaks.ensure_idle_xpc_daemon(jobs)
+
+    if args.enable_cellular:
+        jobs['/System/Library/LaunchDaemons/org.iosonpixel.cellulard.plist'] = {
+            'EnvironmentVariables': {'PATH': '/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'},
+            'KeepAlive': True,
+            'Label': 'org.iosonpixel.cellulard',
+            'MachServices': {
+                'com.apple.commcenter.coretelephony.xpc': True,
+                'com.apple.commcenter.xpc': True,
+            },
+            'ProcessType': 'Interactive',
+            'ProgramArguments': ['/var/local/bin/cellulard'],
+            'RunAtLoad': True,
+            'StandardErrorPath': '/var/local/cellulard.log',
+            'StandardOutPath': '/var/local/cellulard.log',
+            'UserName': 'root',
+        }
 
     if args.selftest_bin or args.selftest_script:
         prog_args = (['/private/var/local/bin/sweet-selftest'] if args.selftest_bin
@@ -346,6 +659,61 @@ def main():
     if missing_keep:
         raise RuntimeError(f'refusing to build overlay: required LaunchDaemons missing: {missing_keep}')
 
+    wp_assets = None
+    wp_defaults = {}
+    if args.wallpaper:
+        wp_w, wp_h = _parse_wh(args.wallpaper_size)
+        th_w, th_h = max(1, wp_w // 3), max(1, wp_h // 3)
+        with open(args.wallpaper, 'rb') as f:
+            src_png = f.read()
+        src_w, src_h, src_rgb = _decode_png_rgb(src_png)
+        full_rgb = _resize_rgb_cover(src_rgb, src_w, src_h, wp_w, wp_h)
+        thumb_rgb = _resize_rgb_cover(src_rgb, src_w, src_h, th_w, th_h)
+        full_png = _encode_png_rgb(full_rgb, wp_w, wp_h)
+        thumb_png = _encode_png_rgb(thumb_rgb, th_w, th_h)
+        full_cpb = _encode_cpbitmap_png(full_png, wp_w, wp_h)
+        thumb_cpb = _encode_cpbitmap_png(thumb_png, th_w, th_h)
+        wp_bundle_plist = plistlib.dumps({
+            'appearanceAware': False,
+            'assets': {
+                'lockAndHome': {
+                    'default': {
+                        'disableParallax': True,
+                        'fullSizeImageFileName': 'Wallpaper.png',
+                        'identifier': 7565,
+                        'name': 'Default',
+                        'thumbnailImageFileName': 'Thumbnail.png',
+                        'type': 'Still',
+                    },
+                },
+            },
+            'disableParallax': True,
+            'family': 'iOS 17',
+            'fullSizeImageFileName': 'Wallpaper.png',
+            'identifier': 7565,
+            'logicalScreenClass': '375w-812h@3x~iphone',
+            'name': 'Default',
+            'thumbnailImageFileName': 'Thumbnail.png',
+            'type': 'Still',
+            'version': 1,
+        }, fmt=plistlib.FMT_BINARY)
+        wp_assets = (wp_w, wp_h, th_w, th_h, full_png, thumb_png, full_cpb, thumb_cpb, wp_bundle_plist)
+        wp_defaults = {
+            'SBWallpaperHasVideoKey': False,
+            'SBWallpaperMagnifyHomeScreenKey': False,
+            'SBWallpaperMagnifyLockScreenKey': False,
+            'SBWallpaperParallaxFactorHomeScreen': 0.0,
+            'SBWallpaperParallaxFactorLockScreen': 0.0,
+            'SBWallpaperPortraitHomeScreenKey': True,
+            'SBWallpaperPortraitLockScreenKey': True,
+            'SBWallpaperZoomScaleHomeScreen': 1.0,
+            'SBWallpaperZoomScaleLockScreen': 1.0,
+            'kSBProceduralWallpaperHomeUserSetKey': False,
+            'kSBProceduralWallpaperLockUserSetKey': False,
+        }
+        print(f'wallpaper: {src_w}x{src_h} -> {wp_w}x{wp_h} PNG ({len(full_png)} B) + '
+              f'{th_w}x{th_h} thumb ({len(thumb_png)} B) + CPBitmaps')
+
     cleaned_bytes = plistlib.dumps(plist, fmt=plistlib.FMT_BINARY)
     major_ver = int(prod_ver.split('.')[0]) if prod_ver and prod_ver.split('.')[0].isdigit() else 26
     setup_ver = 15 if major_ver >= 26 else 11
@@ -353,11 +721,13 @@ def main():
         'LastSystemVersion': build_ver,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': build_ver},
     }, fmt=plistlib.FMT_BINARY)
-    sb_bytes = plistlib.dumps({
+    sb_dict = {
         'BKNoWatchdogs': True,
         'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},
         'MCForceShowCloudConfigurationUI': False,
-    }, fmt=plistlib.FMT_BINARY)
+    }
+    sb_dict.update(wp_defaults)
+    sb_bytes = plistlib.dumps(sb_dict, fmt=plistlib.FMT_BINARY)
     buddy_bytes = plistlib.dumps({
         'ForceNoBuddy': True,
         'LastSystemVersion': build_ver,
@@ -387,6 +757,8 @@ def main():
         if jetsam_bytes is not None:
             add_ustar_bytes(tf, 'System/Library/LaunchDaemons/com.apple.jetsamproperties.D421.plist',
                             jetsam_bytes, mode=j_mode, uid=j_uid, gid=j_gid)
+        add_ustar_dir(tf, 'private/var/mobile/Library', mode=0o755, uid=MOBILE_UID, gid=MOBILE_UID)
+        add_ustar_dir(tf, 'private/var/mobile/Library/Preferences', mode=0o755, uid=MOBILE_UID, gid=MOBILE_UID)
         for pref_name, pref_data in (
             ('com.apple.migration.plist', mig_bytes),
             ('com.apple.springboard.plist', sb_bytes),
@@ -395,7 +767,107 @@ def main():
             ('com.apple.managedconfiguration.notbackedup.plist', mc_nb_bytes),
         ):
             add_ustar_bytes(tf, f'private/var/mobile/Library/Preferences/{pref_name}',
-                            pref_data, mode=0o600, uid=501, gid=501)
+                            pref_data, mode=0o600, uid=MOBILE_UID, gid=MOBILE_UID)
+
+        if tz_name:
+            add_ustar_dir(tf, 'private/var/db/timezone', mode=0o755, uid=0, gid=0)
+            add_ustar_symlink(tf, 'private/var/db/timezone/zoneinfo', '/usr/share/zoneinfo.default')
+            # Point localtime through /var/db/timezone/zoneinfo/<TZ> so both libc stat/open
+            # and Foundation's readlink("/var/db/timezone/localtime") prefix check resolve <TZ>.
+            add_ustar_symlink(tf, 'private/var/db/timezone/localtime', f'/var/db/timezone/zoneinfo/{tz_name}')
+
+            timed_bytes = plistlib.dumps({
+                'TMAutomaticTimeEnabled': True,
+                'TMAutomaticTimeOnlyEnabled': True,
+                'TMAutomaticTimeZoneEnabled': False,
+                'TMTimeZone': tz_name,
+                'TMTimeZoneConfirmed': True,
+            }, fmt=plistlib.FMT_BINARY)
+            dt_bytes = plistlib.dumps({
+                'AutomaticTimeZoneEnabled': False,
+                'timezone': tz_name,
+                'timezoneset': True,
+            }, fmt=plistlib.FMT_BINARY)
+
+            for tdir in (
+                'private/var/db/timed',
+                'private/var/db/timed/Library',
+                'private/var/db/timed/Library/Preferences',
+            ):
+                add_ustar_dir(tf, tdir, mode=0o750, uid=TIMED_UID, gid=TIMED_UID)
+            add_ustar_bytes(tf, 'private/var/db/timed/com.apple.timed.plist',
+                            timed_bytes, mode=0o600, uid=TIMED_UID, gid=TIMED_UID)
+            add_ustar_bytes(tf, 'private/var/db/timed/Library/Preferences/com.apple.timed.plist',
+                            timed_bytes, mode=0o600, uid=TIMED_UID, gid=TIMED_UID)
+            add_ustar_bytes(tf, 'private/var/db/timed/Library/Preferences/com.apple.preferences.datetime.plist',
+                            dt_bytes, mode=0o600, uid=TIMED_UID, gid=TIMED_UID)
+            add_ustar_bytes(tf, 'private/var/mobile/Library/Preferences/com.apple.timed.plist',
+                            timed_bytes, mode=0o600, uid=MOBILE_UID, gid=MOBILE_UID)
+            add_ustar_bytes(tf, 'private/var/mobile/Library/Preferences/com.apple.preferences.datetime.plist',
+                            dt_bytes, mode=0o600, uid=MOBILE_UID, gid=MOBILE_UID)
+
+            mobile_global_prefs.update({
+                'AutomaticTimeZoneEnabled': False,
+                'TimeZone': tz_name,
+            })
+            add_ustar_bytes(tf, 'private/var/mobile/Library/Preferences/.GlobalPreferences.plist',
+                            plistlib.dumps(mobile_global_prefs, fmt=plistlib.FMT_BINARY),
+                            mode=0o644, uid=MOBILE_UID, gid=MOBILE_UID)
+            sys_global_prefs.update({
+                'AutomaticTimeZoneEnabled': False,
+                'TimeZone': tz_name,
+            })
+            add_ustar_dir(tf, 'private/var/preferences', mode=0o755, uid=0, gid=0)
+            add_ustar_bytes(tf, 'private/var/preferences/.GlobalPreferences.plist',
+                            plistlib.dumps(sys_global_prefs, fmt=plistlib.FMT_BINARY),
+                            mode=0o644, uid=0, gid=0)
+
+        if wp_assets is not None:
+            _, _, _, _, full_png, thumb_png, full_cpb, thumb_cpb, wp_bundle_plist = wp_assets
+            wp_bundle_dir = (
+                'Library/Wallpaper/Collections/iOS_17~iphone.wallpaperCollection/'
+                'Wallpapers/7565.iOS_17-375w-812h@3x~iphone.wallpaper'
+            )
+            add_ustar_dir(tf, wp_bundle_dir, mode=0o755, uid=0, gid=0)
+            add_ustar_bytes(tf, f'{wp_bundle_dir}/Wallpaper.png', full_png, mode=0o644, uid=0, gid=0)
+            add_ustar_bytes(tf, f'{wp_bundle_dir}/Thumbnail.png', thumb_png, mode=0o644, uid=0, gid=0)
+            add_ustar_bytes(tf, f'{wp_bundle_dir}/Wallpaper.plist', wp_bundle_plist, mode=0o644, uid=0, gid=0)
+
+            # Disable SpringBoard's Autobahn feature flag before launchd builds com.apple.featureflags.shm
+            # so SBWallpaperController renders Lock & Home backdrops in-process via PaperBoardUI + SweetMetal2
+            # instead of waiting on PosterBoard ExtensionKit scene hosting.
+            autobahn_override = {
+                'Autobahn': {'Enabled': False},
+                'AutobahnLegacyMigration': {'Enabled': False},
+                'AutobahnLegacyMigrationSupportingDistinctHome': {'Enabled': False},
+            }
+            ff_domain = dict(sb_ff_plist) if sb_ff_plist is not None else {}
+            ff_domain.update(autobahn_override)
+            add_ustar_dir(tf, 'System/Library/FeatureFlags', mode=0o755, uid=0, gid=0)
+            add_ustar_dir(tf, 'System/Library/FeatureFlags/Domain', mode=0o755, uid=0, gid=0)
+            add_ustar_bytes(tf, 'System/Library/FeatureFlags/Domain/SpringBoard.plist',
+                            plistlib.dumps(ff_domain, fmt=plistlib.FMT_BINARY), mode=0o644, uid=0, gid=0)
+            if not tz_name:
+                add_ustar_dir(tf, 'private/var/preferences', mode=0o755, uid=0, gid=0)
+            add_ustar_dir(tf, 'private/var/preferences/FeatureFlags', mode=0o755, uid=0, gid=0)
+            add_ustar_dir(tf, 'private/var/preferences/FeatureFlags/Domain', mode=0o755, uid=0, gid=0)
+            add_ustar_bytes(tf, 'private/var/preferences/FeatureFlags/Domain/SpringBoard.plist',
+                            plistlib.dumps(autobahn_override, fmt=plistlib.FMT_BINARY), mode=0o644, uid=0, gid=0)
+
+            add_ustar_dir(tf, 'private/var/mobile/Library/SpringBoard', mode=0o755, uid=MOBILE_UID, gid=MOBILE_UID)
+            for cpb_name, cpb_data in (
+                ('LockBackground.cpbitmap', full_cpb),
+                ('HomeBackground.cpbitmap', full_cpb),
+                ('LockBackgroundThumbnail.cpbitmap', thumb_cpb),
+                ('HomeBackgroundThumbnail.cpbitmap', thumb_cpb),
+                ('LockBackgroundThumbnail.jpg', thumb_png),
+                ('HomeBackgroundThumbnail.jpg', thumb_png),
+            ):
+                add_ustar_bytes(tf, f'private/var/mobile/Library/SpringBoard/{cpb_name}',
+                                cpb_data, mode=0o644, uid=MOBILE_UID, gid=MOBILE_UID)
+            add_ustar_bytes(tf, 'private/var/mobile/Library/Preferences/com.apple.PaperBoard.plist',
+                            plistlib.dumps(wp_defaults, fmt=plistlib.FMT_BINARY),
+                            mode=0o600, uid=MOBILE_UID, gid=MOBILE_UID)
         # Ensure all MCM system & user container class base directories exist with right owners
         for cdir, cuid in (
             ('private/var/containers', 0),
@@ -507,6 +979,11 @@ def main():
         )
 
         rm_paths = []
+        if wp_assets is not None:
+            rm_paths.extend([
+                'private/var/mobile/Library/SpringBoard/OriginalLockBackground.cpbitmap',
+                'private/var/mobile/Library/SpringBoard/OriginalHomeBackground.cpbitmap',
+            ])
         if args.selftest_bin:
             with open(args.selftest_bin, 'rb') as f:
                 add_ustar_bytes(tf, 'private/var/local/bin/sweet-selftest', f.read(), mode=0o755)
@@ -539,6 +1016,10 @@ def main():
 
     print(f'launchd.plist: {before_count} -> {after_count} LaunchDaemons '
           f'({renamed} _PanicOnCrash renamed, {len(removed)} stripped)')
+    if idle_svcs:
+        print(f'idlexpc claimed MachServices: {idle_svcs}')
+    if tz_name:
+        print(f'timezone staged: {tz_name}')
     print(f'kept intact: {[os.path.basename(k) for k in KEEP_DAEMON_KEYS]}')
     print(f'wrote {args.output} ({os.path.getsize(args.output)} bytes)')
 

@@ -5,7 +5,7 @@ Only what the early boot path actually reads (see ios-sweet's NOTES.md); every
 MMIO address comes from the SM8150 live FDT. Defaults to iPhone 11 Pro
 (iPhone12,3 / D421AP, A13 Bionic Cebu 0x8030) for iOS 26; pass --d22ap for
 legacy iPhone X (iPhone10,3 / D22AP, A11 0x8015) iOS 16 builds.
-Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--d22ap]
+Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--d22ap] [--canvas-height N] [--baseband]
 """
 import hashlib, os, struct, sys
 
@@ -140,7 +140,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, d22ap=False):
+def build(seed=None, qemu=False, highmem=False, d22ap=False, canvas_height=2499, baseband=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     dram_base, dram_size = (QEMU_DRAM_BASE, QEMU_DRAM_SIZE) if qemu else (DRAM_BASE, DRAM_SIZE)
@@ -299,7 +299,7 @@ def build(seed=None, qemu=False, highmem=False, d22ap=False):
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-height', u32(canvas_height)),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -366,6 +366,13 @@ def build(seed=None, qemu=False, highmem=False, d22ap=False):
         ('aab-constraint-lmax', u32(625)),
     ])
 
+    baseband_nodes = [node('baseband', [
+        ph(),
+        ('device_type', cstr('baseband')),
+        ('compatible', cstr('baseband,i19')),
+        ('class', u32(3)),
+    ])] if baseband else []
+
     product = d22ap_product(ph) if d22ap else d421ap_product(ph)
 
     target_type, target_sub, model = ('D22', 'D22AP', 'iPhone10,3') if d22ap else ('D421', 'D421AP', 'iPhone12,3')
@@ -382,11 +389,23 @@ def build(seed=None, qemu=False, highmem=False, d22ap=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, backlight] + product + ([] if qemu else [ufs, pram]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, backlight] + baseband_nodes + product + ([] if qemu else [ufs, pram]))
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, d22ap='--d22ap' in sys.argv)
+    canvas_h = 2499
+    for idx, arg in enumerate(sys.argv[1:], 1):
+        if arg == '--canvas-height' and idx + 1 < len(sys.argv):
+            canvas_h = int(sys.argv[idx + 1])
+        elif arg.startswith('--canvas-height='):
+            canvas_h = int(arg.split('=', 1)[1])
+    root = build(
+        qemu='--qemu' in sys.argv,
+        highmem='--highmem' in sys.argv,
+        d22ap='--d22ap' in sys.argv,
+        canvas_height=canvas_h,
+        baseband='--baseband' in sys.argv,
+    )
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
