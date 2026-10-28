@@ -167,6 +167,10 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         let mut options = DeviceOptions::default();
         options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
         options.metal_level = Some(MetalLevel::NEWEST);
+        // Render padded IOSurface rows in place when recorded 16x4 GMEM tile-store bounds fit (`0008` + `0016`),
+        // and skip encoder replay-call logging since this frontend never calls `rebind_bytes_no_copy` (`0013`).
+        options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::AliasWrites;
+        options.refuse_rebinds = true;
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
         Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
@@ -876,6 +880,42 @@ pub extern "C" fn nmb_buffer_set_purgeable_state(buffer: *const NmbBuffer, state
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_make_aliasable(buffer: *const NmbBuffer) -> bool {
+    guard(false, || {
+        get(buffer)?.0.make_aliasable().map_err(e("buffer makeAliasable"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_is_aliasable(buffer: *const NmbBuffer) -> bool {
+    guard(false, || Ok(get(buffer)?.0.is_aliasable()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_heap_offset(buffer: *const NmbBuffer) -> u64 {
+    guard(0, || Ok(get(buffer)?.0.heap_offset()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_make_aliasable(texture: *const NmbTexture) -> bool {
+    guard(false, || {
+        get(texture)?.0.make_aliasable().map_err(e("texture makeAliasable"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_is_aliasable(texture: *const NmbTexture) -> bool {
+    guard(false, || Ok(get(texture)?.0.is_aliasable()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_heap_offset(texture: *const NmbTexture) -> u64 {
+    guard(0, || Ok(get(texture)?.0.heap_offset()))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_release(texture: *mut NmbTexture) {
     release(texture)
 }
@@ -1249,6 +1289,28 @@ pub extern "C" fn nmb_compute_pipeline_execution_width(pipeline: *const NmbCompu
     guard(0, || Ok(get(pipeline)?.0.thread_execution_width() as u64))
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_compute_pipeline_static_threadgroup_memory(pipeline: *const NmbComputePipeline) -> u64 {
+    guard(0, || Ok(get(pipeline)?.0.static_threadgroup_memory_length() as u64))
+}
+
+/// `requiredThreadsPerThreadgroup` into the caller's three words (zeros when the descriptor requires none).
+///
+/// # Safety
+/// `out` holds three writable `u64` words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_compute_pipeline_required_threads(pipeline: *const NmbComputePipeline, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null size".into());
+        }
+        let s = get(pipeline)?.0.required_threads_per_threadgroup();
+        // SAFETY: the header's three words.
+        unsafe { std::slice::from_raw_parts_mut(out, 3) }.copy_from_slice(&[s.width, s.height, s.depth]);
+        Ok(true)
+    })
+}
+
 #[repr(C)]
 pub struct NmbColorAttachment {
     pub format: u64,
@@ -1353,6 +1415,8 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
         if !d.fragment.is_null() {
             let fragment = get(d.fragment)?.0.function_descriptor().with_linked(linked_functions(&d.fragment_linked)?);
             out.fragment = Some(StageSource::Function(fragment));
+        } else if !linked_functions(&d.fragment_linked)?.is_empty() {
+            return Err("fragment linked functions without a fragment function".into());
         }
         for (slot, c) in out.color_attachments.iter_mut().zip(d.colors.iter()) {
             if c.format == 0 {

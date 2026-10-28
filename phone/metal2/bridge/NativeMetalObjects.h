@@ -102,6 +102,12 @@ NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, c
 /* setPurgeableState: with Metal's raw state; the answer's raw state, 0 where it fails. */
 uint64_t nmb_texture_set_purgeable_state(const NmbTexture *, uint64_t state);
 uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t state);
+bool nmb_buffer_make_aliasable(const NmbBuffer *);
+bool nmb_buffer_is_aliasable(const NmbBuffer *);
+uint64_t nmb_buffer_heap_offset(const NmbBuffer *);
+bool nmb_texture_make_aliasable(const NmbTexture *);
+bool nmb_texture_is_aliasable(const NmbTexture *);
+uint64_t nmb_texture_heap_offset(const NmbTexture *);
 void nmb_texture_release(NmbTexture *);
 void nmb_texture_describe(const NmbTexture *, struct NmbTextureDescriptor *out);
 bool nmb_texture_replace(NmbTexture *, const uint64_t region[6], uint64_t level, uint64_t slice, const void *bytes, uint64_t bytes_per_row,
@@ -129,6 +135,8 @@ NmbComputePipeline *nmb_compute_pipeline_new(NmbDevice *, NmbFunction *);
 void nmb_compute_pipeline_release(NmbComputePipeline *);
 uint64_t nmb_compute_pipeline_max_threads(const NmbComputePipeline *);
 uint64_t nmb_compute_pipeline_execution_width(const NmbComputePipeline *);
+uint64_t nmb_compute_pipeline_static_threadgroup_memory(const NmbComputePipeline *);
+bool nmb_compute_pipeline_required_threads(const NmbComputePipeline *, uint64_t out[3]);
 
 struct NmbLinkedGroup {
     const char *name;
