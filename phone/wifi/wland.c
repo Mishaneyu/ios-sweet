@@ -384,8 +384,8 @@ static int qmp_send(const char *msg)
 /* ---- modem boot: TrustZone PAS (Linux qcom_q6v5_pas + qcom_mdt_loader) ---- */
 
 #define PAS_MODEM	4
-#define MPSS_PA		0x8dc00000ull	/* RMX1931 modem_region */
-#define MPSS_SIZE	0x0a000000ull	/* 0x8dc00000..0x97c00000 (160 MiB) */
+#define MPSS_PA		0x8e000000ull	/* LG G8S modem_region (live device tree, after LG's dtbo) */
+#define MPSS_SIZE	0x0a000000ull	/* 0x8e000000..0x98000000 (160 MiB) */
 #define FW_DIR		"/var/local/fw/modem"
 #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
 

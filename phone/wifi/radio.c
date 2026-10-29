@@ -31,7 +31,7 @@ const uint8_t radio_mac[6] = { 0x02, 0x50, 0x49, 0x58, 0x45, 0x4c };	/* what WLF
 
 /* ---------------------------------------------------------------- host memory */
 
-#define POOL_PA		0xE0000000ull
+#define POOL_PA		0xF0000000ull	/* LG G8S: above the kernel's GPU pool (bsd/dev/sweet_gpu.c), below 4 GB */
 #define POOL_SIZE	0x01000000ull
 static uint64_t pool_next = POOL_PA;
 
