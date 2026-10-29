@@ -167,7 +167,9 @@ const char *loader_boot(uintptr_t dtb, const struct sde_fb *fb)
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
 
 	uint64_t plog = adt_get_reg_size(adt_pa, "pram");
-	if (avail > plog + (512UL << 20) && plog) {
+	/* v2 (iOS 26) ADTs: /chosen dram-base/size is all of physical DRAM (is_dram_addr),
+	 * not XNU's range, and /pram sits at a fixed 0x1fd000000: keep mkadt's values. */
+	if (p->version == 1 && avail > plog + (512UL << 20) && plog) {
 		mem_size = avail - plog;
 		adt_set_u64(adt_pa, "chosen", "dram-size", mem_size);
 		adt_set_reg(adt_pa, "pram", p->phys_base + mem_size, plog);
