@@ -140,6 +140,9 @@ const char *loader_boot(uintptr_t dtb, const struct sde_fb *fb)
 	 */
 	uint64_t mem_size = p->mem_size;
 	uint64_t avail = fdt_mem_from(dtb, p->phys_base);
+	/* iOS 26 kernels keep a log mirror at 0x1fe000000 (sweet_ufs.c): XNU's RAM and /pram stay below it. */
+	if (p->version == 2 && p->phys_base < 0x1fe000000UL && avail > 0x1fe000000UL - p->phys_base)
+		avail = 0x1fe000000UL - p->phys_base;
 	con_hex2("FDTMEM", "hi=", avail >> 32, "lo=", (uint32_t)avail);
 	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
 	con_hex("VIRT", p->virt_base);
