@@ -1,0 +1,211 @@
+#!/bin/bash
+# tools/mkiosroot.sh (iOS 26) for hosts whose kernel cannot mount HFS+
+# (WSL2: Microsoft's kernel has no hfsplus module). From ios-betalm's
+# mkiosroot-wsl.sh, for the LG G8S.
+#
+#   mkiosroot26-wsl.sh OS.dmg[.aea] SYSTEMOS.dmg[.aea] APPOS.dmg[.aea] OUT.img [SIZE] [STAGE_DIR]
+#
+# Same result as mkiosroot.sh (AEA images decrypted with ipsw, cryptex links,
+# arm64e PAC instructions rewritten by de-pac-arm64e.py), built in two halves:
+#   1. Everything that only needs files is done in STAGE_DIR on the host's
+#      own Linux filesystem (WSL: under ~, NOT /mnt/c): the three APFS
+#      volumes are copied out through apfs-fuse, the dyld/cryptex links, the
+#      logd stores and the system keybag are added, and the bring-up tweaks
+#      run on it.
+#   2. The HFS+ image is formatted in user space (mkfs.hfsplus) and filled
+#      by libguestfs: a small VM with a stock Ubuntu kernel (which has
+#      hfsplus) mounts it and unpacks a tar stream of STAGE_DIR into it.
+#      Numeric owners, modes, symlinks and hard links are kept.
+#
+# Needs: apfs-fuse, hfsprogs, rsync, python3, libguestfs-tools and a stock
+# kernel for the libguestfs appliance (see README-betalm.md, option B).
+# Free space: about 12 GB in STAGE_DIR plus the image (sparse, up to SIZE).
+set -euo pipefail
+
+[[ $# -ge 4 ]] || { sed -n '2,20p' "$0"; exit 2; }
+os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3")
+out=$(realpath -m "$4") size=${5:-20G}
+stage=$(realpath -m "${6:-$HOME/ios26root-stage}")
+here=$(dirname "$(realpath "$0")")
+[[ ! -e $out ]] || { echo "refusing to overwrite $out (rm it first)" >&2; exit 1; }
+# libguestfs builds its appliance from the host kernel, which it must read as
+# this user (Ubuntu installs it mode 0600).
+for k in /boot/vmlinuz-*; do
+	[[ -r $k ]] || { echo "Error: $k is not readable: sudo chmod 0644 /boot/vmlinuz-*" >&2; exit 1; }
+done
+export LIBGUESTFS_BACKEND=${LIBGUESTFS_BACKEND:-direct}
+
+# A stage finished by an earlier run (marker $stage.done) is reused: only the
+# image is rebuilt. An unfinished one is refused.
+resume=0
+if [[ -e $stage ]]; then
+	if [[ -e $stage.done ]]; then
+		resume=1
+		echo "== reusing the finished stage $stage (sudo rm -rf $stage $stage.done to rebuild it)"
+	else
+		echo "refusing to reuse unfinished $stage (remove it first: sudo rm -rf $stage)" >&2
+		exit 1
+	fi
+fi
+case $stage in /mnt/*) echo "warning: $stage is on a Windows drive: slow, and links/owners may not survive" >&2 ;; esac
+
+missing=()
+for tool in apfs-fuse mkfs.hfsplus fsck.hfsplus rsync guestfish python3 gcc; do
+	command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+	echo "Error: missing: ${missing[*]}" >&2
+	echo "  sudo apt install hfsprogs rsync python3 libguestfs-tools linux-generic" >&2
+	echo "  apfs-fuse: build from https://github.com/sgan81/apfs-fuse" >&2
+	exit 1
+fi
+
+if [[ $resume == 0 ]]; then
+work=$(mktemp -d)
+mounts=()
+cleanup() {
+	for m in "${mounts[@]}"; do
+		mountpoint -q "$m" && sudo umount "$m" 2>/dev/null || true
+	done
+	rm -f "$work"/*.dmg
+	rmdir "$work"/* "$work" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+decrypt_if_aea() {
+	local src=$1
+	if [[ "$src" != *.aea ]]; then
+		printf '%s\n' "$src"
+		return
+	fi
+	local dst=${src%.aea}
+	if [[ -f "$dst" ]]; then
+		echo "reusing decrypted $dst" >&2
+		printf '%s\n' "$dst"
+		return
+	fi
+	echo "decrypting $src -> $dst ..." >&2
+	command -v ipsw >/dev/null 2>&1 || { echo "error: ipsw is needed to decrypt $src (sudo snap install ipsw)" >&2; exit 1; }
+	ipsw fw aea "$src" -o "$(dirname "$dst")" >&2
+	[[ -f "$dst" ]] || { echo "error: expected decrypted DMG at $dst" >&2; exit 1; }
+	printf '%s\n' "$dst"
+}
+
+# apfs-fuse splits its options on ',' (iPhone12,3 paths): use links, keep .dmg.
+apfs_mount() {
+	local img
+	img=$(decrypt_if_aea "$1")
+	ln -s "$img" "$work/$2.dmg"
+	mkdir "$work/$2"
+	sudo "$(command -v apfs-fuse)" "$work/$2.dmg" "$work/$2"
+	mounts+=("$work/$2")
+}
+apfs_mount "$os" os
+apfs_mount "$sysos" sysos
+apfs_mount "$appos" appos
+
+# ---- 1. stage the root on the host filesystem (as mkiosroot.sh does) ----
+sudo mkdir -p "$stage"
+copy() {
+	echo "copying $1 -> /${2#"$stage"}"
+	sudo mkdir -p "$2"
+	sudo rsync -aH --numeric-ids "$1/" "$2/"
+}
+copy "$work/os/root" "$stage"
+copy "$work/sysos/root" "$stage/private/preboot/Cryptexes/OS"
+copy "$work/appos/root" "$stage/private/preboot/Cryptexes/App"
+for m in "${mounts[@]}"; do sudo umount "$m"; done
+mounts=()
+
+dsc=private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld
+sudo mkdir -p "$stage/System/Library/Caches/com.apple.dyld"
+for f in "$stage/$dsc"/*; do
+	sudo ln "$f" "$stage/System/Library/Caches/com.apple.dyld/${f##*/}"
+done
+
+for c in OS App; do
+	(cd "$stage/private/preboot/Cryptexes/$c" && sudo find . ! -type d ! -path './System/Library/Caches/com.apple.dyld/*') |
+	while IFS= read -r f; do
+		f=${f#./}
+		if ! sudo test -e "$stage/$f" && ! sudo test -L "$stage/$f"; then
+			sudo mkdir -p "$stage/$(dirname "$f")"
+			src="$stage/private/preboot/Cryptexes/$c/$f"
+			# Linux hfsplus cannot hard-link symlinks: copy those.
+			if sudo test -L "$src"; then sudo cp -P "$src" "$stage/$f"; else sudo ln "$src" "$stage/$f"; fi
+			echo "linked $c:/$f"
+		fi
+	done
+done
+
+# mkdir/chown/chmod rather than install -o: uutils install (Ubuntu 26.04)
+# rejects numeric ids that have no passwd entry, such as iOS's _logd (272).
+db="$stage/private/var/db"
+sudo mkdir -p "$db/diagnostics/timesync" "$db/uuidtext"
+for d in diagnostics uuidtext diagnostics/timesync; do
+	sudo touch "$db/$d/.migrated"
+	sudo chown 272:272 "$db/$d" "$db/$d/.migrated"
+	sudo chmod 0644 "$db/$d/.migrated"
+done
+sudo chmod 0751 "$db/diagnostics"
+sudo chmod 0755 "$db/uuidtext" "$db/diagnostics/timesync"
+
+sudo mkdir -p "$stage/private/var/keybags"
+sudo chown 0:0 "$stage/private/var/keybags"
+sudo chmod 0700 "$stage/private/var/keybags"
+printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
+	sudo tee "$stage/private/var/keybags/systembag.kb" >/dev/null
+sudo chown 0:0 "$stage/private/var/keybags/systembag.kb"
+sudo chmod 0600 "$stage/private/var/keybags/systembag.kb"
+
+# /System/Cryptexes/{OS,App} point to the merged cryptex trees.
+sudo mkdir -p "$stage/System/Cryptexes"
+for c in OS App; do
+	if ! sudo test -e "$stage/System/Cryptexes/$c" && ! sudo test -L "$stage/System/Cryptexes/$c"; then
+		sudo ln -s "../../private/preboot/Cryptexes/$c" "$stage/System/Cryptexes/$c"
+	fi
+done
+
+# Kryo 485 is ARMv8.2: rewrite the arm64e PAC instructions of every binary and
+# of the shared cache in place (the launchd tweaks come with the boot overlay,
+# tools/make-ios26-overlay.py).
+echo "== rewriting arm64e PAC instructions (takes a while)"
+sudo python3 -I "$here/de-pac-arm64e.py" --root "$stage"
+# EXTRA_TAR=file.tar: more files for the root (LG G8S: modem/Wi-Fi firmware under
+# /private/var/local/fw, from that phone only), numeric owners kept.
+if [[ -n "${EXTRA_TAR:-}" ]]; then
+	sudo tar -xpf "$EXTRA_TAR" --numeric-owner --no-overwrite-dir -C "$stage"
+	echo "extracted $(tar -tf "$EXTRA_TAR" | wc -l) entries from $EXTRA_TAR"
+fi
+sudo du -sh "$stage"
+touch "$stage.done"
+fi # resume
+
+# ---- 2. format the image and fill it inside the libguestfs appliance ----
+truncate -s "$size" "$out"
+mkfs.hfsplus -s -J -v iOSRoot "$out"
+echo "== filling $out through libguestfs (several minutes)"
+# Numeric owners only: iOS uids (mobile 501, _logd 272, ...) have no host names.
+sudo tar -C "$stage" --numeric-owner -cf - . |
+	guestfish --rw -a "$out" -- \
+		run : \
+		mount-vfs force hfsplus /dev/sda / : \
+		tar-in - / : \
+		df-h : \
+		umount-all
+
+fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
+# Linux fsck_hfs reports "Volume header needs minor repair" on every fresh
+# journaled volume, even right after -y (NOTES.md, image v4): that alone is
+# not a failure. Anything else in the read-only check is.
+check=$(fsck.hfsplus -f -n "$out" 2>&1) || true
+echo "$check"
+if echo "$check" | grep -qE 'appears to be OK'; then :
+elif echo "$check" | grep -vE 'Volume header needs minor repair|^\(1, 0\)$|found corrupt and needs to be repaired' |
+	grep -qiE 'invalid|incorrect|error|missing|needs'; then
+	echo "fsck found real problems: see above" >&2; exit 1
+else
+	echo "(only the known Linux header quirk: fine)"
+fi
+echo "done: $out (stage left in $stage: sudo rm -rf $stage when the image boots)"
