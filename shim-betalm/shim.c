@@ -436,19 +436,22 @@ static void show_previous_log(void)
 	/* Pages from the end backwards: find where each page starts. */
 	con_scale(2);
 	unsigned starts[64], pages = 0, pos = 0;
+	con_set_dry(1);		/* measure the pages without drawing */
 	while (pos < n && pages < 64) {
 		starts[pages++] = pos;
 		con_clear(BLUE);
 		con_skip();
 		pos += con_page(mir_text + pos, n - pos, WHITE);
 	}
-	unsigned first = pages > 6 ? pages - 6 : 0;	/* the last 6 pages */
-	for (unsigned p = first; p < pages; p++) {
-		con_clear(p + 1 == pages ? 0xff000040U : BLUE);
-		con_str("PREVLOG", p + 1 == pages ? "LAST PAGE (60 s)" : "older page (8 s)");
+	con_set_dry(0);
+	/* The last page first (2 min), then the four before it (30 s each). */
+	for (unsigned k = 0; k < 5 && k < pages; k++) {
+		unsigned p = pages - 1 - k;
+		con_clear(k == 0 ? 0xff000040U : BLUE);
+		con_str("PREVLOG", k == 0 ? "LAST PAGE, 2 min" : "older page, 30 s");
 		unsigned end = p + 1 < pages ? starts[p + 1] : n;
 		con_page(mir_text + starts[p], end - starts[p], WHITE);
-		delay_ms(p + 1 == pages ? 60000 : 8000);
+		delay_ms(k == 0 ? 120000 : 30000);
 	}
 	con_scale(3);
 }

@@ -28,3 +28,4 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 void con_scale(int s);
 unsigned con_page(const char *t, unsigned len, uint32_t fg);
 int con_rows(void);
+void con_set_dry(int d);
