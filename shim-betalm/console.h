@@ -25,3 +25,6 @@ void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb);
+void con_scale(int s);
+unsigned con_page(const char *t, unsigned len, uint32_t fg);
+int con_rows(void);

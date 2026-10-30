@@ -409,6 +409,50 @@ static int want_autorefresh(uint64_t dtb)
 	return 1;
 }
 
+
+/*
+ * The previous iOS 26 kernel's console (sweet_ufs.c keeps an uncached mirror
+ * of its log ring at 0x1fe000000; DRAM usually survives the reset into
+ * fastboot): show its last part in a small font, page by page, the last page
+ * for a minute, so a crash that never reached the disk can be photographed.
+ */
+#define MIR_PA		0x1fe000000UL
+#define MIR_RING	(4u << 20)
+static char mir_text[24 * 1024];
+static void show_previous_log(void)
+{
+	volatile const char *m = (volatile const char *)MIR_PA;
+	static const char want[8] = { 'S','W','E','E','T','M','I','R' };
+	for (int i = 0; i < 8; i++)
+		if (m[i] != want[i])
+			return;
+	if (*(volatile const uint32_t *)(MIR_PA + 16) != MIR_RING)
+		return;
+	uint64_t total = *(volatile const uint64_t *)(MIR_PA + 8);
+	*(volatile char *)MIR_PA = 0;	/* once */
+	unsigned n = total < sizeof(mir_text) ? (unsigned)total : sizeof(mir_text);
+	for (unsigned i = 0; i < n; i++)
+		mir_text[i] = m[0x1000 + (total - n + i) % MIR_RING];
+	/* Pages from the end backwards: find where each page starts. */
+	con_scale(2);
+	unsigned starts[64], pages = 0, pos = 0;
+	while (pos < n && pages < 64) {
+		starts[pages++] = pos;
+		con_clear(BLUE);
+		con_skip();
+		pos += con_page(mir_text + pos, n - pos, WHITE);
+	}
+	unsigned first = pages > 6 ? pages - 6 : 0;	/* the last 6 pages */
+	for (unsigned p = first; p < pages; p++) {
+		con_clear(p + 1 == pages ? 0xff000040U : BLUE);
+		con_str("PREVLOG", p + 1 == pages ? "LAST PAGE (60 s)" : "older page (8 s)");
+		unsigned end = p + 1 < pages ? starts[p + 1] : n;
+		con_page(mir_text + starts[p], end - starts[p], WHITE);
+		delay_ms(p + 1 == pages ? 60000 : 8000);
+	}
+	con_scale(3);
+}
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
@@ -425,6 +469,8 @@ void shim_main(uint64_t dtb)
 	if (fb.cmd_mode && !fb.autorefresh)
 		con_flush = fb_kick;
 
+	stage = "prevlog";
+	show_previous_log();
 	stage = "loader";
 	con_clear(RED);
 	con_str("SHIM", BOARD_NAME);

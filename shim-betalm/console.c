@@ -6,7 +6,7 @@
 #include "board.h"
 #include "font.h"
 
-#define SCALE		3
+static int SCALE = 3;
 #define CH_W		(8 * SCALE)
 #define CH_H		(16 * SCALE)
 #define MARGIN		24
@@ -118,3 +118,29 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 	row++;
 	flush();
 }
+
+/* Small-font page of raw text (the previous kernel's log): returns bytes shown. */
+void con_scale(int s) { SCALE = s; }
+unsigned con_page(const char *t, unsigned len, uint32_t fg)
+{
+	int cols = ((int)con_w - 2 * MARGIN) / CH_W, rows = ((int)con_h - 2 * MARGIN) / CH_H;
+	int col = 0;
+	unsigned i = 0;
+	for (; i < len && row < rows; i++) {
+		char c = t[i];
+		if (c == '\n' || col >= cols) {
+			row++;
+			col = 0;
+			if (c == '\n')
+				continue;
+			if (row >= rows)
+				break;
+		}
+		if (c == '\r' || c == '\t')
+			c = ' ';
+		put_char(col++, c, fg);
+	}
+	flush();
+	return i;
+}
+int con_rows(void) { return ((int)con_h - 2 * MARGIN) / CH_H; }
