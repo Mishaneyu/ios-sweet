@@ -169,6 +169,12 @@ const char *loader_boot(uintptr_t dtb, const struct sde_fb *fb)
 	uint64_t plog = adt_get_reg_size(adt_pa, "pram");
 	/* v2 (iOS 26) ADTs: /chosen dram-base/size is all of physical DRAM (is_dram_addr),
 	 * not XNU's range, and /pram sits at a fixed 0x1fd000000: keep mkadt's values. */
+	/* v2: never past the end of the RAM ABL reports (the G8S high bank may end
+	 * below mkadt's 0x1fcc00000): pages there read back garbage. */
+	if (p->version == 2 && plog && avail > plog + (512UL << 20) && avail - plog < mem_size) {
+		mem_size = avail - plog;
+		adt_set_reg(adt_pa, "pram", p->phys_base + mem_size, plog);
+	}
 	if (p->version == 1 && avail > plog + (512UL << 20) && plog) {
 		mem_size = avail - plog;
 		adt_set_u64(adt_pa, "chosen", "dram-size", mem_size);
