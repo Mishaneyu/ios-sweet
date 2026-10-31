@@ -5,7 +5,7 @@ Only what the early boot path actually reads (see ios-sweet's NOTES.md); every
 MMIO address comes from the SM8150 live FDT. Defaults to iPhone 11 Pro
 (iPhone12,3 / D421AP, A13 Bionic Cebu 0x8030) for iOS 26; pass --d22ap for
 legacy iPhone X (iPhone10,3 / D22AP, A11 0x8015) iOS 16 builds.
-Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--d22ap] [--canvas-height N] [--baseband]
+Usage:  mkadt.py OUT.adt [--mem-size=N] [--dump] [--qemu] [--highmem] [--d22ap] [--canvas-height N] [--baseband]
 """
 import hashlib, os, struct, sys
 
@@ -394,6 +394,10 @@ def build(seed=None, qemu=False, highmem=False, d22ap=False, canvas_height=2499,
 
 if __name__ == '__main__':
     canvas_h = 2499
+    for arg in sys.argv[2:]:
+        if arg.startswith('--mem-size='):
+            # LG G8S: XNU takes 3 GB (0xc0000000); the GPU pool gets the rest (patch 0153)
+            HIGH_MEM_SIZE = int(arg.split('=', 1)[1], 0)
     for idx, arg in enumerate(sys.argv[1:], 1):
         if arg == '--canvas-height' and idx + 1 < len(sys.argv):
             canvas_h = int(sys.argv[idx + 1])

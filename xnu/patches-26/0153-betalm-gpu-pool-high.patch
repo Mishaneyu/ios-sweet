@@ -1,0 +1,16 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 5190b4a..d04ef17 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1016,6 +1016,11 @@ static const struct { uint64_t pa, size; } gpool_ranges[] = {
+ 	 */
+ 	{ 0xb0400000ULL, 0x0c800000ULL },       /* 200 MB, up to the hole */
+ 	{ 0xc0000000ULL, 0x30000000ULL },       /* 768 MB, up to the radio pool */
++	/*
++	 * The top of the high bank, which XNU leaves alone (mkadt.py --g8s-gpu-ram: XNU
++	 * takes 0x1_00000000 + 3 GB): iOS 26's backboardd alone fills the 968 MB above.
++	 */
++	{ 0x1c0000000ULL, 0x3cc00000ULL },      /* 972 MB, up to /pram at 0x1fd000000 */
+ };
+ static struct { uint64_t pa, size; } gpool_free[GPOOL_FREE_MAX];       /* sorted by address, merged */
+ static uint32_t gpool_nfree;
