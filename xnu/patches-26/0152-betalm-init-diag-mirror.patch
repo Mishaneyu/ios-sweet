@@ -1,0 +1,93 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6e6f47b..793e15b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -717,7 +717,11 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+  *   +0x1000 ring bytes (offset of byte n = n % ring size)
+  * The next shim boot copies its tail to UFS (tools/flame-log-pull.sh rescue).
+  */
++#if defined(SWEET_BOARD_BETALM)
++#define SWEET_MIRROR_PA         0x1fd400000ULL  /* G8S RAM ends at 0x1fe000000 (ABL /memory) */
++#else
+ #define SWEET_MIRROR_PA         0x1fe000000ULL
++#endif
+ struct sweet_mirror_header {
+ 	char magic[8];
+ 	uint64_t total;
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 9bbeb0b..55b6962 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8369,6 +8369,59 @@ static const char * init_programs[] = {
+  * 3		2		NA		/usr/appleinternal/sbin/launchd.development
+  * 4		3		1		/sbin/launchd
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * launchd would not exec: say why before the panic, and get the log to
++ * disk (bsd/dev/sweet_ufs.c), since nothing after the panic reaches it.
++ */
++static void
++sweet_init_diag(const char *path)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int e = vnode_lookup(path, 0, &vp, ctx);
++	printf("SWEET INIT: lookup %s = %d\n", path, e);
++	if (e == 0) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_data_size);
++		VATTR_WANTED(&va, va_mode);
++		VATTR_WANTED(&va, va_flags);
++		VATTR_WANTED(&va, va_fileid);
++		int ge = vnode_getattr(vp, &va, ctx);
++		printf("SWEET INIT: getattr %d size %llu mode 0%o flags 0x%x fileid %llu type %d\n", ge,
++		    (unsigned long long)va.va_data_size, va.va_mode, va.va_flags,
++		    (unsigned long long)va.va_fileid, vnode_vtype(vp));
++		static uint8_t buf[4096];
++		for (int pass = 0; pass < 2; pass++) {
++			int resid = -1;
++			bzero(buf, sizeof(buf));
++			int re = vn_rdwr(UIO_READ, vp, (caddr_t)buf, sizeof(buf), (off_t)pass * 65536,
++			    UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			unsigned nz = 0;
++			for (unsigned i = 0; i < sizeof(buf); i++) {
++				nz += buf[i] != 0;
++			}
++			printf("SWEET INIT: read @%d = %d resid %d nonzero %u: "
++			    "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
++			    pass * 65536, re, resid, nz,
++			    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
++			    buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]);
++		}
++		vnode_put(vp);
++	}
++	struct vfsstatfs *sf = mountlist.tqh_first ? vfs_statfs(mountlist.tqh_first) : NULL;
++	if (sf) {
++		printf("SWEET INIT: root %s on %s bsize %u blocks %llu free %llu\n", sf->f_fstypename,
++		    sf->f_mntfromname, sf->f_bsize, (unsigned long long)sf->f_blocks,
++		    (unsigned long long)sf->f_bfree);
++	}
++	extern void sweet_log_sync(void);
++	sweet_log_sync();
++	sweet_log_sync();
++}
++#endif
++
+ void
+ load_init_program(proc_t p)
+ {
+@@ -8431,6 +8484,12 @@ load_init_program(proc_t p)
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET INIT: exec failed, errno %d\n", error);
++	sweet_init_diag("/sbin/launchd");
++	sweet_init_diag("/usr/lib/dyld");
++	sweet_init_diag("/bin/sh");
++#endif
+ 	panic("Process 1 exec of %s failed, errno %d", ((i == 0) ? "<null>" : init_programs[i - 1]), error);
+ }
+ 

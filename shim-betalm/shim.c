@@ -416,7 +416,7 @@ static int want_autorefresh(uint64_t dtb)
  * fastboot): show its last part in a small font, page by page, the last page
  * for a minute, so a crash that never reached the disk can be photographed.
  */
-#define MIR_PA		0x1fe000000UL
+#define MIR_PA		0x1fd400000UL
 #define MIR_RING	(4u << 20)
 static char mir_text[24 * 1024];
 static void show_previous_log(void)
