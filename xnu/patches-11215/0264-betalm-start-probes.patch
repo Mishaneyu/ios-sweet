@@ -1,0 +1,106 @@
+betalm: colour probes in start.s (cold-boot bring-up diagnostic)
+
+boot2-boot4 on the G8S showed only DarwinBoot's green bar: the kernel never
+reached arm_init's first early mark (stage 1, which needs sweetearlyfb=1).
+Five 64x48 squares at panel row 400, 80 px apart, in the boot framebuffer the
+boot args name (Video.v_baseAddr +40, v_rowBytes +56), so the photo shows the
+last checkpoint passed:
+  0 red      kernel entry (start_first_cpu, MMU off)
+  1 yellow   boot args read (x22-x26)
+  2 cyan     page tables and TTBRs set, before SCTLR_EL1 (MMU on)
+  3 white    after SCTLR_EL1 + isb (framebuffer V=P via the 32 MB block)
+  4 magenta  returning into arm_init
+Cold boot only (x21 == 0); clobbers x9-x12, x16, x17 and the flags. The
+fixed stage-0 white band at 0x9c000000 + row 2368 stays (sweet layout).
+
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index e8f555e..5f198bc 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -506,6 +506,38 @@ start_cpu:
+ 2:
+ .endmacro
+ 
++#if defined(SWEET)
++/*
++ * betalm bring-up probe (0264): a 64x48 square of colour \color in column
++ * \slot (80 px apart) at panel row 400 of the boot framebuffer named by the
++ * boot args (Video.v_baseAddr +40, v_rowBytes +56). Cold boot only (x21 == 0:
++ * x20 is the boot args PA). Clobbers x9-x12, x16, x17 and the flags only.
++ */
++.macro SWEET_PROBE slot, color
++	cbnz	x21, 9f
++	ldr		x9, [x20, #40]
++	cbz		x9, 9f
++	ldr		x10, [x20, #56]
++	mov		x11, #400
++	madd	x9, x11, x10, x9
++	add		x9, x9, #(\slot * 320)
++	MOV64	x16, \color
++	mov		x17, #48
++8:
++	mov		x12, x9
++	mov		x11, #64
++7:
++	str		w16, [x12], #4
++	subs	x11, x11, #1
++	b.ne	7b
++	add		x9, x9, x10
++	subs	x17, x17, #1
++	b.ne	8b
++	dsb		sy
++9:
++.endmacro
++#endif
++
+ /*
+  * _start_first_cpu
+  * Cold boot init routine.  Called from __start
+@@ -522,6 +554,10 @@ LEXT(start_first_cpu)
+ 	mov		x20, x0
+ 	mov		x21, #0
+ 
++#if defined(SWEET)
++	SWEET_PROBE 0, 0xffff0000		/* red: kernel entry */
++#endif
++
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+ 	MOV64	x0, (0x9c000000 + 2368 * 4320)
+@@ -553,6 +589,9 @@ Lsweet_mark_pixel:
+ 	ldr		x24, [x20, BA_MEM_SIZE]				// Get the physical memory size
+ 	adrp	x25, EXT(bootstrap_pagetables)@page	// Get the start of the page tables
+ 	ldr		x26, [x20, BA_BOOT_FLAGS]			// Get the kernel boot flags
++#if defined(SWEET)
++	SWEET_PROBE 1, 0xffffff00		/* yellow: boot args read */
++#endif
+ 
+ 	// Clear the registers that will be used to store the userspace thread pointer and CPU number.
+ 	// We may not actually be booting from ordinal CPU 0, so this register will be updated
+@@ -835,10 +874,16 @@ common_start:
+ 	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
+ #endif /* HAS_APPLE_PAC */
+ 
++#if defined(SWEET)
++	SWEET_PROBE 2, 0xff00ffff		/* cyan: page tables set, MMU next */
++#endif
+ 	// Enable caches, MMU, ROP and JOP
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
++#if defined(SWEET)
++	SWEET_PROBE 3, 0xffffffff		/* white: MMU on (framebuffer V=P) */
++#endif
+ 
+ #if !VMAPPLE && !defined(SWEET)
+ 	MOV64   x1, SCTLR_EL1_DEFAULT
+@@ -901,6 +946,9 @@ common_start:
+ 	mov	lr, x21
+ #endif
+ 
++#if defined(SWEET)
++	SWEET_PROBE 4, 0xffff00ff		/* magenta: returning into arm_init */
++#endif
+ 	// Return to arm_init()
+ 	ret
+ 
