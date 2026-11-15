@@ -153,3 +153,22 @@ Next: an iOS 18.7.8 root (Bergamota's Renegade builder, tools/renegade, from
 Apple's IPSW on the user's PC), a partition for it (GPT full: resize an
 existing entry, user decides), GPU firmware from the G8S vendor image.
 
+## Repartition for the iOS root (2026-11-15, done from Renegade TWRP)
+
+Backups first (on the user's PC): `sfdisk -d` dump, raw primary GPT (sectors
+0-5) and tail (last 8 sectors). TWRP's e2fsprogs 1.45.4 refused the Arch ext4
+(orphan_file = FEATURE_C12): static ARM64 e2fsprogs 1.47.2 built and tested
+(check/shrink/grow, files identical) and pushed to /tmp. Steps: journal replay
+(`e2fsck -p -E journal_only`), `e2fsck -f -p` (counters), TWRP clock set,
+`resize2fs sda32 54G`, `sgdisk -a 1` (dry run with -P first) keeping type GUIDs,
+unique GUIDs and names, TWRP reboot, `resize2fs` to fill; every e2fsck clean.
+
+| # | name | start | end | size (4 KiB sectors) |
+|---|---|---|---|---|
+| sda30 | userdata (iOS root) | 21668608 | 30843901 | 9175294 (35.0 GiB) |
+| sda31 | esp | 6954752 | 7085823 | unchanged |
+| sda32 | linux (Arch, ext4) | 7085824 | 21668607 | 14582784 (55.6 GiB) |
+| free | old userdata | 4333312 | 6954751 | 10 GiB unused |
+
+Do not boot Android on this phone any more (userdata is no longer its FS).
+
