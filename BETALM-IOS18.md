@@ -8,11 +8,12 @@ as kernel patch `xnu/patches-11215/0263`.
 
 ## Status (2026-11-15)
 
-- **0263 written, not built yet.** Applies cleanly on 0001-0262 (checked
-  against xnu-11215.81.4 + dxb patches). The changed C files pass a local
-  clang `-fsyntax-only -Wall -Wextra` check against the patched tree; the two
-  C++ files (SweetBattery, SweetPlatformExpert) only got board-check swaps
-  and are first compiled by CI.
+- **Kernel built (2026-11-15):** CI run 43739194192 (workflow_dispatch,
+  commit f4c0a0e), 9m21s, success. 0263 applied, no compile or link errors.
+  `kernel.development.sweet` sha256 e6c7865c3ee323858709d88dedc94464a5e3e88b835e243a188389bf350350b1;
+  contains `lge,betalm`, the S3706 touch, the G8S GPU board and the AOP cmd-db lookup.
+  Note: pushes that touch many files do not trigger `xnu.yml` (GitHub's
+  300-file path-filter limit); start it with `gh workflow run xnu.yml --ref ios18-betalm`.
 - `tools/mkadt.py --board betalm` added (not run: needs Apple's D22AP tree).
 - Nothing booted on the phone yet.
 
