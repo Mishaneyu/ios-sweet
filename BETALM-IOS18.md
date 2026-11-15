@@ -36,7 +36,32 @@ Expected: Renegade splash and countdown, then the UniXNU menu (it lists
 `\EFI\BOOT\BOOTAA64.EFI` entries it finds, i.e. GRUB on the Arch ESP, plus
 its built-in actions). If GRUB/Arch boots directly instead, BootOrder was not
 honoured: reboot, press a side button for SimpleInit and pick UniXNU in the
-UEFI boot menu. Not tested on the phone yet.
+UEFI boot menu.
+
+**boot1 on the phone (2026-11-15, user report):** UniXNU menu shown, keys work
+(volume down and power confirmed), countdown ~1 s (no config: built-in
+fallback timeout).
+
+## boot2: first kernel start (ESP payload, same firmware)
+
+UniXNU reads `\EFI\UniXNU\unixnu.toml` from any FAT volume, so the payload goes
+into the phone's existing ESP (sda31, GRUB's) next to `EFI/BOOT`; the firmware
+stays boot1-v0.img. `tools/betalm/mkesp-betalm.sh KERNEL ADT OUT.zip` packs
+`EFI/UniXNU/{unixnu.toml,SHA256SUMS,Payloads/kernel.macho,kernel.macho.adt}`
+(timeout 5 s). Default boot-args are read-only: no `ufsrw`/`rootrw` (the UFS
+driver returns EROFS for every write), `sweetlog=0`, `sweetgpu=0` (no GPU
+firmware yet); the script refuses writable args unless `BETALM_RW=1`.
+
+**boot2-esp-v0.zip** = kernel run 43739194192 + `mkadt.py --board betalm`
+without `/product` (Apple's d22ap.adt is only needed for MobileGestalt in
+userland; the kernel start does not read it). There is no iOS root: expected
+end is a wait/panic at mountroot (userdata holds Android). What to watch:
+DarwinBoot's hand-off summary (window inside 0x140000000 + 3 GiB, video
+0x9d200000 1080x2248), then the kernel console, 8 CPUs, keys, touch probe
+lines (`SWEET TOUCH: ... rmi F01 ... product=`) after ~20 s.
+
+`tools/adt.py` was missing from the UniXNU-raphael import (mkadt.py imports
+it); it is identical to `scripts/adt.py`.
 
 ## What 0263 does
 
