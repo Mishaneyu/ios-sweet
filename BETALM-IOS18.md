@@ -113,3 +113,17 @@ Note for the GUI stage: AppleCLCD::flipSetup assumes 36 MiB after the scan-out
 buffer; on betalm buffer 2 would land in TGCM. Page flipping is off by default
 (`sweetfb_flip`/`sweetfb_hw`), so this needs a betalm region end before enabling it.
 
+**boot3 (2026-11-15):** still only the green bar, even with `sweetearlyfb=1`, so
+the kernel stops before its first early mark. Likely cause: the kernel window.
+The kernel takes gDramBase from ADT `/chosen dram-base` (0x140000000, raphael's
+layout), but DarwinBoot takes the first run that fits. Raphael's Aloha map only
+had a big run at 0x140000000; Renegade's 6 GB map chains 0xC0300000.. past
+4 GiB to 0x200000000, so the window most likely landed near 0xC2004000,
+outside the RAM the ADT describes.
+
+**boot4-v0.img** (firmware, sha256 772de8f9...d602): DarwinBoot +
+`patches/darwinboot-window-dram-base.patch`: the window starts at or above
+`/chosen dram-base` of the kernel's ADT (0 = unchanged behaviour), so betalm gets
+raphael's 0x141004000. Use with the boot3-esp-v0 payload (unchanged). Ask for a
+photo of DarwinBoot's hand-off summary (pa, window, video) every time.
+

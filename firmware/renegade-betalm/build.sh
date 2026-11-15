@@ -30,7 +30,7 @@ if [ ! -d unixnu ]; then
   git -C unixnu checkout -q FETCH_HEAD
   git -C unixnu submodule update --init --depth 1 drivers/DarwinBoot
   git -C unixnu apply "$REPO/patches/unixnu-guacamole.patch" "$REPO/patches/unixnu-diag.patch"
-  for p in darwinboot-guacamole darwinboot-diag darwinboot-window-split darwinboot-window-below4g; do
+  for p in darwinboot-guacamole darwinboot-diag darwinboot-window-split darwinboot-window-below4g darwinboot-window-dram-base; do
     git -C unixnu/drivers/DarwinBoot apply "$REPO/patches/$p.patch"
   done
 fi

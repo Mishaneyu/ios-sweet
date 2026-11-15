@@ -1,0 +1,67 @@
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
+index 12f9b66..e1cf7fe 100644
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -23,6 +23,10 @@
+ // The boot path itself is unchanged.
+ //
+ STATIC UINTN   mDiagStep;
++// /chosen dram-base of the kernel's device tree: the window starts at or above it (0 = anywhere).
++// The kernel takes gDramBase from that property, so a window below it (Renegade's map chains
++// 0xC0300000.. past 4 GiB) would not be the RAM the kernel believes it owns.
++STATIC UINT64 mWindowFloor;
+ STATIC UINT64  mDiagBytes;
+ STATIC UINT64  mDiagKernel;
+ STATIC CONST CHAR8 *CONST  mDiagStepName[] = {
+@@ -230,9 +234,11 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+   UINTN  Candidate;
+   UINTN  TrustCandidate;
+   UINTN  MemoryCandidate;
++  UINTN  FloorCandidate;
+   CONST UINT8 *Name;
+   UINTN  NameLength;
+ 
++  FloorCandidate = MAX_UINTN;
+   Name = NULL;
+   NameLength = 0;
+   Candidate = MAX_UINTN;
+@@ -267,6 +273,9 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+       if ((TrustCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+       TrustCandidate = *Offset;
+     }
++    if ((AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "dram-base") == 0) && (Length == 8)) {
++      FloorCandidate = *Offset;
++    }
+     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-size") == 0) {
+       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
+       MemoryCandidate = *Offset;
+@@ -287,6 +296,9 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+     if (*TrustCacheOffset != MAX_UINTN) { return FALSE; }
+     *TrustCacheOffset = TrustCandidate;
+   }
++  if ((Path == 1) && (FloorCandidate != MAX_UINTN)) {
++    mWindowFloor = U64 (Data + FloorCandidate);
++  }
+   if (MemoryCandidate != MAX_UINTN) {
+     if ((Path != 1) || (*WindowSize != 0)) { return FALSE; }
+     *WindowSize = U64 (Data + MemoryCandidate);
+@@ -505,9 +517,9 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
+                     Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages));
+       RunBytes = End - Descriptor->PhysicalStart;
+       if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
+-      Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, KERNEL_BLOCK_SIZE) + (Kernel->Base & (KERNEL_BLOCK_SIZE - 1));
++      Candidate = ALIGN_VALUE (MAX (Descriptor->PhysicalStart, mWindowFloor), KERNEL_BLOCK_SIZE) + (Kernel->Base & (KERNEL_BLOCK_SIZE - 1));
+       if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
+-      if ((Pass == 0) && (Candidate + WindowSize > SIZE_4GB)) { continue; }
++      if ((Pass == 0) && (mWindowFloor == 0) && (Candidate + WindowSize > SIZE_4GB)) { continue; }
+       Status = ReserveRange (Map, Size, Stride, Candidate, WindowSize);
+       if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
+     }
+@@ -639,6 +651,7 @@ Boot (
+   TrustCacheOffset = MAX_UINTN;
+   WindowSize = 0;
+   KeepPacked = FALSE;
++  mWindowFloor = 0;
+   if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
