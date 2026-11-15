@@ -127,3 +127,11 @@ outside the RAM the ADT describes.
 raphael's 0x141004000. Use with the boot3-esp-v0 payload (unchanged). Ask for a
 photo of DarwinBoot's hand-off summary (pa, window, video) every time.
 
+**boot5 (2026-11-15):** probe kernel (CI 43747900875, 0263+0264) + boot4
+firmware: all five start.s squares appeared (entry, boot args, page tables,
+MMU on, return into arm_init), so the cold-boot assembly runs through. No early
+text because `sweet_early_set_cmdline` scans only the first 256 characters and
+`sweetearlyfb=1` sat at ~330: early_screen stayed 0. mkesp-betalm.sh now puts
+it first. Early marks: text rows from the top, a 48 px block per stage on the
+bottom 32 rows.
+
