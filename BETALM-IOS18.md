@@ -143,3 +143,13 @@ console is initialised, kprintf has no sink and the early console has no more
 marks. raphael debugged through the USB CDC-ECM log. Next: `-v` (XNU video
 console on boot_args Video), now first in mkesp-betalm.sh.
 
+**boot6 with `-v` (2026-11-15, user report): the kernel boots to the root wait.**
+Verbose console up (Bergamota's console art and header line, from
+osfmk/console/video_console.c), it repeatedly reports no iOS root (expected:
+userdata holds Android, boot is read-only), and **touch works**: the S3706
+RMI4 driver (0263, bit-banged SE17) reports the user's touches correctly.
+Status: firmware, hand-off, kernel window, early boot, console, touch: done.
+Next: an iOS 18.7.8 root (Bergamota's Renegade builder, tools/renegade, from
+Apple's IPSW on the user's PC), a partition for it (GPT full: resize an
+existing entry, user decides), GPU firmware from the G8S vendor image.
+
