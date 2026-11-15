@@ -1,0 +1,28 @@
+diff --git a/Platform/LG/sm8150/betalm.fdf.inc b/Platform/LG/sm8150/betalm.fdf.inc
+index 06736f7..b26efb4 100644
+--- a/Platform/LG/sm8150/betalm.fdf.inc
++++ b/Platform/LG/sm8150/betalm.fdf.inc
+@@ -58,3 +58,23 @@ FILE FREEFORM = 25462CDA-221F-47DF-AC1D-259CFAA4E326 {
+   #
+   # INF Silicon/Qualcomm/QcomPkg/Drivers/SynapticsRmi4Dxe/SynapticsTouchDevice.inf
+   # INF Silicon/Qualcomm/QcomPkg/Drivers/SynapticsRmi4Dxe/SynapticsTouchDxe.inf
++
++// UniXNU boot manager + DarwinBoot XNU loader (ios-sweet ios18-betalm).
++// Prebuilt with Mu_Basecore (UniXNU b6ae99c + UniXNU-raphael patches); the
++// pinned 2022 edk2 here cannot compile UniXNUPkg. UniXNUDxe registers the
++// UniXNU application (FV file 9B665204-...) first in BootOrder.
++FILE APPLICATION = 9B665204-A133-47A2-9396-9E2B370A4E25 {
++    SECTION PE32 = Platform/LG/sm8150/UniXNU/UniXNU.efi
++    SECTION UI = "UniXNU"
++}
++
++FILE DRIVER = 29B950CF-586D-49EA-9D71-F88645CCDAF6 {
++    SECTION DXE_DEPEX = Platform/LG/sm8150/UniXNU/UniXNUDxe.depex
++    SECTION PE32 = Platform/LG/sm8150/UniXNU/UniXNUDxe.efi
++    SECTION UI = "UniXNUDxe"
++}
++
++FILE DRIVER = 1B64AF87-8415-4B57-9B16-680D70913B9F {
++    SECTION PE32 = Platform/LG/sm8150/UniXNU/DarwinBoot.efi
++    SECTION UI = "DarwinBoot"
++}

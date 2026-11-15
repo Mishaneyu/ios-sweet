@@ -17,6 +17,27 @@ as kernel patch `xnu/patches-11215/0263`.
 - `tools/mkadt.py --board betalm` added (not run: needs Apple's D22AP tree).
 - Nothing booted on the phone yet.
 
+## Firmware: Renegade edk2-msm + UniXNU (boot1)
+
+`firmware/renegade-betalm/build.sh OUT.img` builds Renegade's betalm UEFI
+(edk2-msm e195262) with three extra files in its firmware volume: UniXNU.efi
+(app), UniXNUDxe (puts UniXNU first in BootOrder) and DarwinBoot, prebuilt
+with Mu_Basecore at the raphael pin b6ae99c + raphael's UniXNU/DarwinBoot
+patches (Renegade's 2022 edk2 cannot compile UniXNUPkg). Reproduced from a
+clean directory in 4m15s.
+
+Renegade's betalm config: framebuffer 0x9D200000 1080x2248 (the panel buffer
+the iOS 16 shim found; Windows ran on it, so the panel keeps refreshing), 6 GB
+memory map with a free run 0x140000000 + 0xC0000000 (matches mkadt's window).
+
+**boot1-v0.img** (2026-11-15, sha256 40c32893...8037): UEFI + UniXNU menu
+only, no kernel, no payload. `fastboot boot` only (RAM, writes nothing).
+Expected: Renegade splash and countdown, then the UniXNU menu (it lists
+`\EFI\BOOT\BOOTAA64.EFI` entries it finds, i.e. GRUB on the Arch ESP, plus
+its built-in actions). If GRUB/Arch boots directly instead, BootOrder was not
+honoured: reboot, press a side button for SimpleInit and pick UniXNU in the
+UEFI boot menu. Not tested on the phone yet.
+
 ## What 0263 does
 
 | Area | betalm |
