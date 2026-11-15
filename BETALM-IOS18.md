@@ -135,3 +135,11 @@ text because `sweet_early_set_cmdline` scans only the first 256 characters and
 it first. Early marks: text rows from the top, a 48 px block per stage on the
 bottom 32 rows.
 
+**boot6 (2026-11-15):** with `sweetearlyfb=1` first, all early marks 1-20 drew
+(incl. 17/18 fbcon config + mapping), then nothing for 60 s+. Not a betalm
+fault: serial_init registers sweet-fbcon, then returns 0 because the ADT
+`/defaults` has no `serial-device` (raphael's ADT is the same), so no serial
+console is initialised, kprintf has no sink and the early console has no more
+marks. raphael debugged through the USB CDC-ECM log. Next: `-v` (XNU video
+console on boot_args Video), now first in mkesp-betalm.sh.
+
