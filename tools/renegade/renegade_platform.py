@@ -462,9 +462,20 @@ class Linux(Backend):
         for dev in r.stdout.split():
             self.detach(dev)
 
+    @staticmethod
+    def fsck_repair_cmd(img):
+        # Linux mkfs.hfsplus and the hfsplus driver leave kHFSHasFolderCountMask clear and folderCount 0 on every folder of
+        # an HFSX volume (macOS newfs_hfs / the macOS driver set them). fsck_hfs reports each as "HasFolderCount flag needs
+        # to be set" and the read-only check fails. One repairing pass sets the flags and counts the way macOS would.
+        return ['fsck.hfsplus', '-f', '-y', img]
+
     def fsck(self, img):
+        rr = self.run(self.fsck_repair_cmd(img), check=False)
         r = self.run(self.fsck_cmd(img), check=False)
-        return r.returncode, r.stdout + r.stderr
+        out = r.stdout + r.stderr
+        if rr.returncode not in (0, None):
+            out = f'(repair pass exit {rr.returncode})\n' + (rr.stdout or '') + (rr.stderr or '') + out
+        return r.returncode, out
 
     def copy_tree(self, src, dst, exclude=(), rel=''):
         """Copy src into dst like ditto does for our purposes: directories (mode), regular files, symlinks and hard links;

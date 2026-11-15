@@ -96,6 +96,8 @@ class TestLinuxCommands(unittest.TestCase):
         self.assertEqual(h[6][0], 'copytree')
         self.assertTrue(any(c[0] == '/fake/ldid' and '-Icom.apple.mount' in c for c in h))
         self.assertTrue(any(c[0] == 'fsck.hfsplus' for c in h))
+        i = h.index(['fsck.hfsplus', '-f', '-y', '/w/r.img'])      # folder-count repair pass first,
+        self.assertEqual(h[i + 1], ['fsck.hfsplus', '-f', '-n', '/w/r.img'])   # then the read-only verification
         self.assertTrue(any(c[:2] == ['losetup', '-d'] for c in h))
         self.assertFalse(any(c[0] in ('hdiutil', 'newfs_hfs', 'codesign', 'ditto') for c in h))
 
