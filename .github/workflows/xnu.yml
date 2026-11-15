@@ -1,5 +1,6 @@
 name: betalm/raphael kernel (xnu-11215, iOS 18)
 
+# ios18-betalm: the same kernel also carries the LG G8S board (patch 0263, BETALM-IOS18.md).
 # The Bergamota / ios-sweet "Heartwood" kernel (xnu-11215.81.4, MACHINE_CONFIG=SWEET) with the patch series in
 # xnu/patches-11215 (upstream ry-diffusion/Bergamota + the raphael patches 0260-0262), built by blacktop's
 # darwin-xnu-build on a macOS runner. Pack the result with tools/raphael/mkboot-raphael.sh (see docs/IOS18.md).
