@@ -100,3 +100,16 @@ bit2 swap), `sweettouchfingers=N` (object slots read, default 2),
    OSM DCVS), Wi-Fi (0093).
 
 Test images: number every one uniquely (boot1, boot2, ...), never reuse.
+
+**boot2 on the phone (2026-11-15):** UniXNU ran the entry, DarwinBoot drew its
+green bar (= DarwinBoot's own DarwinEnter breadcrumb, just before the jump), then
+nothing more. Cause found: the ADT `sweet-fbcon` reg was 0x9c000000 (raphael's
+GOP); on the G8S the scan-out buffer is 0x9d200000, so all kernel console output
+went off screen. The early console is log-only unless `sweetearlyfb=1`.
+
+**boot3-esp-v0.zip:** same kernel; ADT fb = 0x9d200000 + 0x1200000 (to the end
+of Display Reserved; TGCM follows at 0x9e400000), boot-args + `sweetearlyfb=1`.
+Note for the GUI stage: AppleCLCD::flipSetup assumes 36 MiB after the scan-out
+buffer; on betalm buffer 2 would land in TGCM. Page flipping is off by default
+(`sweetfb_flip`/`sweetfb_hw`), so this needs a betalm region end before enabling it.
+

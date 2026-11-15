@@ -94,9 +94,10 @@ BOARDS = {
     # DarwinBoot, the same chain as raphael. Same SoC blocks as raphael; drivers check
     # 'lge,betalm' (touch S3706, zap region) or sweet_board_sm8150() (keys, RTC, battery, GPU).
     'betalm': dict(
-        # cont_splash 0x9c000000 + 36 MiB (ABL's scan-out buffer is 0x9d200000 inside it);
-        # panel 1080x2248. TO VERIFY against the betalm UEFI's GOP before the first boot.
-        fb=(0x9c000000, 0x2400000), fb_wh=(1080, 2248),
+        # The scan-out buffer (Renegade GOP, PcdMipiFrameBufferAddress) is 0x9d200000, 18 MiB into
+        # Display Reserved 0x9c000000-0x9e400000; TGCM (reserved) follows. sweet-fbcon must name the
+        # buffer itself: boot2 with 0x9c000000 drew the kernel console off screen (2026-11-15).
+        fb=(0x9d200000, 0x1200000), fb_wh=(1080, 2248),
         compat=['lge,betalm', 'xiaomi,sweet', 'qcom,sm8150'],
         # 0-3 Kryo 485 Silver (A55), 4-6 Gold, 7 Prime (A76); SweetCPU matches kryo470
         cpu_compat='qcom,kryo470', big_from=4, freqs=(1785600000, 2419200000),

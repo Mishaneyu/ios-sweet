@@ -10,7 +10,7 @@
 # (the UFS driver then refuses every write) and sweetlog=0.
 set -euo pipefail
 KERNEL=${1:?kernel}; ADT=${2:?adt}; OUT=$(realpath -m "${3:?out.zip}")
-DEFAULT_ARGS="debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60 sweetusb=2 sweetarm64e=1 launchd_disable_all_timeouts=1 sweetlog=0 sweetgpu=0 sweettouchdelay=20"
+DEFAULT_ARGS="debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60 sweetusb=2 sweetarm64e=1 launchd_disable_all_timeouts=1 sweetlog=0 sweetgpu=0 sweettouchdelay=20 sweetearlyfb=1"
 ARGS=${CMDLINE:-$DEFAULT_ARGS}
 case " $ARGS " in
   *" sweetlog=1 "*|*" ufsrw=1 "*|*" rootrw=1 "*)
