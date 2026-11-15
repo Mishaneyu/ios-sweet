@@ -1,0 +1,526 @@
+raphael: Redmi K20 Pro / Mi 9T Pro (SM8150) board, volume-up key, GT9886 touch
+
+sweet_board.h gains sweet_board_raphael() (ADT root compatible
+"xiaomi,raphael"; the ADT keeps "xiaomi,sweet" too, so every other driver
+takes the sweet defaults, which already ran on raphael with xnu-8796).
+
+sweet_keys.c: volume-up is PM8150 GPIO6 at SPMI SID 0 0xc500 (status
+0xc510), the same peripheral address as on the Poco F1.
+
+sweet_touch.c: a third touch board. Goodix GT9886 (Normandy protocol) at
+0x5d on QUP19 = wrapper 2 SE2 @0xc88000, SDA/SCL GPIO 57/58 function 2,
+reset 54, IRQ 122, load switches GPIO 98/100, all in the TLMM SOUTH tile
+(0x03d00000). Clocks: GCC vote 0x52014 bits 1/2/6, RCG 0x1e3a8, wrapper 2
+AHB branches 0x1e004/0x1e008 (the latter hardware gated); a DFS RCG uses the
+first boot-programmed XO/1 level through the SE CLK_SEL. The clocks are
+voted before the first SE register read. Protocol from Xiaomi raphael-p-oss
+goodix_driver_gt9886 + goodix_gt9886_cfg_f11.bin: doze off via
+0x30f0/0x3100, 72-byte version block at 0x452c (zero sum, PID "9886",
+sensor ID 0x4541), frames at 0x4100 with an 8-bit zero-sum checksum and a
+0x00 acknowledge; sensor 0 mirrors both axes, sweettouchflip=N overrides.
+Ported from UniXNU-raphael patch 0112 (xnu-8796, verified on the phone
+2026-11-05). A GSI-only SE falls back to the existing bit-banged I2C.
+The sweet and beryllium boards are unchanged (their new table fields are 0).
+
+Host test: tools/raphael/touch-test (109 checks).
+
+diff --git a/bsd/dev/sweet_board.h b/bsd/dev/sweet_board.h
+index 3d9c06a..e52eed0 100644
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -3,6 +3,9 @@
+  * (tools/mkadt.py --board) names the board; everything else is common.
+  *   xiaomi,sweet      Redmi Note 10 Pro, SM7150 (default)
+  *   xiaomi,beryllium  Poco F1, SDM845
++ *   xiaomi,raphael    Redmi K20 Pro / Mi 9T Pro, SM8150 (keeps "xiaomi,sweet"
++ *                     in its compatible list too, so it takes the sweet
++ *                     defaults except where a driver checks for raphael)
+  */
+ #ifndef _SWEET_BOARD_H_
+ #define _SWEET_BOARD_H_
+@@ -76,4 +79,14 @@ sweet_board_beryllium(void)
+ 	return cached == 1;
+ }
+ 
++static inline bool
++sweet_board_raphael(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		cached = sweet_board_is("xiaomi,raphael") ? 1 : 0;
++	}
++	return cached == 1;
++}
++
+ #endif /* _SWEET_BOARD_H_ */
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 4faeee1..8610488 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -3,6 +3,8 @@
+  * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+  * Poco F1 (beryllium): power/RESIN on PM8998 PON (SID 0, same block),
+  * volume-up on PM8998 GPIO6 (SID 0, 0xc500; mainline gpio-keys).
++ * Redmi K20 Pro (raphael): the same layout on PM8150 (PON SID 0 0x0810,
++ * volume-up GPIO6 SID 0 0xc500).
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+@@ -142,7 +144,8 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
+-	if (sweet_board_beryllium()) {
++	/* raphael: volume-up is PM8150 GPIO6, SID 0 at 0xc500 (status 0xc510), as on the Poco F1 */
++	if (sweet_board_beryllium() || sweet_board_raphael()) {
+ 		keys_gpio_base = 0xc500u;
+ 		keys_gpio_ppid = 0x0c5u;
+ 	}
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 204207f..93daa07 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -15,6 +15,17 @@
+  * edge, 1080x2246). Probed first, without a reset: the TDDI shares its reset
+  * pin with the display. Standard Focaltech frame: reg 0 mode, reg 2 point
+  * count, 6-byte records from reg 3.
++ *
++ * Redmi K20 Pro / Mi 9T Pro (raphael, SM8150): Goodix GT9886 (Normandy) at
++ * 0x5d on QUP19 = wrapper 2 SE2 @0xc88000, SDA/SCL GPIO 57/58 (function 2),
++ * reset 54, IRQ 122, load switches GPIO 98 (vdd) / 100 (avdd), all in the
++ * TLMM SOUTH tile. GCC vote 0x52014 bits 1/2/6, RCG 0x1e3a8. Protocol from
++ * Xiaomi raphael-p-oss goodix_driver_gt9886 and goodix_gt9886_cfg_f11.bin:
++ * doze off via 0x30f0/0x3100, 72-byte version block at 0x452c (zero sum, PID
++ * "9886", sensor ID at 0x4541), frames at 0x4100 with an 8-bit zero-sum
++ * checksum and a 0x00 acknowledge. Sensor 0 mirrors both axes (DT
++ * goodix,x2x/y2y); boot-arg sweettouchflip=N (bit0 x, bit1 y) overrides.
++ * The only IC writes are doze control and the event acknowledge.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -47,6 +58,21 @@ void sweet_touch_init(void);
+ #define TOUCH_FTS        2
+ #define TOUCH_NVT        3
+ #define TOUCH_FT8719     4
++#define TOUCH_GT9886     5
++/* GT9886 Normandy (raphael) */
++#define NOR_ADDR         0x5du
++#define NOR_VERSION_REG  0x452cu /* 72 bytes, 8-bit sum is zero */
++#define NOR_VERSION_LEN  72u
++#define NOR_PID_OFF      9u      /* 0x4535: ASCII "9886" */
++#define NOR_VID_OFF      17u     /* 0x453d */
++#define NOR_SENSOR_OFF   21u     /* 0x4541, low nibble */
++#define NOR_EVENT_REG    0x4100u
++#define NOR_POINT_LEN    8u
++#define NOR_FIRST_LEN    12u     /* status, count, one point, key, checksum */
++#define NOR_DOZE_CTRL    0x30f0u
++#define NOR_DOZE_STAT    0x3100u
++#define RAPHAEL_VDD_GPIO  98u    /* DT goodix,vdd-gpio */
++#define RAPHAEL_AVDD_GPIO 100u   /* DT goodix,avdd-gpio */
+ /* FT8719 (Focaltech TDDI, EBBG Poco F1) */
+ #define FT_ADDR          0x38u
+ #define FT_ID_REG        0xa3u  /* chip id high: 0x87 */
+@@ -72,14 +98,31 @@ struct touch_board {
+ 	unsigned sda, scl, mux, irq, rst;
+ 	unsigned w, h;
+ 	bool rpmh_l11c;   /* sweet: L11C vote + GPIO90 digital enable */
++	/* Zero = the sweet/beryllium values (wrapper 1, TLMM NORTH). */
++	uint32_t vote_reg;            /* GCC vote register (TOUCH_GCC_VOTE) */
++	uint32_t gpio_pa, gpio_size;  /* TLMM tile holding every touch pin */
++	uint32_t ahb[2];              /* wrapper m/s AHB branches (0x18004.. on wrapper 1) */
++	uint32_t ahb_hwcg;            /* ahb[1] CBCR bit that hands CLK_OFF to hardware gating */
+ };
+ static const struct touch_board touch_sweet = {
+ 	"SE7", 0x00a84000u, 0x18148u, (0x0fu << 18) | (1u << 23), 0x18144u,
+ 	6, 7, 1, 9, 8, 1080, 2400, true,
++	0, 0, 0, {0, 0}, 0,
+ };
+ static const struct touch_board touch_beryllium = {
+ 	"SE14", 0x00a98000u, 0x18738u, (0x0fu << 18) | (1u << 28), 0x18734u,
+ 	33, 34, 2, 31, 32, 1080, 2246, false,
++	0, 0, 0, {0, 0}, 0,
++};
++/*
++ * raphael: gcc-sm8150.c vote 0x52014 BIT(1) wrap_2_s_ahb (CBCR 0x1e008, HW
++ * gated by bit 1), BIT(2) wrap_2_m_ahb (0x1e004), BIT(6) wrap2_s2 (0x1e3a4);
++ * RCG 0x1e3a8. Pins per pinctrl-sm8150.c, SOUTH tile 0x03d00000.
++ */
++static const struct touch_board touch_raphael = {
++	"QUP19", 0x00c88000u, 0x1e3a8u, (1u << 1) | (1u << 2) | (1u << 6), 0x1e3a4u,
++	57, 58, 2, 122, 54, 1080, 2340, false,
++	0x52014u, 0x03d00000u, 0x7b000u, {0x1e004u, 0x1e008u}, 2u,
+ };
+ static const struct touch_board *tb = &touch_sweet;
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+@@ -127,6 +170,7 @@ static struct {
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
++	unsigned clk_sel, sensor, flip;   /* SE DFS level; raphael GT9886 sensor ID and axis mirroring */
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+ } st;
+ static int touch_sleep_chan;
+@@ -186,20 +230,37 @@ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out,
+ static bool
+ touch_clocks(void)
+ {
+-	/* Vote on only wrapper1 and the touch SE, preserving other clock users. */
++	/* Vote on only the touch wrapper and SE, preserving other clock users. */
+ 	uint32_t mask = tb->vote;
+-	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
++	uint32_t vote_reg = tb->vote_reg ? tb->vote_reg : TOUCH_GCC_VOTE;
++	touch_wr(st.gcc, vote_reg, touch_rd(st.gcc, vote_reg) | mask);
+ 	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+ 	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+ 	printf("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+-	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
++	    touch_rd(st.gcc, vote_reg), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
++	st.clk_sel = 0;
+ 	if (dfs & 1u) {
+-		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
+-		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
+-		if ((cfg & 0x371fu) != 1u) {
+-			printf("SWEET TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
++		/*
++		 * SE CLK_SEL selects the DFS performance level. Use the first level
++		 * the boot firmware programmed as XO/1 (level 0 on sweet); never
++		 * alter the tables.
++		 */
++		unsigned level;
++		for (level = 0; level < 8u; ++level) {
++			cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu + 4u * level);
++			if ((cfg & 0x371fu) == 1u) {
++				break;
++			}
++		}
++		if (level == 8u) {
++			printf("SWEET TOUCH: no DFS level is XO/1 (level0=%#x); need clock integration\n",
++			    touch_rd(st.gcc, TOUCH_RCG + 0x1cu));
+ 			return false;
+ 		}
++		st.clk_sel = level;
++		if (level) {
++			printf("SWEET TOUCH: DFS level %u is XO/1\n", level);
++		}
+ 	} else {
+ 		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
+ 		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
+@@ -210,8 +271,15 @@ touch_clocks(void)
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, tb->se_branch};
+-	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++	const uint32_t wrap1[] = {0x18004, 0x18008, 0x1800c, 0x18010, tb->se_branch};
++	const uint32_t own[] = {tb->ahb[0], tb->ahb[1], tb->se_branch};
++	const uint32_t *branches = tb->ahb[0] ? own : wrap1;
++	unsigned nbranch = tb->ahb[0] ? 3u : 5u;
++	for (unsigned i = 0; i < nbranch; ++i) {
++		if (tb->ahb_hwcg && branches[i] == tb->ahb[1] &&
++		    (touch_rd(st.gcc, branches[i]) & tb->ahb_hwcg)) {
++			continue; /* hardware clock gating owns CLK_OFF */
++		}
+ 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+ 			    touch_rd(st.gcc, branches[i]));
+@@ -890,6 +958,222 @@ touch_ft8719(void)
+ 	return 0;
+ }
+ 
++/* Plain register write: FIFO message (at most 3 bytes) or a bit-banged write. */
++static int
++touch_write(uint8_t addr, const uint8_t *buf, unsigned n)
++{
++	if (st.bitbang) {
++		return bb_xfer(addr, buf, n, NULL, 0);
++	}
++	return touch_msg(addr, buf, n, NULL, 0, false);
++}
++
++static int
++touch_nor_write(uint16_t reg, uint8_t val)
++{
++	const uint8_t msg[3] = {(uint8_t)(reg >> 8), (uint8_t)reg, val};
++	return touch_write(NOR_ADDR, msg, sizeof(msg));
++}
++
++/*
++ * GT9886 Normandy frame, vendor goodix_touch_handler: [0] status, [1] count
++ * in the low nibble, 8 bytes per point from [2] (id low nibble, x LE16,
++ * y LE16, width, ...), then key and checksum; the 8-bit sum over
++ * count * 8 + 4 bytes is zero. Pen records (>= 0x80) are dropped. flip
++ * bit 0 mirrors x and bit 1 mirrors y (DT goodix,x2x / goodix,y2y).
++ * No I/O: buf holds at least count * 8 + 4 bytes.
++ */
++static int
++touch_nor_parse(const uint8_t *buf, unsigned n, uint32_t *maskp, int *x, int *y)
++{
++	uint8_t sum = 0;
++	uint32_t mask = 0;
++	unsigned max_x = tb->w - 1u, max_y = tb->h - 1u;
++	if (n > TOUCH_MAX) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < n * NOR_POINT_LEN + 4u; ++i) {
++		sum = (uint8_t)(sum + buf[i]);
++	}
++	if (sum) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		const uint8_t *p = buf + 2u + i * NOR_POINT_LEN;
++		if (p[0] & 0x80u) {
++			continue;
++		}
++		unsigned id = p[0] & 15u;
++		unsigned px = p[1] | ((unsigned)p[2] << 8);
++		unsigned py = p[3] | ((unsigned)p[4] << 8);
++		if (id >= TOUCH_MAX || (mask & (1u << id)) || px > max_x || py > max_y) {
++			return EIO;
++		}
++		if (st.flip & 1u) {
++			px = max_x - px;
++		}
++		if (st.flip & 2u) {
++			py = max_y - py;
++		}
++		mask |= 1u << id;
++		x[id] = (int)px;
++		y[id] = (int)py;
++	}
++	*maskp = mask;
++	return 0;
++}
++
++/*
++ * Vendor goodix_set_i2c_doze_mode(false): request 0xaa, wait for 0xbb.
++ * Doze is never re-enabled: this driver polls instead of waiting for the
++ * IRQ, so the IC has to stay awake between reads.
++ */
++static int
++touch_nor_doze_off(void)
++{
++	uint8_t v = 0;
++	int err = touch_nor_write(NOR_DOZE_CTRL, 0xaa);
++	touch_wait(1);
++	for (unsigned i = 0; i < 9u; ++i) {
++		err = touch_read(NOR_ADDR, NOR_DOZE_STAT, true, &v, 1);
++		if (!err && v == 0xbbu) {
++			return 0;
++		}
++		if (err || v != 0xaau) {
++			(void)touch_nor_write(NOR_DOZE_CTRL, 0xaa);
++		}
++		touch_wait(10);
++	}
++	printf("SWEET TOUCH: normandy doze-off not confirmed (stat=%#x err=%d)\n", v, err);
++	return err ? err : ETIMEDOUT;
++}
++
++/*
++ * Vendor goodix_read_version: the 72-byte version block sums to zero and
++ * holds PID "9886" at 0x4535, VID at 0x453d and the sensor ID at 0x4541.
++ */
++static int
++touch_nor_probe(void)
++{
++	uint8_t v[NOR_VERSION_LEN];
++	uint8_t sum = 0;
++	memset(v, 0xa5, sizeof(v));
++	int err = touch_read(NOR_ADDR, NOR_VERSION_REG, true, v, sizeof(v));
++	if (!err) {
++		for (unsigned off = 0; off < sizeof(v); off += 16) {
++			char line[49];
++			unsigned len = sizeof(v) - off < 16u ? (unsigned)sizeof(v) - off : 16u;
++			line[0] = '\0';
++			for (unsigned j = 0; j < len; ++j) {
++				(void)snprintf(line + j * 3u, 4, "%02x ", v[off + j]);
++			}
++			printf("SWEET TOUCH: probe raw %#x: %s\n", NOR_VERSION_REG + off, line);
++		}
++		for (unsigned i = 0; i < sizeof(v); ++i) {
++			sum = (uint8_t)(sum + v[i]);
++		}
++	}
++	const uint8_t *pid = v + NOR_PID_OFF, *vid = v + NOR_VID_OFF;
++	printf("SWEET TOUCH: normandy version err=%d sum=%#x pid=%02x%02x%02x%02x vid=%02x%02x%02x%02x sensor=%u\n",
++	    err, sum, pid[0], pid[1], pid[2], pid[3], vid[0], vid[1], vid[2], vid[3],
++	    v[NOR_SENSOR_OFF] & 15u);
++	if (err) {
++		return err;
++	}
++	if (sum || pid[0] != '9' || pid[1] != '8' || pid[2] != '8' || pid[3] != '6') {
++		return ENODEV;
++	}
++	st.sensor = v[NOR_SENSOR_OFF] & 15u;
++	return 0;
++}
++
++static int
++touch_goodix_nor(void)
++{
++	uint8_t buf[NOR_FIRST_LEN + (TOUCH_MAX - 1u) * NOR_POINT_LEN];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	int err = touch_read(NOR_ADDR, NOR_EVENT_REG, true, buf, NOR_FIRST_LEN);
++	if (err) {
++		return err;
++	}
++	if (!(buf[0] & 0x80u)) {
++		/* Do not acknowledge firmware/config requests that we cannot service. */
++		if (buf[0] & 0x40u) {
++			return ENOTSUP;
++		}
++		return 0; /* no new touch frame: retain current contacts */
++	}
++	unsigned n = buf[1] & 15u;
++	if (n > TOUCH_MAX) {
++		err = EIO;
++	} else if (n > 1u) {
++		err = touch_read(NOR_ADDR, NOR_EVENT_REG + NOR_FIRST_LEN, true,
++		    buf + NOR_FIRST_LEN, (n - 1u) * NOR_POINT_LEN);
++	}
++	if (!err) {
++		err = touch_nor_parse(buf, n, &mask, x, y);
++	}
++	/* Like the vendor handler, clear the status for every touch frame seen. */
++	int ack = touch_nor_write(NOR_EVENT_REG, 0);
++	if (!err) {
++		err = ack;
++	}
++	if (!err) {
++		touch_report(mask, x, y);
++	}
++	return err;
++}
++
++/* raphael: power the GT9886 through its load switches, reset it, leave doze. */
++static bool
++touch_raphael_start(void)
++{
++	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd=%#x avdd=%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(RAPHAEL_VDD_GPIO)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(RAPHAEL_AVDD_GPIO)));
++	/*
++	 * Vendor goodix_ts_power_init/power_on/gpio_setup: IRQ an input with
++	 * pull-up, reset held low while the load switches turn on. 16 mA and
++	 * pull-up follow the DT tp_active state.
++	 */
++	touch_gpio(tb->irq, 0, 3, 7, false, false);
++	touch_gpio(tb->rst, 0, 3, 7, true, false);
++	touch_gpio(RAPHAEL_VDD_GPIO, 0, 0, 0, true, true);
++	touch_gpio(RAPHAEL_AVDD_GPIO, 0, 0, 0, true, true);
++	touch_wait(300); /* DT goodix,power-on-delay-us = 300000 */
++	if (st.bitbang) {
++		touch_gpio(tb->sda, 0, 0, 0, false, false); /* GPIO function, released */
++		touch_gpio(tb->scl, 0, 0, 0, false, false);
++	} else {
++		touch_gpio(tb->sda, tb->mux, 0, 0, false, false); /* qup19, 2 mA, no pull */
++		touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
++	}
++	/* Vendor goodix_hw_reset (Normandy): low 2 ms, high, then wait. */
++	touch_gpio(tb->rst, 0, 3, 7, true, false);
++	touch_wait(2);
++	touch_gpio(tb->rst, 0, 3, 7, true, true);
++	touch_wait(300);
++	st.probing = true;
++	int derr = touch_nor_doze_off();
++	int perr = touch_nor_probe();
++	st.probing = false;
++	if (st.dead || perr) {
++		printf("SWEET TOUCH: no GT9886 Normandy at %#x (doze=%d probe=%d dead=%d); stopping\n",
++		    NOR_ADDR, derr, perr, st.dead);
++		return false;
++	}
++	/* DT sensor0 carries goodix,x2x and goodix,y2y; sensor1 does not. */
++	int flip = -1;
++	(void)PE_parse_boot_argn("sweettouchflip", &flip, sizeof(flip));
++	st.flip = flip >= 0 ? (unsigned)flip & 3u : (st.sensor == 0 ? 3u : 0u);
++	printf("SWEET TOUCH: GT9886 sensor=%u flip=%u%s\n", st.sensor, st.flip,
++	    flip >= 0 ? " (sweettouchflip)" : "");
++	st.kind = TOUCH_GT9886;
++	return true;
++}
++
+ static int
+ touch_nvt_params(void)
+ {
+@@ -1012,7 +1296,7 @@ touch_se_init(void)
+ 	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
+ 	touch_wr(st.se, 0x24, 0x7f);
+ 	touch_wr(st.se, 0x20, 1);
+-	touch_wr(st.se, SE_CLK_SEL, 0);
++	touch_wr(st.se, SE_CLK_SEL, st.clk_sel);
+ 	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+ 	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
+ 	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+@@ -1057,21 +1341,27 @@ touch_thread(void *arg, wait_result_t result)
+ 	touch_wait(delay_s * 1000u);
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/%s\n", tb->name);
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
++	st.gpio = ml_io_map(tb->gpio_pa ? tb->gpio_pa : TOUCH_NORTH_PA,
++	    tb->gpio_size ? tb->gpio_size : 0x5b000);
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+ 	if (!st.gcc || !st.gpio || !st.se) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+ 	if (!tb->rpmh_l11c) {
++		/* raphael: vote the wrapper 2 clocks before the first SE register read */
++		bool early_clocks = tb == &touch_raphael;
++		if (early_clocks && !touch_clocks()) {
++			goto out;
++		}
+ 		uint32_t ifdis = touch_rd(st.se, 0x64), fw = touch_rd(st.se, SE_FW);
+ 		st.bitbang = (ifdis & 1u) != 0;
+ 		printf("SWEET TOUCH: %s fw=%#x if-disable=%#x -> %s\n", tb->name, fw, ifdis,
+ 		    st.bitbang ? "GSI-only SE, bit-banged I2C on the GPIOs" : "FIFO I2C");
+-		if (!st.bitbang && (!touch_clocks() || !touch_se_init())) {
++		if (!st.bitbang && ((!early_clocks && !touch_clocks()) || !touch_se_init())) {
+ 			goto out;
+ 		}
+-		if (!touch_beryllium_start()) {
++		if (!(tb == &touch_raphael ? touch_raphael_start() : touch_beryllium_start())) {
+ 			goto out;
+ 		}
+ 		goto selected;
+@@ -1121,6 +1411,7 @@ touch_thread(void *arg, wait_result_t result)
+ selected:
+ 	printf("SWEET TOUCH: selected %s, %ux%u, poll=%ums i2c-half=%uus irq-hint=%d\n",
+ 	    st.kind == TOUCH_NVT ? "NT36672A" : st.kind == TOUCH_FT8719 ? "Focaltech FT8719" :
++	    st.kind == TOUCH_GT9886 ? "GT9886 Normandy" :
+ 	    st.kind == TOUCH_GOODIX ? "GT9896 Yellowstone" : "Focaltech 54:52",
+ 	    tb->w, tb->h, touch_poll_ms, bb_half_us, st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+@@ -1158,6 +1449,7 @@ selected:
+ 			since_read = 0;
+ 			touch_trace_why = pending ? 'e' : 'a';
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
++			    st.kind == TOUCH_GT9886 ? touch_goodix_nor() :
+ 			    st.kind == TOUCH_NVT ? touch_novatek() :
+ 			    st.kind == TOUCH_FT8719 ? touch_ft8719() : touch_focaltech();
+ 			if (err) {
+@@ -1178,6 +1470,10 @@ selected:
+ 				if (errors == 10) {
+ 					touch_report(0, st.x, st.y); /* release after persistent bad reads */
+ 				}
++				if (st.kind == TOUCH_GT9886 && errors == 20) {
++					/* An IC reset (ESD, watchdog) turns doze back on. */
++					(void)touch_nor_doze_off();
++				}
+ 			} else {
+ 				errors = 0;
+ 			}
+@@ -1199,7 +1495,9 @@ sweet_touch_init(void)
+ 		return;
+ 	}
+ 	st.started = true;
+-	if (sweet_board_beryllium()) {
++	if (sweet_board_raphael()) {
++		tb = &touch_raphael;    /* GT9886 on FIFO I2C: poll every 10 ms as on sweet */
++	} else if (sweet_board_beryllium()) {
+ 		tb = &touch_beryllium;
+ 		st.irq_hint = 1; /* bit-banged reads are slow: only on IRQ edges or while touched */
+ 	}

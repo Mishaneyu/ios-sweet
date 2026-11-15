@@ -1,0 +1,7 @@
+# Keep scripts and CI files LF so they run correctly on the Linux/macOS runners.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.patch text eol=lf

@@ -1,0 +1,28 @@
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
+index 109479e..84dc657 100644
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -19,6 +19,14 @@
+ 
+ #define WINDOW_SIZE  SIZE_256MB
+ #define BLOCK_SIZE   SIZE_2MB
++//
++// The kernel's bootstrap page tables use 2 MiB L2 blocks on a 4 KiB build
++// and 32 MiB L2 blocks on a 16 KiB build; 32 MiB covers both because it is a
++// multiple of 2 MiB. The physical base must be congruent to the kernel's
++// virtual base modulo that block size, otherwise the first fetch after the
++// MMU is enabled lands one block away.
++//
++#define KERNEL_BLOCK_SIZE  SIZE_32MB
+ #define MAX_SEGMENTS 64
+ 
+ typedef struct {
+@@ -418,7 +426,7 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
+                   Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages));
+     RunBytes = End - Descriptor->PhysicalStart;
+     if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
+-    Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
++    Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, KERNEL_BLOCK_SIZE) + (Kernel->Base & (KERNEL_BLOCK_SIZE - 1));
+     if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
+     Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
+     if (!EFI_ERROR (Status)) { *Address = Candidate; break; }

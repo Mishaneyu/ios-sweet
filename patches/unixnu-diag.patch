@@ -1,0 +1,288 @@
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Internal.h b/package/UniXNUPkg/Library/UniXNULib/Internal.h
+index a4ab4d9..e865fcd 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Internal.h
++++ b/package/UniXNUPkg/Library/UniXNULib/Internal.h
+@@ -572,6 +572,17 @@ UniXNUUiDrawStatus (
+   IN CONST CHAR16  *Text
+   );
+ 
++/**
++  Bring-up diagnostics: Lines over the whole screen in the status font,
++  hard-wrapped to the screen width. The menu redraws everything afterwards.
++**/
++VOID
++UniXNUUiDrawDiag (
++  IN UNIXNU_UI            *Ui,
++  IN CONST CHAR16 *CONST  *Lines,
++  IN UINTN                Count
++  );
++
+ VOID
+ UniXNULogoRender (
+   OUT EFI_GRAPHICS_OUTPUT_BLT_PIXEL  *Buffer,
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Main.c b/package/UniXNUPkg/Library/UniXNULib/Main.c
+index 76dc7a6..82b8593 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Main.c
++++ b/package/UniXNUPkg/Library/UniXNULib/Main.c
+@@ -8,9 +8,26 @@
+ #include "Internal.h"
+ 
+ #include <Protocol/SerialIo.h>
++#include <Protocol/UniXNULoader.h>
+ 
+ STATIC EFI_SERIAL_IO_PROTOCOL  *mSerial;
+ 
++//
++// Bring-up diagnostics (UniXNU-raphael): the last log lines, shown on screen
++// when an entry fails, for devices whose serial log cannot be read.
++//
++#define DIAG_LOG_LINES   14
++#define DIAG_LOG_CHARS   80
++#define DIAG_TEXT_LINES  32
++#define DIAG_TEXT_CHARS  128
++#define DIAG_RANGES      128
++
++STATIC CHAR8   mDiagLog[DIAG_LOG_LINES][DIAG_LOG_CHARS];
++STATIC UINTN   mDiagLogCount;
++STATIC CHAR16  mDiagText[DIAG_TEXT_LINES][DIAG_TEXT_CHARS];
++STATIC UINT64  mDiagStart[DIAG_RANGES];
++STATIC UINT64  mDiagEnd[DIAG_RANGES];
++
+ VOID
+ UniXNULogInit (
+   VOID
+@@ -37,6 +54,8 @@ UniXNULog (
+   VA_START (Args, Format);
+   AsciiVSPrint (Line + Prefix, sizeof (Line) - Prefix - 2, Format, Args);
+   VA_END (Args);
++  AsciiStrnCpyS (mDiagLog[mDiagLogCount % DIAG_LOG_LINES], DIAG_LOG_CHARS, Line + Prefix, DIAG_LOG_CHARS - 1);
++  mDiagLogCount++;
+   AsciiStrCatS (Line, sizeof (Line), "\r\n");
+ 
+   DEBUG ((PcdGet32 (PcdUniXNUDebugLevel), "%a", Line));
+@@ -46,6 +65,146 @@ UniXNULog (
+   }
+ }
+ 
++//
++// After a failed entry: what DarwinBoot recorded, how the UEFI free memory is
++// laid out, and the last log lines, over the whole screen until a key press.
++//
++STATIC
++VOID
++UniXNUDiagShow (
++  IN UNIXNU_UI   *Ui,
++  IN EFI_STATUS  Result
++  )
++{
++  CONST CHAR16           *Lines[DIAG_TEXT_LINES];
++  UINTN                  Count;
++  CHAR8                  Record[160];
++  UINTN                  RecordSize;
++  EFI_MEMORY_DESCRIPTOR  *Map;
++  EFI_MEMORY_DESCRIPTOR  *Desc;
++  UINTN                  MapSize;
++  UINTN                  Key;
++  UINTN                  DescSize;
++  UINT32                 DescVersion;
++  UINTN                  Offset;
++  UINTN                  Ranges;
++  UINTN                  Index;
++  UINTN                  Other;
++  UINT64                 Swap;
++  UINT64                 Free;
++  UINT64                 BootData;
++  UINT64                 LoaderData;
++  UINTN                  Best;
++  UINTN                  Shown;
++  UINTN                  First;
++  UINTN                  KeyIndex;
++  EFI_INPUT_KEY          InputKey;
++
++  Count = 0;
++  UnicodeSPrint (mDiagText[Count++], sizeof (mDiagText[0]), L"UNIXNU DIAG: entry returned %r", Result);
++
++  ZeroMem (Record, sizeof (Record));
++  RecordSize = sizeof (Record) - 1;
++  if (!EFI_ERROR (gRT->GetVariable (L"DarwinBootDiag", &gUniXNULoaderProtocolGuid, NULL, &RecordSize, Record))) {
++    UnicodeSPrint (mDiagText[Count++], sizeof (mDiagText[0]), L"DarwinBoot %a", Record);
++    gRT->SetVariable (L"DarwinBootDiag", &gUniXNULoaderProtocolGuid, 0, 0, NULL);
++  } else {
++    UnicodeSPrint (mDiagText[Count++], sizeof (mDiagText[0]), L"DarwinBoot: no record (not reached)");
++  }
++
++  Map     = NULL;
++  MapSize = 0;
++  Ranges  = 0;
++  Free    = 0;
++  BootData   = 0;
++  LoaderData = 0;
++  DescSize   = sizeof (EFI_MEMORY_DESCRIPTOR);
++  if (gBS->GetMemoryMap (&MapSize, NULL, &Key, &DescSize, &DescVersion) == EFI_BUFFER_TOO_SMALL) {
++    MapSize += 16 * DescSize;
++    Map      = AllocatePool (MapSize);
++  }
++
++  if ((Map != NULL) && !EFI_ERROR (gBS->GetMemoryMap (&MapSize, Map, &Key, &DescSize, &DescVersion))) {
++    for (Offset = 0; Offset + DescSize <= MapSize; Offset += DescSize) {
++      Desc = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
++      if ((Desc->Type == EfiBootServicesData) || (Desc->Type == EfiBootServicesCode)) {
++        BootData += EFI_PAGES_TO_SIZE (Desc->NumberOfPages);
++      } else if ((Desc->Type == EfiLoaderData) || (Desc->Type == EfiLoaderCode)) {
++        LoaderData += EFI_PAGES_TO_SIZE (Desc->NumberOfPages);
++      } else if ((Desc->Type == EfiConventionalMemory) && (Ranges < DIAG_RANGES)) {
++        mDiagStart[Ranges] = Desc->PhysicalStart;
++        mDiagEnd[Ranges]   = Desc->PhysicalStart + EFI_PAGES_TO_SIZE (Desc->NumberOfPages);
++        Free              += EFI_PAGES_TO_SIZE (Desc->NumberOfPages);
++        Ranges++;
++      }
++    }
++
++    //
++    // Sort by start and merge touching ranges: what one allocation can get.
++    //
++    for (Index = 1; Index < Ranges; Index++) {
++      for (Other = Index; (Other > 0) && (mDiagStart[Other - 1] > mDiagStart[Other]); Other--) {
++        Swap = mDiagStart[Other]; mDiagStart[Other] = mDiagStart[Other - 1]; mDiagStart[Other - 1] = Swap;
++        Swap = mDiagEnd[Other];   mDiagEnd[Other]   = mDiagEnd[Other - 1];   mDiagEnd[Other - 1]   = Swap;
++      }
++    }
++
++    for (Index = 0, Other = 0; Index < Ranges; Index++) {
++      if ((Other > 0) && (mDiagStart[Index] == mDiagEnd[Other - 1])) {
++        mDiagEnd[Other - 1] = mDiagEnd[Index];
++      } else {
++        mDiagStart[Other] = mDiagStart[Index];
++        mDiagEnd[Other]   = mDiagEnd[Index];
++        Other++;
++      }
++    }
++
++    Ranges = Other;
++    UnicodeSPrint (mDiagText[Count++], sizeof (mDiagText[0]), L"free %lu MiB in %u runs; bs %lu MiB, loader %lu MiB",
++                   RShiftU64 (Free, 20), (UINT32)Ranges, RShiftU64 (BootData, 20), RShiftU64 (LoaderData, 20));
++
++    //
++    // The largest runs first (selection, at most 8).
++    //
++    for (Shown = 0; (Shown < 8) && (Shown < Ranges); Shown++) {
++      Best = Shown;
++      for (Index = Shown + 1; Index < Ranges; Index++) {
++        if (mDiagEnd[Index] - mDiagStart[Index] > mDiagEnd[Best] - mDiagStart[Best]) {
++          Best = Index;
++        }
++      }
++
++      Swap = mDiagStart[Shown]; mDiagStart[Shown] = mDiagStart[Best]; mDiagStart[Best] = Swap;
++      Swap = mDiagEnd[Shown];   mDiagEnd[Shown]   = mDiagEnd[Best];   mDiagEnd[Best]   = Swap;
++      UnicodeSPrint (mDiagText[Count++], sizeof (mDiagText[0]), L"run %lx +%lx (%lu MiB)",
++                     mDiagStart[Shown], mDiagEnd[Shown] - mDiagStart[Shown],
++                     RShiftU64 (mDiagEnd[Shown] - mDiagStart[Shown], 20));
++    }
++  } else {
++    UnicodeSPrint (mDiagText[Count++], sizeof (mDiagText[0]), L"memory map unavailable");
++  }
++
++  if (Map != NULL) {
++    FreePool (Map);
++  }
++
++  UnicodeSPrint (mDiagText[Count++], sizeof (mDiagText[0]), L"-- last log lines --");
++  First = (mDiagLogCount > DIAG_LOG_LINES) ? mDiagLogCount - DIAG_LOG_LINES : 0;
++  for (Index = First; (Index < mDiagLogCount) && (Count < DIAG_TEXT_LINES - 1); Index++) {
++    UnicodeSPrint (mDiagText[Count++], sizeof (mDiagText[0]), L"%a", mDiagLog[Index % DIAG_LOG_LINES]);
++  }
++
++  UnicodeSPrint (mDiagText[Count++], sizeof (mDiagText[0]), L"Press a key for the menu");
++  for (Index = 0; Index < Count; Index++) {
++    Lines[Index] = mDiagText[Index];
++  }
++
++  UniXNUUiDrawDiag (Ui, Lines, Count);
++  if ((gST->ConIn != NULL) && !EFI_ERROR (gBS->WaitForEvent (1, &gST->ConIn->WaitForKey, &KeyIndex))) {
++    gST->ConIn->ReadKeyStroke (gST->ConIn, &InputKey);
++  }
++}
++
+ EFI_STATUS
+ EFIAPI
+ UniXNURun (
+@@ -157,6 +316,10 @@ UniXNURun (
+     UnicodeSPrint (Ui.Notice, sizeof (Ui.Notice), L"'%s' returned: %r", Entry->Title, Status);
+     UniXNULog ("menu: entry %u returned %r", (UINT32)Index, Status);
+     gBS->SetWatchdogTimer (0, 0, 0, NULL);
++    if (EFI_ERROR (Status)) {
++      UniXNUDiagShow (&Ui, Status);
++    }
++
+     Countdown = FALSE;
+   }
+ }
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Ui.c b/package/UniXNUPkg/Library/UniXNULib/Ui.c
+index dec0412..7645d85 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Ui.c
++++ b/package/UniXNUPkg/Library/UniXNULib/Ui.c
+@@ -904,3 +904,63 @@ UniXNUUiDrawStatus (
+   FillRect (Ui, 0, Y, Ui->Width, Ch, mBackground);
+   DrawCentered (Ui, Y, Text, Ui->Scale, (Line == 0) ? mText : mDim);
+ }
++
++VOID
++UniXNUUiDrawDiag (
++  IN UNIXNU_UI            *Ui,
++  IN CONST CHAR16 *CONST  *Lines,
++  IN UINTN                Count
++  )
++{
++  CHAR16  Chunk[PORTRAIT_TEXT_MAX + 1];
++  UINTN   Fs;
++  UINTN   Pitch;
++  UINTN   Cw;
++  UINTN   Max;
++  UINTN   Y;
++  UINTN   Index;
++  UINTN   Offset;
++  UINTN   Len;
++  UINTN   Take;
++
++  if (Ui->Mode == UniXNUUiText) {
++    gST->ConOut->ClearScreen (gST->ConOut);
++    for (Index = 0; Index < Count; Index++) {
++      gST->ConOut->OutputString (gST->ConOut, (CHAR16 *)Lines[Index]);
++      gST->ConOut->OutputString (gST->ConOut, L"\r\n");
++    }
++
++    return;
++  }
++
++  if (Ui->Mode != UniXNUUiGraphics) {
++    return;
++  }
++
++  Fs    = FooterScale (Ui);
++  Pitch = FooterPitch (Ui);
++  Cw    = UNIXNU_GLYPH_WIDTH * Fs;
++  if (Ui->Width <= Cw) {
++    return;
++  }
++
++  Max = MIN ((Ui->Width - Cw) / Cw, (UINTN)PORTRAIT_TEXT_MAX);
++  FillRect (Ui, 0, 0, Ui->Width, Ui->Height, mBackground);
++  Y = Pitch;
++  for (Index = 0; Index < Count; Index++) {
++    Len    = StrLen (Lines[Index]);
++    Offset = 0;
++    do {
++      if (Y + Pitch > Ui->Height) {
++        return;
++      }
++
++      Take = MIN (Len - Offset, Max);
++      CopyMem (Chunk, Lines[Index] + Offset, Take * sizeof (CHAR16));
++      Chunk[Take] = L'\0';
++      DrawText (Ui, Cw / 2, Y, Chunk, Fs, (Index == 0) ? mError : mText, mBackground, 0);
++      Y      += Pitch;
++      Offset += Take;
++    } while (Offset < Len);
++  }
++}

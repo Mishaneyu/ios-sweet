@@ -1,0 +1,247 @@
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Config.c b/package/UniXNUPkg/Library/UniXNULib/Config.c
+index 425adec..1fb2ec8 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Config.c
++++ b/package/UniXNUPkg/Library/UniXNULib/Config.c
+@@ -9,6 +9,7 @@
+ 
+ #include "Internal.h"
+ 
++#include <Guid/FileSystemInfo.h>
+ #include <Library/FdtLib.h>
+ 
+ //
+@@ -1533,20 +1534,57 @@ UniXNUConfigLoad (
+   TOML_NODE                  *Root;
+   CHAR8                      Error[96];
+   CHAR16                     Label[64];
++  BOOLEAN                    PayloadVolume;
+ 
+   ZeroMem (Config, sizeof (*Config));
++  PayloadVolume = FALSE;
+   Loaded = FALSE;
++  Config->VolumeCount = 0;
+ 
+   //
+   // The volume UniXNU was started from wins; then every other volume.
+   //
+   if (!EFI_ERROR (gBS->HandleProtocol (ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID **)&Self))) {
+     Loaded = TryVolume (Config, Self->DeviceHandle);
++    if (Loaded) {
++      Config->VolumeCount = 1;
++    }
+   }
+ 
+   if (!Loaded && (Config->Error[0] == '\0')) {
+     Status = gBS->LocateHandleBuffer (ByProtocol, &gEfiSimpleFileSystemProtocolGuid, NULL, &Count, &Handles);
+     if (!EFI_ERROR (Status)) {
++      Config->VolumeCount = Count;
++      for (Index = 0; Index < Count; Index++) {
++        EFI_SIMPLE_FILE_SYSTEM_PROTOCOL  *Fs;
++        EFI_FILE_PROTOCOL                *Root;
++        EFI_FILE_SYSTEM_INFO             *Info;
++        UINTN                            InfoSize;
++        CHAR8                            Ascii[16];
++
++        if (EFI_ERROR (gBS->HandleProtocol (Handles[Index], &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs)) ||
++            EFI_ERROR (Fs->OpenVolume (Fs, &Root))) {
++          continue;
++        }
++
++        InfoSize = 0;
++        if (Root->GetInfo (Root, &gEfiFileSystemInfoGuid, &InfoSize, NULL) == EFI_BUFFER_TOO_SMALL) {
++          Info = AllocatePool (InfoSize);
++          if ((Info != NULL) && !EFI_ERROR (Root->GetInfo (Root, &gEfiFileSystemInfoGuid, &InfoSize, Info))) {
++            UnicodeStrToAsciiStrS (Info->VolumeLabel, Ascii, sizeof (Ascii));
++            if (AsciiStrnCmp (Ascii, "GUACESP", 7) == 0) {
++              PayloadVolume = TRUE;
++            }
++          }
++
++          if (Info != NULL) {
++            FreePool (Info);
++          }
++        }
++
++        Root->Close (Root);
++      }
++
+       for (Index = 0; Index < Count && !Loaded && Config->Error[0] == '\0'; Index++) {
+         Loaded = TryVolume (Config, Handles[Index]);
+       }
+@@ -1563,10 +1601,12 @@ UniXNUConfigLoad (
+     // menu can show it.
+     //
+     CHAR8  Saved[sizeof (Config->Error)];
++    UINTN  VolumeCount = Config->VolumeCount;
+ 
+     CopyMem (Saved, Config->Error, sizeof (Saved));
+     ZeroMem (Config, sizeof (*Config));
+     CopyMem (Config->Error, Saved, sizeof (Saved));
++    Config->VolumeCount = VolumeCount;
+ 
+     Status = TomlParse (mBuiltinConfig, sizeof (mBuiltinConfig) - 1, &Root, Error, sizeof (Error));
+     ASSERT_EFI_ERROR (Status);
+@@ -1580,7 +1620,32 @@ UniXNUConfigLoad (
+       // Only the actions are left. Say so instead of showing a menu that
+       // looks complete.
+       //
+-      AsciiStrCpyS (Config->Notice, sizeof (Config->Notice), "no boot entry found");
++      {
++        volatile SHENG_STATUS  *Shim = (volatile SHENG_STATUS *)(UINTN)SHENG_STATUS_ADDR;
++        UINT32                 DtbValid = 0;
++        UINT32                 Initrd = 0;
++        UINT32                 Scan = 0;
++        UINT32                 Addr = 0;
++
++        if (Shim->Magic == SHENG_STATUS_MAGIC) {
++          DtbValid = Shim->DtbValid;
++          Initrd   = Shim->Initrd;
++          Scan     = Shim->Scan;
++          Addr     = (UINT32)Shim->Addr;
++        }
++
++        AsciiSPrint (
++          Config->Notice,
++          sizeof (Config->Notice),
++          "no boot entry found; volumes %u guac %u; shim d%u i%u s%u @%x",
++          (UINT32)Config->VolumeCount,
++          (UINT32)PayloadVolume,
++          DtbValid,
++          Initrd,
++          Scan,
++          Addr
++          );
++      }
+       UniXNULog ("config: no boot entry found");
+     }
+ 
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Internal.h b/package/UniXNUPkg/Library/UniXNULib/Internal.h
+index 71aa4b8..a4ab4d9 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Internal.h
++++ b/package/UniXNUPkg/Library/UniXNULib/Internal.h
+@@ -247,6 +247,19 @@ typedef enum {
+ 
+ #define UNIXNU_PORTRAIT_BELOW_DEFAULT  800   ///< width/height in thousandths.
+ 
++typedef struct {
++  UINT32  Magic;
++  UINT32  DtbValid;
++  UINT64  Dtb;
++  UINT32  Initrd;
++  UINT32  Scan;
++  UINT64  Addr;
++  UINT64  Size;
++} SHENG_STATUS;
++
++#define SHENG_STATUS_MAGIC  0x5348474D
++#define SHENG_STATUS_ADDR   0x9FF92010
++
+ typedef struct {
+   //
+   // [boot]
+@@ -285,6 +298,7 @@ typedef struct {
+   // Provenance and diagnostics shown on screen.
+   //
+   EFI_HANDLE     Volume;           ///< Volume the config came from (NULL = built-in).
++  UINTN          VolumeCount;      ///< SimpleFileSystem handles seen during discovery.
+   CHAR16         *SourceLabel;
+   CHAR8          Error[160];       ///< First config/kit error, empty if none.
+   CHAR8          Notice[96];       ///< Note for the menu that is not an error, empty if none.
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Main.c b/package/UniXNUPkg/Library/UniXNULib/Main.c
+index c1d76fe..76dc7a6 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Main.c
++++ b/package/UniXNUPkg/Library/UniXNULib/Main.c
+@@ -76,11 +76,11 @@ UniXNURun (
+     );
+ 
+   //
+-  // Started straight from BDS, storage may not be connected yet.
++  // Started straight from BDS, storage may not be connected yet. Do this even
++  // for the application host: the payload block device is installed by a DXE
++  // driver and needs the FAT driver bound before the volume scan.
+   //
+-  if (Host == UniXNUHostFirmware) {
+-    UniXNUConnectAll ();
+-  }
++  UniXNUConnectAll ();
+ 
+   UniXNUConfigLoad (ImageHandle, &Config);
+   UniXNULog (
+diff --git a/package/UniXNUPkg/Library/UniXNULib/UniXNULib.inf b/package/UniXNUPkg/Library/UniXNULib/UniXNULib.inf
+index bfdb3b3..e9b9ab2 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/UniXNULib.inf
++++ b/package/UniXNUPkg/Library/UniXNULib/UniXNULib.inf
+@@ -47,6 +47,7 @@
+ 
+ [Guids]
+   gEfiFileInfoGuid                ## CONSUMES
++  gEfiFileSystemInfoGuid          ## CONSUMES
+   gFdtTableGuid                   ## SOMETIMES_CONSUMES ## SOMETIMES_PRODUCES
+   gLinuxEfiInitrdMediaGuid        ## SOMETIMES_PRODUCES
+   gUniXNUBlockSliceGuid        ## SOMETIMES_PRODUCES
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Volume.c b/package/UniXNUPkg/Library/UniXNULib/Volume.c
+index 15b602c..6047a4b 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Volume.c
++++ b/package/UniXNUPkg/Library/UniXNULib/Volume.c
+@@ -153,13 +153,23 @@ OpenPath (
+ {
+   EFI_STATUS         Status;
+   EFI_FILE_PROTOCOL  *Root;
++  CONST CHAR16       *Name;
+ 
+   Status = OpenRoot (Volume, &Root);
+   if (EFI_ERROR (Status)) {
+     return Status;
+   }
+ 
+-  Status = Root->Open (Root, File, (CHAR16 *)Path, EFI_FILE_MODE_READ, 0);
++  //
++  // The path is relative to the volume root. Some FAT/FV drivers reject a
++  // leading backslash even though the config PCD spells the path absolute.
++  //
++  Name = Path;
++  while (*Name == L'\\') {
++    Name++;
++  }
++
++  Status = Root->Open (Root, File, (CHAR16 *)Name, EFI_FILE_MODE_READ, 0);
+   Root->Close (Root);
+   return Status;
+ }
+diff --git a/scripts/unixnu/bootimg.py b/scripts/unixnu/bootimg.py
+index d2aa766..b532d35 100644
+--- a/scripts/unixnu/bootimg.py
++++ b/scripts/unixnu/bootimg.py
+@@ -34,8 +34,11 @@ def compile_shim(uefi, base, size, requires_header, scratch):
+     offset = next((int(line.split()[0], 16) for line in symbols.splitlines() if line.endswith(' _Payload')), None)
+     if offset != len(shim):
+         raise Error('a literal pool or padding separates the _Payload label from the appended firmware volume')
+-    if requires_header and (shim[56:60] != b'ARM\x64' or struct.unpack_from('<QQ', shim, 8) != (base, len(shim) + size)):
+-        raise Error('the ARM64 image header does not describe the shim plus the firmware volume')
++    image_base, _image_size = struct.unpack_from('<QQ', shim, 8)
++    # Aloha's BootShim stores the FV size at offset 16, not shim+FV; the
++    # bootloader only needs the image base and the _Payload alignment.
++    if requires_header and (shim[56:60] != b'ARM\x64' or image_base != base):
++        raise Error('the ARM64 image header does not describe the firmware base')
+     return shim
+ 
+ 
+diff --git a/scripts/unixnu/firmware.py b/scripts/unixnu/firmware.py
+index 5388f78..998144f 100644
+--- a/scripts/unixnu/firmware.py
++++ b/scripts/unixnu/firmware.py
+@@ -28,12 +28,12 @@ def build(ctx, modules, uefi, edk2, target='DEBUG'):
+     if fw.get('submodules'):
+         # Upstream Mu-Silicium submodules the board needs (Mu_Basecore is provided separately).
+         log('firmware: initializing submodules of the Mu-Silicium checkout')
+-        run(['git', '-C', uefi, 'submodule', 'update', '--init', '--depth', '1', '--', *fw['submodules']])
++        run(['git', '-C', uefi, 'submodule', 'update', '--init', '--', *fw['submodules']])
+     for script in [] if ctx.args.skip_preflight else fw.get('preflight', []):
+         run(['python3', ctx.tree / script], cwd=ctx.tree, log_file=ctx.logs / 'firmware-preflight.log')
+     defines = {'FD_BASE': hex(base), 'FD_SIZE': hex(size), 'FD_BLOCKS': str(size // 0x1000)}
+-    defines.update({key: str(value) for key, value in fw.get('defines', {}).items()})
+     fields = {'uefi': str(uefi), 'edk2': str(edk2), 'tree': str(ctx.tree)}
++    defines.update({key: str(value).format(**fields) for key, value in fw.get('defines', {}).items()})
+     packages = ':'.join(item.format(**fields) for item in fw['packages'])
+     tools = edk2 / 'BaseTools'
+     if not (tools / 'Source/C/bin/GenFw').is_file():

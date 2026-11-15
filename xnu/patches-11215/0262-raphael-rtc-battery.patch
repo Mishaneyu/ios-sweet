@@ -1,0 +1,286 @@
+raphael (Redmi K20 Pro, SM8150): wall clock from the PM8150 RTC and the battery from the PM8150B fuel gauge.
+
+- RTC: the Poco F1 code of 0245 (raw RTC seconds plus an offset kept in the RTC alarm's data registers while the
+  alarm is disabled; IORTC published so iOS takes its time from it at boot, setGMTTimeOfDay stores the offset) now
+  also runs on raphael. PM8150 has the same pm8941-layout RTC at SID 0 0x6000/0x6100 as PM8998. The only PMIC
+  writes allowed on raphael are the four alarm data bytes 0x6140-0x6143.
+- SPMI reads on raphael: PM8150 RTC 0x60/0x61; PM8150B (SID 2) SMB5 charger 0x10/0x11/0x12/0x13/0x15/0x16 and FG
+  gen4 BATT_SOC 0x40 / BATT_INFO 0x41 (status registers only, no FG SRAM access). The SM8150 PMIC arbiter is the
+  same v5 block at the same addresses as the Poco F1's.
+- SweetBattery on raphael (on by default; sweetbattery=0 turns it off): monotonic SOC 0x4009 (gen3 scaling),
+  VBATT 0x41a0 (122.07 or 194.637 uV/bit, whichever is plausible), IBATT 0x41a2, USBIN plug-in 0x1310 bit 4,
+  charge state 0x1006 bits 2:0; design capacity 4000 mAh. The raw values are logged once per boot.
+- kern.sweet_spmi_addr / kern.sweet_spmi_dump: read-only 16-byte PMIC dump (allowed blocks only), to calibrate
+  registers on the phone without a rebuild.
+
+Sources: register numbers from Linux rtc-pm8xxx.c, downstream qpnp-fg-gen4.c / fg-reg.h / smb5-reg.h and
+sm8150 / pm8150 / pm8150b device trees (values only, no code copied).
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 362a89b..2f0b945 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -159,6 +159,15 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		    peripheral == 0x45)) ||
+ 		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9)) ||
+ 		    (sid == 0 && (peripheral == 0x08 || peripheral == 0x60 || peripheral == 0x61));  /* 0x60/0x61: PM8998 RTC, alarm (sweet_rtc_*) */
++	} else if (sweet_board_raphael()) {
++		/*
++		 * raphael (0262), status registers only (no FG SRAM / MEM_IF access): PM8150 (SID 0) RTC 0x60 and its alarm
++		 * 0x61; PM8150B (SID 2) SMB5 charger CHGR 0x10, DCDC 0x11, BATIF 0x12, USBIN 0x13, TYPEC 0x15, MISC 0x16 and
++		 * FG gen4 BATT_SOC 0x40 / BATT_INFO 0x41.
++		 */
++		allowed = (sid == 0 && (peripheral == 0x60 || peripheral == 0x61)) ||
++		    (sid == 2 && (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 || peripheral == 0x13 ||
++		    peripheral == 0x15 || peripheral == 0x16 || peripheral == 0x40 || peripheral == 0x41));
+ 	} else {
+ 		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
+ 		    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
+@@ -227,6 +236,10 @@ sweet_spmi_charger_writes(void)
+ static bool
+ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ {
++	if (sweet_board_raphael()) {
++		/* 0262: only the PM8150 RTC alarm data 0x6140-0x6143 (the wall-clock offset, sweet_rtc_set) */
++		return sid == 0 && len >= 1 && len <= 2 && addr >= 0x6140u && addr + len <= 0x6144u;
++	}
+ 	if (!sweet_board_beryllium() || len < 1 || len > 2) {
+ 		return false;
+ 	}
+@@ -416,7 +429,8 @@ static int
+ sr_raw(uint32_t *raw)
+ {
+ 	uint8_t ctrl = 0, b0 = 0;
+-	if (!sweet_board_beryllium() || sweet_spmi_init() != 0 || sweet_spmi_read(0, SR_RTC_CTRL, &ctrl) != 0 ||
++	if ((!sweet_board_beryllium() && !sweet_board_raphael()) || sweet_spmi_init() != 0 ||
++	    sweet_spmi_read(0, SR_RTC_CTRL, &ctrl) != 0 ||
+ 	    !(ctrl & SR_EN)) {
+ 		return -1;
+ 	}
+@@ -482,4 +496,36 @@ sweet_rtc_set(uint64_t unix_secs)
+ 	    sr_read32(SR_ALARM_DATA, &back) == 0 && back == want;
+ 	printf("SWEET RTC: offset %u -> %u (raw %u, time %llu)%s\n", off, want, raw, unix_secs, ok ? "" : " FAILED");
+ }
++
++/*
++ * 0262: read-only PMIC register dump for calibration on the phone, limited to what sweet_spmi_read allows.
++ *   sysctl -w kern.sweet_spmi_addr=$(( (SID << 16) | ADDR ))   then   sysctl kern.sweet_spmi_dump   (16 bytes from ADDR)
++ */
++#include <sys/sysctl.h>
++static int sp_peek_addr = 0x24000;
++
++SYSCTL_INT(_kern, OID_AUTO, sweet_spmi_addr, CTLFLAG_RW | CTLFLAG_LOCKED, &sp_peek_addr, 0,
++    "PMIC dump start: (SID << 16) | address (kern.sweet_spmi_dump)");
++
++static int
++sweet_spmi_dump_sysctl SYSCTL_HANDLER_ARGS
++{
++	(void)arg1;
++	(void)arg2;
++	char buf[16 * 3 + 32];
++	unsigned sid = ((unsigned)sp_peek_addr >> 16) & 0xfu, addr = (unsigned)sp_peek_addr & 0xffffu;
++	int n = snprintf(buf, sizeof(buf), "%u:%04x:", sid, addr);
++	for (unsigned i = 0; i < 16 && n > 0 && n < (int)sizeof(buf) - 4; i++) {
++		uint8_t v = 0;
++		if (sweet_spmi_init() == 0 && addr + i <= 0xffffu && sweet_spmi_read(sid, addr + i, &v) == 0) {
++			n += snprintf(buf + n, sizeof(buf) - (size_t)n, " %02x", v);
++		} else {
++			n += snprintf(buf + n, sizeof(buf) - (size_t)n, " --");
++		}
++	}
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_spmi_dump, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_spmi_dump_sysctl, "A",
++    "16 PMIC bytes from kern.sweet_spmi_addr (allowed blocks only; -- = refused or unreadable)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 56b6f9c..3a33d61 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -55,6 +55,9 @@ private:
+ 	static bool readWord(unsigned address, uint16_t *value, unsigned sid = 0);
+ 	void pollBeryllium(void);
+ 	static unsigned estimatePercent(unsigned mv);
++	void pollRaphael(void);
++	/* design capacity in mAh: Poco F1 5020 (DT nominal), raphael 4000 */
++	static unsigned designMah(void) { return sweet_board_raphael() ? 4000u : 5020u; }
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
+@@ -126,7 +129,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	 * CurrentCapacity as a percentage (BatteryCenter, SpringBoard's status bar
+ 	 * item, powerd's "Current Capacity") saw 5020 here. DT nominal = 5020 mAh.
+ 	 */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	const unsigned capacity = (designMah() * percent + 50u) / 100u;
+ 	sweet_batt_ma = ma;
+ 	sweet_batt_percent = (int)percent;
+ 	setBatteryInstalled(true);
+@@ -145,7 +148,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("built-in", true);
+ 	putBool("CapacityEstimated", !measured);
+-	putNumber("NominalChargeCapacity", 5020);
++	putNumber("NominalChargeCapacity", designMah());
+ 	putNumber("AppleRawBatteryVoltage", mv);
+ 	putNumber("DesignCycleCount9C", 500);
+ 	putNumber("PermanentFailureStatus", 0);
+@@ -160,8 +163,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		OSDictionary *bd = OSDictionary::withCapacity(8);
+ 		if (bdKey && bd) {
+ 			struct { const char *k; UInt32 v; } items[] = {
+-				{"CycleCount", 0}, {"DesignCapacity", 5020}, {"StateOfCharge", percent},
+-				{"Voltage", mv}, {"MaxCapacity", 5020}, {"NominalChargeCapacity", 5020},
++				{"CycleCount", 0}, {"DesignCapacity", designMah()}, {"StateOfCharge", percent},
++				{"Voltage", mv}, {"MaxCapacity", designMah()}, {"NominalChargeCapacity", designMah()},
+ 				{"Flags", 0}, {"ResScale", 1},
+ 			};
+ 			for (unsigned i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+@@ -214,8 +217,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	}
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", designMah());
++	putNumber("DesignCapacity", designMah());
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -232,7 +235,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, designMah(), mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -249,7 +252,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? (sweet_board_beryllium() ? "PMI8998 FG SOC" : "PM6150 / estimated SOC") : "static fallback",
++		    measured ? (sweet_board_beryllium() ? "PMI8998 FG SOC" : sweet_board_raphael() ? "PM8150B FG SOC" :
++		    "PM6150 / estimated SOC") : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -344,6 +348,65 @@ SweetBattery::pollBeryllium(void)
+ 	publish(full ? 100 : percent, mv, ma, external, external, charging, full, true, currentValid);
+ }
+ 
++/*
++ * raphael (0262): PM8150B (SID 2) FG gen4 + SMB5 charger, read-only (registers as downstream qpnp-fg-gen4 /
++ * smb5-reg.h): monotonic SOC BATT_SOC 0x4009 (0..255, same scaling as gen3), VBATT/IBATT BATT_INFO 0x41a0/0x41a2,
++ * USBIN_INT_RT_STS 0x1310 bit 4 (plugged in), BATTERY_CHARGER_STATUS_1 0x1006 bits 2:0 (1-4 charging,
++ * 5 TERMINATE). The VBATT scale is checked against both known LSBs (122.07 uV gen3, 194.637 uV) and the raw
++ * values are logged once, to calibrate with kern.sweet_spmi_dump.
++ */
++void
++SweetBattery::pollRaphael(void)
++{
++	static bool told;
++	const unsigned sid = 2;
++	uint8_t msoc = 0, msoc2 = 1, usb = 0, charger = 0;
++	uint16_t rawVoltage = 0, rawCurrent = 0;
++	bool valid = fReal;
++	for (unsigned i = 0; valid && i < 5; ++i) {
++		valid = !sweet_spmi_read(sid, 0x4009, &msoc) && !sweet_spmi_read(sid, 0x4009, &msoc2);
++		if (msoc == msoc2) {
++			break;
++		}
++	}
++	valid = valid && msoc == msoc2 &&
++	    readWord(0x41a0, &rawVoltage, sid) &&
++	    !sweet_spmi_read(sid, 0x1310, &usb) &&
++	    !sweet_spmi_read(sid, 0x1006, &charger);
++	unsigned mv122 = (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u);
++	unsigned mv194 = (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u);
++	unsigned mv = (mv122 >= 2800 && mv122 <= 4600) ? mv122 : (mv194 >= 2800 && mv194 <= 4600) ? mv194 : 0;
++	bool currentValid = valid && readWord(0x41a2, &rawCurrent, sid);
++	if (!told) {
++		told = true;
++		IOLog("SWEET BATTERY: raphael PM8150B raw: msoc %u (%u) vbatt 0x%04x (%u mV @122.07 uV, %u mV @194.637 uV) "
++		    "ibatt 0x%04x usbin_rt 0x%02x chgr_status1 0x%02x%s\n", msoc, msoc2, rawVoltage, mv122, mv194, rawCurrent,
++		    usb, charger, valid ? "" : " (read refused/failed)");
++	}
++	valid = valid && mv != 0;
++	if (!valid) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	unsigned percent = msoc == 255 ? 100 : msoc == 0 ? 0 :
++	    ((unsigned)(msoc - 1) * 98u + 126u) / 253u + 1u;
++	bool external = (usb & 0x10u) != 0;          /* USBIN_PLUGIN_RT_STS */
++	unsigned state = charger & 7u;
++	bool charging = external && state >= 1 && state <= 4;
++	bool full = external && state == 5;          /* TERMINATE_CHARGE */
++	int ma = 0;
++	if (currentValid) {
++		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
++		/* FG: positive = discharging, 488.281 uA/bit (gen3 LSB; checked on the phone); IOPMPowerSource: positive = charging */
++		ma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
++		if (ma < -8000 || ma > 8000) {
++			currentValid = false;
++			ma = 0;
++		}
++	}
++	publish(full ? 100 : percent, mv, ma, external, external, charging, full, true, currentValid);
++}
++
+ void
+ SweetBattery::poll(void)
+ {
+@@ -351,6 +414,10 @@ SweetBattery::poll(void)
+ 		pollBeryllium();
+ 		return;
+ 	}
++	if (fReal && sweet_board_raphael()) {
++		pollRaphael();
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -407,7 +474,7 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	int real = sweet_board_raphael() ? 1 : 0;     /* 0262: raphael reads its fuel gauge by default */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index c6d113f..891bc20 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -39,8 +39,8 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+-	if (sweet_board_beryllium()) {
+-		publishResource("IORTC");       /* 0245: the PM8998 RTC below; IOKitInitializeTime waits up to 30 s for it */
++	if (sweet_board_beryllium() || sweet_board_raphael()) {
++		publishResource("IORTC");       /* 0245 (0262: also raphael's PM8150): IOKitInitializeTime waits up to 30 s for it */
+ 	}
+ 	return true;
+ }
+@@ -77,13 +77,13 @@ SweetPlatformExpert::haltRestart(unsigned int type)
+ long
+ SweetPlatformExpert::getGMTTimeOfDay(void)
+ {
+-	return sweet_board_beryllium() ? (long)sweet_rtc_get() : 0;
++	return (sweet_board_beryllium() || sweet_board_raphael()) ? (long)sweet_rtc_get() : 0;
+ }
+ 
+ void
+ SweetPlatformExpert::setGMTTimeOfDay(long secs)
+ {
+-	if (sweet_board_beryllium() && secs > 0) {
++	if ((sweet_board_beryllium() || sweet_board_raphael()) && secs > 0) {
+ 		sweet_rtc_set((uint64_t)secs);
+ 	}
+ }

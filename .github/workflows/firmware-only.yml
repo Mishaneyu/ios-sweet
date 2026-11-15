@@ -1,0 +1,276 @@
+name: firmware-only
+
+# Fast firmware iteration: reuse the SM8150 kernel that the build-raphael
+# workflow already produced instead of rebuilding XNU on the macOS runner
+# (~10 min) for every firmware experiment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: >
+          full              = complete port: all patches + UniXNU/DarwinBoot
+                              drivers added to the xiaomi-raphael device.
+          no_darwinboot     = all patches, but the UniXNU/DarwinBoot drivers
+                              are NOT added (plain Aloha UEFI for raphael).
+          bootshim_upstream = full, with BootShim.S reverted (no DTB store).
+        required: false
+        default: full
+        type: choice
+        options: [full, no_darwinboot, bootshim_upstream]
+      uefi_ref:
+        description: >
+          Project Aloha (mu_aloha_platforms) ref. The only image confirmed to
+          boot on this phone is the 2402.86 release; the newest tree (2026-10)
+          builds a firmware volume that resets the phone.
+        required: false
+        default: 0b79812897177e9fdd1fb8cb02f05f5338322541
+      device:
+        description: >
+          Aloha TARGET_DEVICE. xiaomi-raphael is K20 Pro's own directory, but
+          the only Aloha image confirmed to reach the UEFI Shell on this phone
+          carries xiaomi-cepheus (Mi 9) assets - the two are platform twins.
+        required: false
+        default: xiaomi-raphael
+        type: choice
+        options: [xiaomi-raphael, xiaomi-cepheus]
+      kernel_run_id:
+        description: workflow run that holds the raphael-kernel artifact
+        required: false
+        default: "41798632101"
+      target:
+        description: EDK II build target
+        required: false
+        default: RELEASE
+        type: choice
+        options: [DEBUG, RELEASE]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reuse the kernel built by an earlier run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p inputs/raphael
+          curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ inputs.kernel_run_id }}/artifacts" -o /tmp/arts.json
+          ID=$(python3 -c "import json;print([a['id'] for a in json.load(open('/tmp/arts.json'))['artifacts'] if a['name']=='raphael-kernel'][0])")
+          curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$ID/zip" -o /tmp/k.zip
+          python3 -c "import zipfile;zipfile.ZipFile('/tmp/k.zip').extractall('inputs/raphael')"
+          ls -l inputs/raphael
+
+      - name: Checkout UniXNU driver (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: b6ae99c17194e6a18fd819d3148e69fe405e91fc
+          path: unixnu
+          submodules: recursive
+
+      - name: Checkout Project Aloha UEFI (SM8150)
+        uses: actions/checkout@v4
+        with:
+          repository: Project-Aloha/mu_aloha_platforms
+          ref: ${{ inputs.uefi_ref }}
+          path: uefi
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Host tools (EDK2 + UniXNU driver)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build uuid-dev bison flex nasm iasl gcc g++ python3-dev clang lld llvm mtools unzip zip
+          for t in clang lld-link llvm-lib llvm-rc; do
+            if command -v "$t" >/dev/null 2>&1; then echo "have $t"; continue; fi
+            cand=$(ls /usr/lib/llvm-*/bin/"$t" /usr/bin/"$t"-* 2>/dev/null | sort -V | tail -1)
+            if [ -n "$cand" ]; then sudo ln -sf "$cand" "/usr/local/bin/$t"; echo "linked $t -> $cand"; else echo "MISSING $t"; fi
+          done
+          command -v clang lld-link llvm-lib llvm-rc
+
+      - name: Apply the SM8150 patches (vendored in this repo)
+        run: |
+          # NOTE: `git -C <dir> apply` resolves the patch path relative to <dir>.
+          git -C unixnu apply ../patches/unixnu-guacamole.patch
+          # aloha-guacamole.patch was generated against one revision of the tree.
+          # Newer/older releases move the context of two of its hunks, and git
+          # apply is all-or-nothing, so one stale hunk used to kill the build.
+          # Apply hunk-by-hunk and let the rejects fall through; the two hunks
+          # that actually drifted are pure additions and fix_aloha_tree.py
+          # re-does them without needing any context.
+          git -C uefi apply --reject --whitespace=nowarn ../patches/aloha-guacamole.patch \
+            || echo "NOTE: some aloha hunks were rejected (see *.rej) - re-applying below"
+          python3 scripts/fix_aloha_tree.py uefi
+          find uefi -name '*.rej' -exec sh -c 'echo "--- REJECTED: $1"; cat "$1"' _ {} \; || true
+          # Same story for the submodule list: `git submodule update --init --
+          # <paths>` aborts on the first path this revision does not have.
+          python3 scripts/prune_submodules.py uefi board.toml
+          # drivers/DarwinBoot is a SUBMODULE OF UniXNU, not of the Aloha tree
+          git -C unixnu/drivers/DarwinBoot apply ../../../patches/darwinboot-guacamole.patch
+          # Bring-up diagnostics: after a failed entry UniXNU shows DarwinBoot's
+          # failing step, the UEFI free-memory runs and its last log lines.
+          git -C unixnu apply ../patches/unixnu-diag.patch
+          git -C unixnu/drivers/DarwinBoot apply ../../../patches/darwinboot-diag.patch
+          # Reserve the kernel window one memory-map entry at a time: Mu's
+          # AllocatePages refuses a range spanning several free entries.
+          git -C unixnu/drivers/DarwinBoot apply ../../../patches/darwinboot-window-split.patch
+          git -C unixnu/drivers/DarwinBoot apply ../../../patches/darwinboot-window-below4g.patch
+          echo "diagnostic patches applied"
+          sed -i 's|^TARGET_DEVICE = .*|TARGET_DEVICE = "${{ inputs.device }}"|' board.toml
+          grep -n 'TARGET_DEVICE' board.toml
+          # board.toml keeps FDT = raphael.dtb (the real K20 Pro hardware tree),
+          # so the platform looks for Device/<device>/DeviceTreeBlob/*/…-raphael.dtb
+          # even when TARGET_DEVICE is a sibling. Supply those names: the Android
+          # blob must stay raphael's (hardware), the Linux one is a placeholder.
+          if [ "${{ inputs.device }}" != "xiaomi-raphael" ]; then
+            SRC=uefi/Platforms/SurfaceDuo1Pkg/Device/xiaomi-raphael/DeviceTreeBlob
+            DST=uefi/Platforms/SurfaceDuo1Pkg/Device/${{ inputs.device }}/DeviceTreeBlob
+            cp "$SRC/Android/android-raphael.dtb" "$DST/Android/android-raphael.dtb"
+            cp "$SRC/Linux/linux-raphael.dtb" "$DST/Linux/linux-raphael.dtb"
+            ls -l "$DST/Android" "$DST/Linux"
+          fi
+          if [ "${{ inputs.variant }}" = "bootshim_upstream" ]; then
+            git -C uefi checkout -- BootShim/BootShim.S
+            echo "variant: BootShim.S reverted to upstream (no DTB-pointer store)"
+          fi
+          # The vendored patches were written for oneplus-guacamole, so they add
+          # the UniXNU/DarwinBoot drivers to Device/oneplus-guacamole/*. raphael
+          # compiles Device/xiaomi-raphael/*, which the patch never touches -
+          # without this the firmware volume has no DarwinBoot at all and can
+          # never boot XNU. Append the same modules to raphael's own files.
+          if [ "${{ inputs.variant }}" != "no_darwinboot" ]; then
+            DEV=uefi/Platforms/SurfaceDuo1Pkg/Device/${{ inputs.device }}
+            cat >> "$DEV/DXE.dsc.inc" <<'DSC'
+
+          # UniXNU / DarwinBoot (appended for xiaomi-raphael)
+          AndromedaPkg/Driver/ShengBootMemoryDxe/ShengBootMemoryDxe.inf {
+            <LibraryClasses>
+              FdtLib|MdePkg/Library/BaseFdtLib/BaseFdtLib.inf
+          }
+          UniXNUPkg/Application/UniXNU/UniXNU.inf {
+            <LibraryClasses>
+              FdtLib|MdePkg/Library/BaseFdtLib/BaseFdtLib.inf
+          }
+          UniXNUPkg/Driver/UniXNUDxe/UniXNUDxe.inf {
+            <LibraryClasses>
+              FdtLib|MdePkg/Library/BaseFdtLib/BaseFdtLib.inf
+          }
+          DarwinBootPkg/Driver/DarwinBoot.inf {
+            <LibraryClasses>
+              FdtLib|MdePkg/Library/BaseFdtLib/BaseFdtLib.inf
+          }
+          DSC
+            cat >> "$DEV/DXE.inc" <<'FDF'
+
+          # UniXNU / DarwinBoot (appended for xiaomi-raphael)
+          INF UniXNUPkg/Application/UniXNU/UniXNU.inf
+          INF UniXNUPkg/Driver/UniXNUDxe/UniXNUDxe.inf
+          INF DarwinBootPkg/Driver/DarwinBoot.inf
+          INF AndromedaPkg/Driver/ShengBootMemoryDxe/ShengBootMemoryDxe.inf
+          FDF
+            echo "variant: UniXNU/DarwinBoot appended to $DEV"
+            tail -6 "$DEV/DXE.dsc.inc"; tail -6 "$DEV/DXE.inc"
+          else
+            echo "variant: UniXNU/DarwinBoot NOT added (plain Aloha UEFI)"
+          fi
+
+      - name: Fetch raphael DTB (real android-raphael.dtb shipped by Aloha)
+        run: bash scripts/get-raphael-dtb.sh
+
+      - name: Fetch iPhone X (D22AP) base ADT (auto from public IPSW)
+        run: bash scripts/get-base-d22ap.sh
+
+      - name: Fetch the prebuilt BaseCrypto driver (Mu external dependency)
+        run: |
+          DEST=uefi/MU_BASECORE/CryptoPkg/Binaries/edk2-basecrypto-driver-bin_extdep
+          mkdir -p "$DEST"
+          curl -sL -o /tmp/cryptobin.zip \
+            https://github.com/microsoft/mu_crypto_release/releases/download/v1.1.3/Mu_CryptoBin_v1_1_3.zip
+          unzip -q -o /tmp/cryptobin.zip -d "$DEST"
+          ls -l "$DEST/Driver/Bin/CryptoDriver.inc.dsc"
+
+      - name: Build the EDK II host tools (legacy C standard)
+        run: |
+          # mu_basecore dev/202405, which the 2412 Aloha tree pins, still ships
+          # the 1990s PCCTS sources. GitHub's runner defaults to GCC 14 = C23,
+          # where `int (*f)()` means `(void)`, so every PCCTS call site reports
+          # "too many arguments to function". Build them here with an older
+          # standard so the firmware step sees bin/GenFw and skips its own
+          # (flag-less) build.
+          if [ -f uefi/MU_BASECORE/BaseTools/Source/C/bin/GenFw ]; then
+            echo "host tools already present"; exit 0
+          fi
+          # The PCCTS sub-directories build with their own makefile and their
+          # own CFLAGS, so EXTRA_OPTFLAGS never reaches them. Put a compiler
+          # wrapper on PATH instead: every cc/gcc invocation, at any depth,
+          # then gets an older C standard.
+          WRAP="$RUNNER_TEMP/legacycc"
+          mkdir -p "$WRAP"
+          for c in cc gcc; do
+            printf '#!/bin/sh\nexec /usr/bin/%s -std=gnu17 "$@"\n' "$c" > "$WRAP/$c"
+            chmod +x "$WRAP/$c"
+          done
+          PATH="$WRAP:$PATH" make -C uefi/MU_BASECORE/BaseTools/Source/C -j8 \
+            EXTRA_OPTFLAGS="-Wno-error -std=gnu17"
+          ls -l uefi/MU_BASECORE/BaseTools/Source/C/bin/GenFw
+
+      - name: Seed the EDK II Conf directory with relaxed clang flags
+        run: |
+          # The UniXNU build driver seeds out/raphael/edk2-conf from
+          # BaseTools/Conf/*.template only when a file is MISSING, so writing
+          # tools_def.txt here is what the build ends up using.
+          CONF=out/raphael/edk2-conf
+          TPL=uefi/MU_BASECORE/BaseTools/Conf
+          mkdir -p "$CONF"
+          for n in target tools_def build_rule; do
+            [ -f "$CONF/$n.txt" ] || cp "$TPL/$n.template" "$CONF/$n.txt"
+          done
+          python3 scripts/relax_clang.py "$CONF/tools_def.txt"
+          grep -n "_CLANGPDB_AARCH64_CC_FLAGS" "$CONF/tools_def.txt" | head -3
+
+      - name: Build the UEFI firmware volume (SM8150 + xiaomi-raphael device)
+        env:
+          EXTRA_OPTFLAGS: "-Wno-error"
+          FW_TARGET: ${{ inputs.target }}
+        run: python3 scripts/build-firmware.py
+
+      - name: Upload the firmware volume (for local repacking experiments)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SM8150_EFI-${{ inputs.variant }}-${{ inputs.target }}.fd
+          path: uefi/Build/SurfaceDuo1Pkg/${{ inputs.target }}_CLANGPDB/FV/SM8150_EFI.fd
+          if-no-files-found: error
+
+      - name: Build the FAT payload (kernel + raphael ADT)
+        run: python3 scripts/build-payload.py
+
+      - name: Pack the Android boot image
+        env:
+          FW_TARGET: ${{ inputs.target }}
+        run: python3 scripts/build-bootimg.py
+
+      - name: Dump build logs on failure
+        if: failure()
+        run: |
+          ls -la out/raphael/logs/ 2>/dev/null || true
+          for f in out/raphael/logs/*.log; do
+            [ -f "$f" ] || continue
+            echo "----- $f -----"; tail -n 60 "$f"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boot-raphael-${{ inputs.variant }}-${{ inputs.target }}.img
+          path: out/raphael/boot/boot-raphael.img
+          if-no-files-found: error

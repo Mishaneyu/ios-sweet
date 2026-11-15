@@ -1,0 +1,127 @@
+# Redmi K20 Pro / Mi 9T Pro (raphael, SM8150) device repository for UniXNU.
+#
+# raphael is the SAME SM8150 SoC as OnePlus 7 Pro (guacamole) and Xiaomi Pad 5
+# (nabu). The XNU kernel and the Project Aloha UEFI are reused from the proven
+# guacamole SM8150 bring-up (which reached iOS 16.7.16 userland); only the
+# device tree (raphael.dtb) and the Apple Device Tree (ADT) device profile
+# differ. Because the silicon is identical, raphael reuses guacamole's exact
+# kernel build -> NO per-device kernel defconfig is required.
+#
+# The payload volume label is kept as "GUACESP" because the patched UniXNU
+# firmware discovers the config by that label; it is cosmetic.
+
+[board]
+name = "raphael"
+soc = "SM8150"
+description = "Redmi K20 Pro / Mi 9T Pro (raphael)"
+kit = "raphael"
+
+[firmware]
+config = "raphael"
+dsc = "Platforms/SurfaceDuo1Pkg/SurfaceDuo1NoSb.dsc"
+fd = "Build/SurfaceDuo1Pkg/{target}_CLANGPDB/FV/SM8150_EFI.fd"
+submodules = [
+  "MU_BASECORE",
+  "Common/MU",
+  "Common/MU_OEM_SAMPLE",
+  "Platforms/CranePkg",
+  "Platforms/SurfaceDuoACPI",
+  "Features/DFCI",
+  "Features/CONFIG",
+  "Binaries",
+  "Platforms/OpensslPkg/Library/OpensslLib/openssl",
+  "Platforms/MbedTlsPkg/Library/MbedTlsLib/mbedtls",
+]
+packages = [
+  "{uefi}/Platforms",
+  "{uefi}/Common/MU",
+  "{uefi}/Common/MU_OEM_SAMPLE",
+  "{uefi}/Features/DFCI",
+  "{uefi}/Features/CONFIG",
+  "{uefi}/Binaries",
+  "{uefi}/Silicon/QC/Sm8150",
+  "{tree}/package",
+  "{tree}/drivers/DarwinBoot",
+  "{edk2}",
+]
+
+[firmware.defines]
+TARGET_DEVICE = "xiaomi-raphael"
+FDT = "raphael.dtb"
+SHARED_CRYPTO_PATH = "{edk2}/CryptoPkg/Binaries/edk2-basecrypto-driver-bin_extdep"
+CONF_AUTOGEN_INCLUDE_PATH = "{uefi}/Common/MU/AndromedaPkg/Include"
+MU_SCHEMA_DIR = "{uefi}/Common/MU/AndromedaPkg/CfgData"
+MU_SCHEMA_FILE_NAME = "AndromedaPkgCfgData.xml"
+
+[payload]
+volume = "GUACESP"
+size_mib = 64
+loader = "firmware"
+title = "Redmi K20 Pro - XNU"
+dram_size = "0xbe000000"
+panic_screen = false
+timeout = 3
+kernel_args = [
+  "debug=0xc",
+  "serial=3",
+  "cpus=8",
+  "keepsyms=1",
+  "-enable_kprintf_spam",
+  "-noprogress",
+  "rd=ufsroot0",
+  "unentitled_ios_sim_launch=1",
+  "ignition_level=1",
+  "wdt_test=no_user_checkin",
+  "launchd_unsecure_cache=1",
+  "wdt=-1",
+  "sweetusb=2",
+  # Stream the console to the USB CDC-ACM port (VID 1209 PID 0001, patch 0101);
+  # fastboot-test\watch_usb.ps1 captures it into ios-console.log.
+  "sweetusblog=1",
+  "sweettouchdelay=20",
+  # patches/0112: raphael touch (QUP19 I2C, GT9886 Normandy, GPIO54/122/98/100)
+  # instead of the sweet board's SE7/GPIO6-9/90 and L11C vote.
+  "sweettouchboard=1",
+  # The iOS HFS+ root is flashed to userdata (2026-11-05, user-approved), so the
+  # root is mounted read-write as upstream does. Read-only images for testing
+  # against an Android userdata are ci-artifacts\N-kryo470 and earlier.
+  "ufsrw=1",
+  "rootrw=1",
+  # No persistent console log yet: it writes the last 4 MiB + 4 KiB of the
+  # partition (patch 0047) and reading it back needs a recovery.
+  "sweetlog=0",
+  # Boot to the GUI (upstream's home-screen settings). sweetfb_noconsole=1 mutes
+  # the text console at the first framebuffer swap, and sweetpanel=0 stops the
+  # diagnostic panel thread, which otherwise repaints its digest over the GUI
+  # every 20 s and hid a working home screen (verified on raphael 2026-11-05).
+  # For kernel/boot debugging drop both (the console and digest come back).
+  "sweetfb_noconsole=1",
+  "sweetpanel=0",
+  "sweetfb_hz=30",
+  "sweetgpu=3",
+  "sweetlogdump=1",
+]
+
+[payload.adt]
+tool = "scripts/make-raphael-adt.py"
+unique_chip_id = "required"
+# The window must fit one free UEFI run. On a 6 GiB raphael the largest is
+# exactly 0x140000000 + 0xc0000000 (measured with the diagnostic firmware),
+# and DarwinBoot starts the window at a 32 MiB boundary plus the kernel's
+# offset in 32 MiB (0x1004000 for VM_KERNEL_LINK_ADDRESS 0xfffffe0007004000),
+# so 3 GiB overruns that run by ~16 MiB. 0xbe000000 (~2.97 GiB) fits with
+# margin; dram_size above stays equal to it.
+owned_memory_size = "0xbe000000"
+
+[bootimg.image]
+base = 0x0
+kernel_offset = 0x8000
+# The ABL adds abl_base (the "Kernel" RAM region at 0x80000000) to these
+# offsets. 0x800000 puts the 64 MiB payload at 0x80800000-0x84800000, inside
+# the reserved Kernel region (ends 0x82A00000 is too small for 64 MiB, so we
+# use the documented guacamole placement that the ABL accepts).
+ramdisk_offset = 0x800000
+abl_base = 0x80000000
+tags_offset = 0x100
+pagesize = 4096
+header_version = 0

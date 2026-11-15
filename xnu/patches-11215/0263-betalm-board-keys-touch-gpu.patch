@@ -1,0 +1,698 @@
+betalm: LG G8S ThinQ (SM8150) board, keys, Synaptics S3706 touch, A640 GPU
+
+sweet_board.h gains sweet_board_betalm() (ADT root compatible "lge,betalm";
+the ADT keeps "xiaomi,sweet" too, as raphael does) and sweet_board_sm8150()
+(raphael or betalm). The SM8150-common paths that 0260-0262 gated on
+raphael now take sweet_board_sm8150(): volume-up on PM8150 GPIO6 (SID 0
+0xc500, as in the LGE sm8150-beta DT), the PM8150 RTC and its alarm-data
+offset, IORTC, the SPMI read/write allow-lists, and the PM8150B FG gen4
+battery poll (design capacity 3550 mAh on the G8S).
+
+GPU: gpu_board_a640_betalm (same SM8150 blocks as raphael). Its cmd-db
+address is 0 = read the base from AOP message RAM (0x0c3f000c), as
+ios-sweet betalm 0090 / ios-flame do on this phone, instead of raphael's
+fixed 0x85f20000. Zap carve-out pil_gpu_region 0x99915000 (G8S live DT,
+after LG's dtbo; ios-sweet betalm 0094).
+
+sweet_touch.c: a fourth touch board. Synaptics S3706 (RMI4) at 0x20 on
+qupv3_se17_i2c = wrapper 2 SE0 @0xc80000, SDA/SCL GPIO 55/56 function 1,
+reset 54, ATTN 122, rails as TLMM enables vdd 152 / vcl 59, all in the
+SOUTH tile (0x03d00000). GCC vote 0x52014 bits 0-4, RCG 0x1e148, branch
+0x1e144 (ios-sweet betalm 0085, verified on the phone with xnu-8796).
+LG's QUP firmware runs SE17 GSI-only, so the existing bit-banged I2C is
+used (~200 kHz, sweettouchbb=2), reads paced by the ATTN edge latch and
+limited to the first 2 object slots (sweettouchfingers=N). RMI4: PDT scan,
+F01 setup (normal, configured, nosleep, all IRQs), F12 register-descriptor
+parsing, polled objects. sweettouchflip=N: bit0 mirror x, bit1 mirror y,
+bit2 swap. A SiW SW42000 at 0x28 is detected and reported as unsupported.
+The sweet, beryllium and raphael boards are unchanged.
+
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 5d3372a..aead1c2 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -151,6 +151,16 @@ static const struct gpu_board gpu_board_a640 = {
+ 	0x02c00000, 0x02c6a000, 0x02c90000, 0x02ca0000, 0x0b290000, 0x0b490000, 0x85f20000,
+ 	0x71154, 0x06040001, 0x401, 0x400, "a640_gmu.bin", 0x02000140,
+ };
++/*
++ * LG G8S (betalm): the same SM8150 blocks as raphael. Its cmd-db sits where
++ * LG's memory map puts it, so cmddb_pa 0 = read it from AOP message RAM
++ * (0x0c3f000c, as ios-sweet betalm / ios-flame do on this phone).
++ */
++static const struct gpu_board gpu_board_a640_betalm = {
++	"Adreno 640 (LG G8S, SM8150)", true,
++	0x02c00000, 0x02c6a000, 0x02c90000, 0x02ca0000, 0x0b290000, 0x0b490000, 0,
++	0x71154, 0x06040001, 0x401, 0x400, "a640_gmu.bin", 0x02000140,
++};
+ static const struct gpu_board *gb = &gpu_board_a630;
+ 
+ /* ------------------------------------------------------------------ */
+@@ -627,11 +637,30 @@ db_range(uint32_t off, uint32_t size)
+ 	return off <= CMDDB_SIZE && size <= CMDDB_SIZE - off;
+ }
+ 
++#define CMDDB_PTR_PA    0x0c3f0000u     /* AOP message RAM page: cmd-db base at +0xc (low 32 bits) */
++
++static uint32_t cmddb_pa_found;
++
+ static bool
+ cmddb_map(void)
+ {
++	uint32_t pa = CMDDB_PA;
++	if (!pa) {
++		if (!cmddb_pa_found) {
++			vm_offset_t aop = ml_io_map(CMDDB_PTR_PA, 0x1000);
++			if (aop) {
++				cmddb_pa_found = gpu_rd(aop, 0xc);
++			}
++			printf("SWEET GPU: cmd-db from AOP message RAM: %#x\n", cmddb_pa_found);
++		}
++		pa = cmddb_pa_found;
++		if (!pa || (pa & 0xfffu)) {
++			printf("SWEET GPU: no usable cmd-db address\n");
++			return false;
++		}
++	}
+ 	if (!cmddb) {
+-		cmddb = ml_io_map(CMDDB_PA, CMDDB_SIZE);
++		cmddb = ml_io_map(pa, CMDDB_SIZE);
+ 	}
+ 	if (!cmddb) {
+ 		printf("SWEET GPU: cmd-db map failed\n");
+@@ -639,7 +668,7 @@ cmddb_map(void)
+ 	}
+ 	if (db_rd(4) != CMDDB_MAGIC || db_rd(0) != 1 || (db_rd(140) & 1u)) {
+ 		printf("SWEET GPU: cmd-db at %#x: version %#x magic %#x flags %#x not usable\n",
+-		    CMDDB_PA, db_rd(0), db_rd(4), db_rd(140));
++		    pa, db_rd(0), db_rd(4), db_rd(140));
+ 		return false;
+ 	}
+ 	return true;
+@@ -4913,7 +4942,9 @@ sweet_a630_probe(void)
+ 	int mode = 0;
+ 	thread_t thread;
+ 
+-	if (sweet_board_raphael()) {
++	if (sweet_board_betalm()) {
++		gb = &gpu_board_a640_betalm;
++	} else if (sweet_board_raphael()) {
+ 		gb = &gpu_board_a640;
+ 	} else if (!sweet_board_beryllium()) {
+ 		return;
+diff --git a/bsd/dev/sweet_a630_pas.c b/bsd/dev/sweet_a630_pas.c
+index 0b1b3cc..2df5d8e 100644
+--- a/bsd/dev/sweet_a630_pas.c
++++ b/bsd/dev/sweet_a630_pas.c
+@@ -55,9 +55,10 @@ bool sweet_a630_zap_running(void);
+  * Poco F1: live DT gpu_region@0x8c415000. raphael (SM8150, A640): reserved-memory pil_gpu_region@0x98f15000,
+  * 0x2000 (Xiaomi's SM8150 layout, also nabu); its a640_zap.mdt has one relocatable PT_LOAD (a640_zap.b02, 0x7b0).
+  */
+-#define ZAP_REGION_PA           (sweet_board_raphael() ? 0x98f15000ull : 0x8c415000ull)
++/* betalm: pil_gpu_region 0x99915000 from the G8S live DT (after LG's dtbo; ios-sweet betalm patch 0094) */
++#define ZAP_REGION_PA           (sweet_board_betalm() ? 0x99915000ull : sweet_board_raphael() ? 0x98f15000ull : 0x8c415000ull)
+ #define ZAP_REGION_SIZE         0x2000u
+-#define ZAP_NAME                (sweet_board_raphael() ? "a640_zap" : "a630_zap")
++#define ZAP_NAME                (sweet_board_sm8150() ? "a640_zap" : "a630_zap")
+ #define MDT_MAX_PHDRS          16u
+ #define PT_LOAD                 1u
+ #define QCOM_MDT_TYPE_MASK      (7u << 24)
+diff --git a/bsd/dev/sweet_board.h b/bsd/dev/sweet_board.h
+index e52eed0..f702ec7 100644
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -6,6 +6,9 @@
+  *   xiaomi,raphael    Redmi K20 Pro / Mi 9T Pro, SM8150 (keeps "xiaomi,sweet"
+  *                     in its compatible list too, so it takes the sweet
+  *                     defaults except where a driver checks for raphael)
++ *   lge,betalm        LG G8S ThinQ, SM8150 (also keeps "xiaomi,sweet"; shares
++ *                     raphael's SM8150 PMIC/RTC/battery/GPU paths through
++ *                     sweet_board_sm8150(), with its own touch and zap region)
+  */
+ #ifndef _SWEET_BOARD_H_
+ #define _SWEET_BOARD_H_
+@@ -89,4 +92,21 @@ sweet_board_raphael(void)
+ 	return cached == 1;
+ }
+ 
++static inline bool
++sweet_board_betalm(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		cached = sweet_board_is("lge,betalm") ? 1 : 0;
++	}
++	return cached == 1;
++}
++
++/* SM8150 phones: PM8150 (SID 0) + PM8150B (SID 2), Adreno 640 */
++static inline bool
++sweet_board_sm8150(void)
++{
++	return sweet_board_raphael() || sweet_board_betalm();
++}
++
+ #endif /* _SWEET_BOARD_H_ */
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 8610488..6413112 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -145,7 +145,7 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	/* raphael: volume-up is PM8150 GPIO6, SID 0 at 0xc500 (status 0xc510), as on the Poco F1 */
+-	if (sweet_board_beryllium() || sweet_board_raphael()) {
++	if (sweet_board_beryllium() || sweet_board_sm8150()) {   /* betalm: PM8150 GPIO6 too (LGE sm8150-beta DT) */
+ 		keys_gpio_base = 0xc500u;
+ 		keys_gpio_ppid = 0x0c5u;
+ 	}
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 2f0b945..ef77816 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -159,9 +159,9 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		    peripheral == 0x45)) ||
+ 		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9)) ||
+ 		    (sid == 0 && (peripheral == 0x08 || peripheral == 0x60 || peripheral == 0x61));  /* 0x60/0x61: PM8998 RTC, alarm (sweet_rtc_*) */
+-	} else if (sweet_board_raphael()) {
++	} else if (sweet_board_sm8150()) {
+ 		/*
+-		 * raphael (0262), status registers only (no FG SRAM / MEM_IF access): PM8150 (SID 0) RTC 0x60 and its alarm
++		 * raphael (0262), betalm, status registers only (no FG SRAM / MEM_IF access): PM8150 (SID 0) RTC 0x60 and its alarm
+ 		 * 0x61; PM8150B (SID 2) SMB5 charger CHGR 0x10, DCDC 0x11, BATIF 0x12, USBIN 0x13, TYPEC 0x15, MISC 0x16 and
+ 		 * FG gen4 BATT_SOC 0x40 / BATT_INFO 0x41.
+ 		 */
+@@ -236,7 +236,7 @@ sweet_spmi_charger_writes(void)
+ static bool
+ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ {
+-	if (sweet_board_raphael()) {
++	if (sweet_board_sm8150()) {
+ 		/* 0262: only the PM8150 RTC alarm data 0x6140-0x6143 (the wall-clock offset, sweet_rtc_set) */
+ 		return sid == 0 && len >= 1 && len <= 2 && addr >= 0x6140u && addr + len <= 0x6144u;
+ 	}
+@@ -429,7 +429,7 @@ static int
+ sr_raw(uint32_t *raw)
+ {
+ 	uint8_t ctrl = 0, b0 = 0;
+-	if ((!sweet_board_beryllium() && !sweet_board_raphael()) || sweet_spmi_init() != 0 ||
++	if ((!sweet_board_beryllium() && !sweet_board_sm8150()) || sweet_spmi_init() != 0 ||
+ 	    sweet_spmi_read(0, SR_RTC_CTRL, &ctrl) != 0 ||
+ 	    !(ctrl & SR_EN)) {
+ 		return -1;
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 93daa07..7fbce1f 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -59,6 +59,17 @@ void sweet_touch_init(void);
+ #define TOUCH_NVT        3
+ #define TOUCH_FT8719     4
+ #define TOUCH_GT9886     5
++#define TOUCH_SYNAPTICS  6
++/* Synaptics S3706 RMI4 (betalm, LG G8S): LGE sm8150-beta DT */
++#define RMI_ADDR         0x20u
++#define RMI_PAGE_REG     0xffu
++#define RMI_PDT_START    0xe9u
++#define RMI_PDT_END      0x0au
++#define RMI_PAGES        5u
++#define RMI_RX_MAX       255u
++#define RMI_CHUNK        64u     /* FIFO messages hold at most 90 bytes */
++#define BETALM_VDD_GPIO  152u    /* DT vdd-gpio (TLMM enable, no regulator) */
++#define BETALM_VCL_GPIO  59u     /* DT vcl-gpio */
+ /* GT9886 Normandy (raphael) */
+ #define NOR_ADDR         0x5du
+ #define NOR_VERSION_REG  0x452cu /* 72 bytes, 8-bit sum is zero */
+@@ -124,6 +135,18 @@ static const struct touch_board touch_raphael = {
+ 	57, 58, 2, 122, 54, 1080, 2340, false,
+ 	0x52014u, 0x03d00000u, 0x7b000u, {0x1e004u, 0x1e008u}, 2u,
+ };
++/*
++ * betalm (LG G8S): qupv3_se17_i2c = wrapper 2 SE0 @0xc80000, SDA/SCL 55/56
++ * function 1, reset 54, ATTN 122, all in the SOUTH tile (through gpio152).
++ * gcc-sm8150.c vote 0x52014 bits 0-4: wrap2 core, s_ahb, m_ahb, core_2x, s0
++ * (as ios-sweet betalm 0085, verified on the phone); RCG 0x1e148, branch
++ * 0x1e144. LG's QUP firmware runs SE17 GSI-only, so this board bit-bangs.
++ */
++static const struct touch_board touch_betalm = {
++	"SE17", 0x00c80000u, 0x1e148u, 0x1fu, 0x1e144u,
++	55, 56, 1, 122, 54, 1080, 2248, false,
++	0x52014u, 0x03d00000u, 0x99000u, {0x1e004u, 0x1e008u}, 2u,
++};
+ static const struct touch_board *tb = &touch_sweet;
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+ #define GOODIX_PID_REG   0x4022u
+@@ -1125,6 +1148,323 @@ touch_goodix_nor(void)
+ 	return err;
+ }
+ 
++/*
++ * Synaptics RMI4 over I2C (S3706 on the LG G8S), ported from ios-sweet
++ * betalm patch 0085 (xnu-8796, touch verified on the phone). The register
++ * space is paged: register 0xff selects the page, then one-byte addresses.
++ * Functions are found through the Page Description Table at 0xe9 downwards
++ * in each page. F01 is device control, F12 the 2D sensor; F12's data
++ * registers are described by register descriptors (query 7-9), layout as in
++ * Linux drivers/input/rmi4/rmi_driver.c (rmi_read_register_desc). Polled:
++ * F01's interrupt status is read to release ATTN, then the F12 objects.
++ * Only writes: page select, F01 control 0 (normal, configured, nosleep) and
++ * F01 interrupt enable.
++ */
++static struct {
++	int page;
++	uint16_t f01_query, f01_ctrl, f01_data;
++	uint16_t f12_query, f12_ctrl, f12_data;
++	unsigned irq_count;
++	unsigned data_len, data1_off, data1_len, fingers, bb_fingers;
++	int flip; /* sweettouchflip: bit0 mirror x, bit1 mirror y, bit2 swap */
++} rmi = { .page = -1, .bb_fingers = 2 };
++
++static int
++rmi_set_page(unsigned page)
++{
++	if (rmi.page == (int)page) {
++		return 0;
++	}
++	const uint8_t w[2] = {RMI_PAGE_REG, (uint8_t)page};
++	int err = touch_write(RMI_ADDR, w, 2);
++	rmi.page = err ? -1 : (int)page;
++	return err;
++}
++
++static int
++rmi_read(uint16_t addr, uint8_t *buf, unsigned len)
++{
++	int err = rmi_set_page(addr >> 8);
++	unsigned done = 0;
++	while (!err && done < len) {
++		/* the bit-banged bus has no length limit; FIFO messages do */
++		unsigned n = st.bitbang ? len - done : MIN(len - done, RMI_CHUNK);
++		err = touch_read(RMI_ADDR, (uint16_t)((addr + done) & 0xffu), false, buf + done, n);
++		done += n;
++	}
++	return err;
++}
++
++static int
++rmi_write(uint16_t addr, uint8_t val)
++{
++	int err = rmi_set_page(addr >> 8);
++	if (err) {
++		return err;
++	}
++	const uint8_t w[2] = {(uint8_t)addr, val};
++	return touch_write(RMI_ADDR, w, 2);
++}
++
++static bool
++rmi_scan_pdt(void)
++{
++	bool any = false;
++	rmi.irq_count = 0;
++	for (unsigned page = 0; page < RMI_PAGES; ++page) {
++		bool page_has = false;
++		for (unsigned a = RMI_PDT_START; a >= RMI_PDT_END; a -= 6u) {
++			uint8_t e[6];
++			uint16_t at = (uint16_t)((page << 8) | a);
++			if (rmi_read(at, e, sizeof(e))) {
++				return any;
++			}
++			if (e[5] == 0 || e[5] == 0xff) {
++				break; /* end of this page's table */
++			}
++			page_has = any = true;
++			uint16_t base = (uint16_t)(page << 8);
++			printf("SWEET TOUCH: rmi F%02x page %u query=%#x ctrl=%#x data=%#x irqs=%u ver=%u\n",
++			    e[5], page, base | e[0], base | e[2], base | e[3], e[4] & 7u, (e[4] >> 5) & 3u);
++			if (e[5] == 0x01) {
++				rmi.f01_query = base | e[0];
++				rmi.f01_ctrl = base | e[2];
++				rmi.f01_data = base | e[3];
++			} else if (e[5] == 0x12) {
++				rmi.f12_query = base | e[0];
++				rmi.f12_ctrl = base | e[2];
++				rmi.f12_data = base | e[3];
++			}
++			rmi.irq_count += e[4] & 7u;
++		}
++		if (!page_has && page > 0) {
++			break;
++		}
++	}
++	return any;
++}
++
++/*
++ * Register descriptor at query address 'addr' (presence size, presence map,
++ * structure). Returns the byte offset and size of register 'want' within the
++ * function's data block, and the total size of all present registers.
++ */
++static bool
++rmi_reg_desc(uint16_t addr, unsigned want, unsigned *off, unsigned *len,
++    unsigned *subpackets, unsigned *total)
++{
++	uint8_t psize = 0, pres[36], sbuf[128];
++	*off = *len = *subpackets = *total = 0;
++	if (rmi_read(addr, &psize, 1) || psize == 0 || psize > sizeof(pres)) {
++		return false;
++	}
++	if (rmi_read(addr + 1u, pres, psize)) {
++		return false;
++	}
++	unsigned map_start = 1, ssize = pres[0];
++	if (ssize == 0) {
++		if (psize < 3) {
++			return false;
++		}
++		ssize = pres[1] | ((unsigned)pres[2] << 8);
++		map_start = 3;
++	}
++	if (ssize == 0 || ssize > sizeof(sbuf) || rmi_read(addr + 2u, sbuf, ssize)) {
++		printf("SWEET TOUCH: rmi descriptor %#x struct size %u unsupported\n", addr, ssize);
++		return false;
++	}
++	unsigned at = 0;
++	bool found = false;
++	for (unsigned i = map_start; i < psize; ++i) {
++		for (unsigned b = 0; b < 8; ++b) {
++			if (!(pres[i] & (1u << b))) {
++				continue;
++			}
++			unsigned reg = (i - map_start) * 8u + b;
++			if (at >= ssize) {
++				return false;
++			}
++			unsigned size = sbuf[at++];
++			if (size == 0 && at + 2 <= ssize) {
++				size = sbuf[at] | ((unsigned)sbuf[at + 1] << 8);
++				at += 2;
++			}
++			if (size == 0 && at + 4 <= ssize) {
++				size = sbuf[at] | ((unsigned)sbuf[at + 1] << 8) |
++				    ((unsigned)sbuf[at + 2] << 16) | ((unsigned)sbuf[at + 3] << 24);
++				at += 4;
++			}
++			unsigned subs = 0;
++			do {
++				if (at >= ssize) {
++					return false;
++				}
++				subs += (unsigned)__builtin_popcount(sbuf[at] & 0x7fu);
++			} while (sbuf[at++] & 0x80u);
++			if (reg == want) {
++				*off = *total;
++				*len = size;
++				*subpackets = subs;
++				found = true;
++			}
++			*total += size;
++		}
++	}
++	return found;
++}
++
++static bool
++rmi_setup(void)
++{
++	rmi.page = -1;
++	(void)PE_parse_boot_argn("sweettouchflip", &rmi.flip, sizeof(rmi.flip));
++	(void)PE_parse_boot_argn("sweettouchfingers", &rmi.bb_fingers, sizeof(rmi.bb_fingers));
++	if (rmi.bb_fingers == 0 || rmi.bb_fingers > TOUCH_MAX) {
++		rmi.bb_fingers = 2;
++	}
++	if (!rmi_scan_pdt() || !rmi.f01_ctrl || !rmi.f12_data) {
++		printf("SWEET TOUCH: rmi PDT has no F01/F12 (bootloader mode?)\n");
++		return false;
++	}
++	uint8_t status = 0, ctrl0 = 0, prod[11] = {0};
++	(void)rmi_read(rmi.f01_data, &status, 1);
++	(void)rmi_read(rmi.f01_query + 11u, prod, 10);
++	printf("SWEET TOUCH: rmi F01 status=%#x product=\"%s\"\n", status, (const char *)prod);
++	if (status & 0x40u) {
++		printf("SWEET TOUCH: rmi device is in its bootloader; no firmware to report touches\n");
++		return false;
++	}
++	/* F01 control 0: sleep mode normal (bits 1:0 = 0), nosleep (bit 2),
++	 * configured (bit 7). Then enable every function's interrupt source. */
++	if (!rmi_read(rmi.f01_ctrl, &ctrl0, 1)) {
++		(void)rmi_write(rmi.f01_ctrl, (uint8_t)((ctrl0 & ~3u) | 0x84u));
++	}
++	(void)rmi_write(rmi.f01_ctrl + 1u, 0xff);
++	unsigned subs = 0;
++	if (!rmi_reg_desc(rmi.f12_query + 7u, 1, &rmi.data1_off, &rmi.data1_len,
++	    &subs, &rmi.data_len)) {
++		printf("SWEET TOUCH: rmi F12 data descriptor has no data1; assuming data1 at 0\n");
++		rmi.data1_off = 0;
++		rmi.data1_len = TOUCH_MAX * 8u;
++		subs = TOUCH_MAX;
++	}
++	rmi.fingers = subs ? subs : rmi.data1_len / 8u;
++	if (rmi.fingers > TOUCH_MAX) {
++		rmi.fingers = TOUCH_MAX;
++	}
++	if (rmi.data1_off + rmi.fingers * 8u > RMI_RX_MAX) {
++		printf("SWEET TOUCH: rmi F12 data1 at %u+%u does not fit one read\n",
++		    rmi.data1_off, rmi.fingers * 8u);
++		return false;
++	}
++	printf("SWEET TOUCH: rmi F12 ctrl0=%#x data block %u bytes, data1 at %u len %u, %u objects, irqs=%u flip=%d\n",
++	    ctrl0, rmi.data_len, rmi.data1_off, rmi.data1_len, rmi.fingers, rmi.irq_count, rmi.flip);
++	return true;
++}
++
++static int
++touch_synaptics(void)
++{
++	uint8_t buf[RMI_RX_MAX], irq[2];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	unsigned irq_len = (rmi.irq_count + 7u) / 8u;
++	/* Reading F01's interrupt status releases ATTN; the value is not needed. */
++	(void)rmi_read(rmi.f01_data + 1u, irq, irq_len ? MIN(irq_len, 2u) : 1u);
++	/*
++	 * Bit-banged reads busy-wait the CPU (~0.1 ms per byte): read only the
++	 * first sweettouchfingers object slots (default 2 when bit-banging;
++	 * slots fill from 0, so one- and two-finger use loses nothing).
++	 */
++	unsigned slots = rmi.fingers;
++	if (st.bitbang && slots > rmi.bb_fingers) {
++		slots = rmi.bb_fingers;
++	}
++	int err = rmi_read(rmi.f12_data, buf, rmi.data1_off + slots * 8u);
++	if (err) {
++		rmi.page = -1; /* re-select the page after any bus error */
++		return err;
++	}
++	for (unsigned i = 0; i < slots; ++i) {
++		const uint8_t *o = buf + rmi.data1_off + 8u * i;
++		/* Object type: 1 finger, 2 stylus, 6 glove, 7 narrow, 0x0d small. */
++		if (o[0] != 1 && o[0] != 2 && o[0] != 6 && o[0] != 7 && o[0] != 0x0d) {
++			continue;
++		}
++		int px = (int)(o[1] | ((unsigned)o[2] << 8));
++		int py = (int)(o[3] | ((unsigned)o[4] << 8));
++		if (rmi.flip & 4) {
++			int t = px; px = py; py = t;
++		}
++		if (rmi.flip & 1) {
++			px = (int)tb->w - 1 - px;
++		}
++		if (rmi.flip & 2) {
++			py = (int)tb->h - 1 - py;
++		}
++		if (px < 0 || py < 0 || px >= (int)tb->w || py >= (int)tb->h) {
++			continue;
++		}
++		mask |= 1u << i;
++		x[i] = px;
++		y[i] = py;
++	}
++	if (mask && !st.active) {
++		/* Log the first point of each touch to verify orientation. */
++		unsigned i = (unsigned)__builtin_ctz(mask);
++		printf("SWEET TOUCH: down x=%d y=%d\n", x[i], y[i]);
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++/* betalm: power, reset and probe the Synaptics S3706 (LGE sm8150-beta DT). */
++static bool
++touch_betalm_start(void)
++{
++	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd152=%#x vcl59=%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(BETALM_VDD_GPIO)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(BETALM_VCL_GPIO)));
++	/* Hold reset while the rails come up; ATTN stays an input with pull-up. */
++	touch_gpio(tb->irq, 0, 3, 0, false, false);   /* 2 mA, pull-up */
++	touch_gpio(tb->rst, 0, 3, 2, true, false);    /* 6 mA, pull-up */
++	touch_gpio(BETALM_VDD_GPIO, 0, 0, 0, true, true);
++	touch_gpio(BETALM_VCL_GPIO, 0, 0, 0, true, true);
++	touch_wait(10);
++	if (st.bitbang) {
++		/* GPIO function, released; ATTN (active low) latched on both edges
++		 * in the TLMM status bit without routing it to the GIC. */
++		touch_gpio(tb->sda, 0, 3, 0, false, false);
++		touch_gpio(tb->scl, 0, 3, 0, false, false);
++		touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 8u, (1u << 4) | (3u << 2) | (1u << 1));
++		touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 0xcu, 0);
++	} else {
++		/* qupv3_se17_i2c_active: function qup17, 2 mA, bias-disable */
++		touch_gpio(tb->sda, tb->mux, 0, 0, false, false);
++		touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
++	}
++	touch_gpio(tb->rst, 0, 3, 2, true, true);
++	touch_wait(150); /* DT hw_reset_delay = 100 ms */
++	st.probing = true;
++	uint8_t pdt = 0, siw = 0;
++	int se = rmi_read(RMI_PDT_START + 5u, &pdt, 1); /* page 0 PDT: function id */
++	int we = se ? touch_read(0x28, 0x00, false, &siw, 1) : -1;
++	st.probing = false;
++	printf("SWEET TOUCH: probe synaptics@0x20 err=%d first-fn=%#x, siw@0x28 err=%d\n", se, pdt, we);
++	if (se || st.dead) {
++		if (we == 0) {
++			printf("SWEET TOUCH: this G8S has the SiW SW42000 panel touch; not supported yet\n");
++		}
++		return false;
++	}
++	if (!rmi_setup()) {
++		return false;
++	}
++	st.kind = TOUCH_SYNAPTICS;
++	return true;
++}
++
+ /* raphael: power the GT9886 through its load switches, reset it, leave doze. */
+ static bool
+ touch_raphael_start(void)
+@@ -1350,7 +1690,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	}
+ 	if (!tb->rpmh_l11c) {
+ 		/* raphael: vote the wrapper 2 clocks before the first SE register read */
+-		bool early_clocks = tb == &touch_raphael;
++		bool early_clocks = tb == &touch_raphael || tb == &touch_betalm;   /* both on wrapper 2 */
+ 		if (early_clocks && !touch_clocks()) {
+ 			goto out;
+ 		}
+@@ -1361,7 +1701,8 @@ touch_thread(void *arg, wait_result_t result)
+ 		if (!st.bitbang && ((!early_clocks && !touch_clocks()) || !touch_se_init())) {
+ 			goto out;
+ 		}
+-		if (!(tb == &touch_raphael ? touch_raphael_start() : touch_beryllium_start())) {
++		if (!(tb == &touch_betalm ? touch_betalm_start() :
++		    tb == &touch_raphael ? touch_raphael_start() : touch_beryllium_start())) {
+ 			goto out;
+ 		}
+ 		goto selected;
+@@ -1412,6 +1753,7 @@ selected:
+ 	printf("SWEET TOUCH: selected %s, %ux%u, poll=%ums i2c-half=%uus irq-hint=%d\n",
+ 	    st.kind == TOUCH_NVT ? "NT36672A" : st.kind == TOUCH_FT8719 ? "Focaltech FT8719" :
+ 	    st.kind == TOUCH_GT9886 ? "GT9886 Normandy" :
++	    st.kind == TOUCH_SYNAPTICS ? "Synaptics S3706 RMI4" :
+ 	    st.kind == TOUCH_GOODIX ? "GT9896 Yellowstone" : "Focaltech 54:52",
+ 	    tb->w, tb->h, touch_poll_ms, bb_half_us, st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+@@ -1435,7 +1777,8 @@ selected:
+ 		bool periodic = st.kind == TOUCH_FT8719 ? (++ticks % 50u) == 0 :
+ 		    (st.kind != TOUCH_NVT && (++ticks % 10u) == 0);
+ 		/* slow bit-banged readers: IRQ edge or finger down only */
+-		bool paced = st.kind == TOUCH_NVT || st.kind == TOUCH_FT8719;
++		bool paced = st.kind == TOUCH_NVT || st.kind == TOUCH_FT8719 ||
++		    (st.kind == TOUCH_SYNAPTICS && st.bitbang);
+ 		/*
+ 		 * While a finger is down read on every IRQ edge (a new frame) and at
+ 		 * least every ~8 ms, so a missed edge cannot leave a stuck contact;
+@@ -1450,6 +1793,7 @@ selected:
+ 			touch_trace_why = pending ? 'e' : 'a';
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
+ 			    st.kind == TOUCH_GT9886 ? touch_goodix_nor() :
++			    st.kind == TOUCH_SYNAPTICS ? touch_synaptics() :
+ 			    st.kind == TOUCH_NVT ? touch_novatek() :
+ 			    st.kind == TOUCH_FT8719 ? touch_ft8719() : touch_focaltech();
+ 			if (err) {
+@@ -1495,7 +1839,11 @@ sweet_touch_init(void)
+ 		return;
+ 	}
+ 	st.started = true;
+-	if (sweet_board_raphael()) {
++	if (sweet_board_betalm()) {
++		tb = &touch_betalm;     /* S3706, bit-banged (GSI-only SE17) */
++		st.irq_hint = 1;        /* busy-wait reads: on ATTN, while down, every 100 ms */
++		bb_half_us = 2;         /* ~200 kHz on the wire (the S3706 does 400 kHz) */
++	} else if (sweet_board_raphael()) {
+ 		tb = &touch_raphael;    /* GT9886 on FIFO I2C: poll every 10 ms as on sweet */
+ 	} else if (sweet_board_beryllium()) {
+ 		tb = &touch_beryllium;
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 3a33d61..9dfb3ab 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -56,8 +56,8 @@ private:
+ 	void pollBeryllium(void);
+ 	static unsigned estimatePercent(unsigned mv);
+ 	void pollRaphael(void);
+-	/* design capacity in mAh: Poco F1 5020 (DT nominal), raphael 4000 */
+-	static unsigned designMah(void) { return sweet_board_raphael() ? 4000u : 5020u; }
++	/* design capacity in mAh: Poco F1 5020 (DT nominal), raphael 4000, G8S 3550 (LG spec) */
++	static unsigned designMah(void) { return sweet_board_betalm() ? 3550u : sweet_board_raphael() ? 4000u : 5020u; }
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
+@@ -252,7 +252,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? (sweet_board_beryllium() ? "PMI8998 FG SOC" : sweet_board_raphael() ? "PM8150B FG SOC" :
++		    measured ? (sweet_board_beryllium() ? "PMI8998 FG SOC" : sweet_board_sm8150() ? "PM8150B FG SOC" :
+ 		    "PM6150 / estimated SOC") : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+@@ -414,8 +414,8 @@ SweetBattery::poll(void)
+ 		pollBeryllium();
+ 		return;
+ 	}
+-	if (fReal && sweet_board_raphael()) {
+-		pollRaphael();
++	if (fReal && sweet_board_sm8150()) {
++		pollRaphael();   /* PM8150B FG gen4 status registers: same on betalm */
+ 		return;
+ 	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+@@ -474,7 +474,7 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = sweet_board_raphael() ? 1 : 0;     /* 0262: raphael reads its fuel gauge by default */
++	int real = sweet_board_sm8150() ? 1 : 0;      /* 0262: raphael (and betalm) read their fuel gauge by default */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 891bc20..e0142ae 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -39,7 +39,7 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+-	if (sweet_board_beryllium() || sweet_board_raphael()) {
++	if (sweet_board_beryllium() || sweet_board_sm8150()) {
+ 		publishResource("IORTC");       /* 0245 (0262: also raphael's PM8150): IOKitInitializeTime waits up to 30 s for it */
+ 	}
+ 	return true;
+@@ -77,13 +77,13 @@ SweetPlatformExpert::haltRestart(unsigned int type)
+ long
+ SweetPlatformExpert::getGMTTimeOfDay(void)
+ {
+-	return (sweet_board_beryllium() || sweet_board_raphael()) ? (long)sweet_rtc_get() : 0;
++	return (sweet_board_beryllium() || sweet_board_sm8150()) ? (long)sweet_rtc_get() : 0;
+ }
+ 
+ void
+ SweetPlatformExpert::setGMTTimeOfDay(long secs)
+ {
+-	if ((sweet_board_beryllium() || sweet_board_raphael()) && secs > 0) {
++	if ((sweet_board_beryllium() || sweet_board_sm8150()) && secs > 0) {
+ 		sweet_rtc_set((uint64_t)secs);
+ 	}
+ }

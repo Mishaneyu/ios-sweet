@@ -1,0 +1,925 @@
+diff --git a/BootShim/BootShim.S b/BootShim/BootShim.S
+index 76dcb4f9..abee912d 100644
+--- a/BootShim/BootShim.S
++++ b/BootShim/BootShim.S
+@@ -1,3 +1,12 @@
++/* UniXNU's bootimg driver compiles this with FD_BASE/FD_SIZE; the Aloha
++   build script uses UEFI_BASE/UEFI_SIZE. */
++#ifndef UEFI_BASE
++#define UEFI_BASE FD_BASE
++#endif
++#ifndef UEFI_SIZE
++#define UEFI_SIZE FD_SIZE
++#endif
++
+ _Head:
+ 	/* Set _Entry address */
+ 	adr		x1, _Payload
+@@ -34,6 +43,12 @@ _StackSize:
+ 	.long 0
+ 
+ _Start:
++	/* Preserve the device-tree pointer for ShengBootMemoryDxe.
++	   0x9FF92000 is the reserved RAM Partition in the guacamole memory
++	   map; 0x9FFFF000 is the firmware Info Block and gets overwritten. */
++	movz	x6, #0x2000
++	movk	x6, #0x9FF9, lsl #16
++	str		x0, [x6]
+ 	mov		x4, x1
+ 	ldr		x5, _StackBase
+ 	cmp		x4, x5
+diff --git a/Platforms/AndromedaPkg/Driver/ShengBootMemoryDxe/ExtendedMemoryMap.h b/Platforms/AndromedaPkg/Driver/ShengBootMemoryDxe/ExtendedMemoryMap.h
+new file mode 100644
+index 00000000..82dd63d0
+--- /dev/null
++++ b/Platforms/AndromedaPkg/Driver/ShengBootMemoryDxe/ExtendedMemoryMap.h
+@@ -0,0 +1,22 @@
++// Get Macros for parent map
++#include <Library/PlatformMemoryMapLib.h>
++
++static ARM_MEMORY_REGION_DESCRIPTOR_EX gExtendedMemoryDescriptorEx[] = {
++    /* Name               Address     Length      HobOption        ResourceAttribute    ArmAttributes
++                                                          ResourceType          MemoryType */
++#if FixedPcdGet64(PcdMLVMBase) != 0
++        {"MLVM", FixedPcdGet64(PcdMLVMBase), 0x00, NoHob, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++#else
++        {"RAM Partition", 0xA0000000, 0x00, NoHob, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},
++#endif
++        // RAM without this DXE: 4GB mapped region
++        // MAX supported RAM Partitions: 8
++        {"RAM Partition", 0x00000000, 0x00, NoHob, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},
++        {"RAM Partition", 0x00000000, 0x00, NoHob, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},
++        {"RAM Partition", 0x00000000, 0x00, NoHob, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},
++        {"RAM Partition", 0x00000000, 0x00, NoHob, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},
++        {"RAM Partition", 0x00000000, 0x00, NoHob, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},
++        {"RAM Partition", 0x00000000, 0x00, NoHob, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},
++        {"RAM Partition", 0x00000000, 0x00, NoHob, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},
++        {"RAM Partition", 0x00000000, 0x00, NoHob, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},
++};
+diff --git a/Platforms/AndromedaPkg/Driver/ShengBootMemoryDxe/ShengBootMemoryDxe.c b/Platforms/AndromedaPkg/Driver/ShengBootMemoryDxe/ShengBootMemoryDxe.c
+new file mode 100644
+index 00000000..c623f4b6
+--- /dev/null
++++ b/Platforms/AndromedaPkg/Driver/ShengBootMemoryDxe/ShengBootMemoryDxe.c
+@@ -0,0 +1,653 @@
++/** @file
++  Memory and RAM disk from the device tree the previous stage handed over.
++
++  The previous stage (a Linux-style boot loader) passes the physical address
++  of a flattened device tree in x0, which SEC keeps in a HOB. Its /memory
++  nodes list the real DRAM and its /reserved-memory nodes list what the
++  secure side owns. Without the vendor memory manager the firmware only knows
++  the few regions of its own memory map, so:
++
++  * DRAM that no firmware region claims and no reserved-memory node covers is
++    added to the GCD as system memory, up to a fixed amount;
++  * the initrd the loader placed in memory (/chosen linux,initrd-start/-end)
++    is published as a read-only block device, so a FAT image in the boot
++    image's ramdisk shows up as a normal volume.
++
++  Nothing here depends on a hardware address; every range comes from the DT.
++**/
++
++#include <Uefi.h>
++#include <Library/BaseLib.h>
++#include <Library/BaseMemoryLib.h>
++#include <Library/DebugLib.h>
++#include <Library/DxeServicesTableLib.h>
++#include <Library/FdtLib.h>
++#include <Library/MemoryAllocationLib.h>
++#include <Library/UefiBootServicesTableLib.h>
++#include <Protocol/BlockIo.h>
++#include <Protocol/DevicePath.h>
++
++#define MAX_RANGES        64
++#define MIN_PIECE_SIZE    SIZE_16MB
++#define ADD_LIMIT         SIZE_1GB
++#define ADD_BELOW         SIZE_4GB     // stay inside what the MMU setup maps
++
++typedef struct {
++  UINT64  Base;
++  UINT64  End;       // exclusive
++} RANGE;
++
++STATIC
++UINT64
++ReadCells (
++  IN CONST VOID  *Data,
++  IN UINT32      Cells
++  )
++{
++  if (Cells == 2) {
++    return Fdt64ToCpu (ReadUnaligned64 (Data));
++  }
++
++  return Fdt32ToCpu (ReadUnaligned32 (Data));
++}
++
++STATIC
++UINT32
++GetCells (
++  IN CONST VOID  *Fdt,
++  IN INT32       Node,
++  IN CONST CHAR8 *Name,
++  IN UINT32      Default
++  )
++{
++  CONST VOID  *Prop;
++  INT32       Length;
++
++  Prop = FdtGetProp (Fdt, Node, Name, &Length);
++  if ((Prop == NULL) || (Length != sizeof (UINT32))) {
++    return Default;
++  }
++
++  return Fdt32ToCpu (ReadUnaligned32 (Prop));
++}
++
++STATIC
++UINTN
++CollectReg (
++  IN     CONST VOID  *Fdt,
++  IN     INT32       Node,
++  IN     UINT32      AddressCells,
++  IN     UINT32      SizeCells,
++  IN OUT RANGE       *Ranges,
++  IN     UINTN       Count
++  )
++{
++  CONST UINT8  *Reg;
++  INT32        Length;
++  UINT32       Entry;
++  INT32        Offset;
++  UINT64       Base;
++  UINT64       Size;
++
++  Reg = FdtGetProp (Fdt, Node, "reg", &Length);
++  if (Reg == NULL) {
++    return Count;
++  }
++
++  Entry = (AddressCells + SizeCells) * sizeof (UINT32);
++  for (Offset = 0; (Offset + (INT32)Entry <= Length) && (Count < MAX_RANGES); Offset += Entry) {
++    Base = ReadCells (Reg + Offset, AddressCells);
++    Size = ReadCells (Reg + Offset + AddressCells * sizeof (UINT32), SizeCells);
++    if ((Size != 0) && (Base + Size > Base)) {
++      Ranges[Count].Base = Base;
++      Ranges[Count].End  = Base + Size;
++      Count++;
++    }
++  }
++
++  return Count;
++}
++
++/**
++  Remove every part of Pieces[] that lies inside Cut.
++**/
++STATIC
++UINTN
++Subtract (
++  IN OUT RANGE  *Pieces,
++  IN     UINTN  Count,
++  IN     RANGE  Cut
++  )
++{
++  UINTN  Index;
++  UINTN  Result;
++  RANGE  Out[MAX_RANGES];
++
++  Result = 0;
++  for (Index = 0; Index < Count; Index++) {
++    if ((Cut.End <= Pieces[Index].Base) || (Cut.Base >= Pieces[Index].End)) {
++      if (Result < MAX_RANGES) {
++        Out[Result++] = Pieces[Index];
++      }
++
++      continue;
++    }
++
++    if ((Cut.Base > Pieces[Index].Base) && (Result < MAX_RANGES)) {
++      Out[Result].Base  = Pieces[Index].Base;
++      Out[Result].End   = Cut.Base;
++      Result++;
++    }
++
++    if ((Cut.End < Pieces[Index].End) && (Result < MAX_RANGES)) {
++      Out[Result].Base  = Cut.End;
++      Out[Result].End   = Pieces[Index].End;
++      Result++;
++    }
++  }
++
++  CopyMem (Pieces, Out, Result * sizeof (RANGE));
++  return Result;
++}
++
++STATIC
++VOID
++AddMemory (
++  IN CONST VOID  *Fdt
++  )
++{
++  EFI_STATUS                       Status;
++  EFI_GCD_MEMORY_SPACE_DESCRIPTOR  *Map;
++  UINTN                            MapCount;
++  INT32                            Root;
++  INT32                            Node;
++  INT32                            Reserved;
++  INT32                            Length;
++  CONST CHAR8                      *Type;
++  UINT32                           AddressCells;
++  UINT32                           SizeCells;
++  RANGE                            Banks[MAX_RANGES];
++  RANGE                            Holes[MAX_RANGES];
++  RANGE                            Pieces[MAX_RANGES];
++  UINTN                            BankCount;
++  UINTN                            HoleCount;
++  UINTN                            PieceCount;
++  UINTN                            ReservedCount;
++  RANGE                            ReservedRanges[MAX_RANGES];
++  UINTN                            Index;
++  UINTN                            Other;
++  UINT64                           Added;
++  UINT64                           Base;
++  UINT64                           End;
++
++  Root         = FdtPathOffset (Fdt, "/");
++  AddressCells = GetCells (Fdt, Root, "#address-cells", 2);
++  SizeCells    = GetCells (Fdt, Root, "#size-cells", 2);
++
++  BankCount = 0;
++  for (Node = FdtFirstSubnode (Fdt, Root); Node >= 0; Node = FdtNextSubnode (Fdt, Node)) {
++    Type = FdtGetProp (Fdt, Node, "device_type", &Length);
++    if ((Type != NULL) && (AsciiStrCmp (Type, "memory") == 0)) {
++      BankCount = CollectReg (Fdt, Node, AddressCells, SizeCells, Banks, BankCount);
++    }
++  }
++
++  ReservedCount = 0;
++  Reserved      = FdtPathOffset (Fdt, "/reserved-memory");
++  if (Reserved >= 0) {
++    UINT32  ResAddress = GetCells (Fdt, Reserved, "#address-cells", AddressCells);
++    UINT32  ResSize    = GetCells (Fdt, Reserved, "#size-cells", SizeCells);
++
++    for (Node = FdtFirstSubnode (Fdt, Reserved); Node >= 0; Node = FdtNextSubnode (Fdt, Node)) {
++      ReservedCount = CollectReg (Fdt, Node, ResAddress, ResSize, ReservedRanges, ReservedCount);
++    }
++  }
++
++  DEBUG ((DEBUG_ERROR, "SHENGMEM: DT has %u memory ranges and %u reserved ranges\n", (UINT32)BankCount, (UINT32)ReservedCount));
++  if (BankCount == 0) {
++    return;
++  }
++
++  Status = gDS->GetMemorySpaceMap (&MapCount, &Map);
++  if (EFI_ERROR (Status)) {
++    return;
++  }
++
++  //
++  // Holes: DRAM the GCD does not know yet.
++  //
++  HoleCount = 0;
++  for (Index = 0; Index < BankCount; Index++) {
++    for (Other = 0; Other < MapCount; Other++) {
++      if (Map[Other].GcdMemoryType != EfiGcdMemoryTypeNonExistent) {
++        continue;
++      }
++
++      Base = MAX (Banks[Index].Base, Map[Other].BaseAddress);
++      End  = MIN (Banks[Index].End, Map[Other].BaseAddress + Map[Other].Length);
++      if ((Base < End) && (HoleCount < MAX_RANGES)) {
++        Holes[HoleCount].Base = Base;
++        Holes[HoleCount].End  = End;
++        HoleCount++;
++      }
++    }
++  }
++
++  FreePool (Map);
++
++  //
++  // Minus everything the DT reserves; what is left is added right away.
++  //
++  Added = 0;
++  for (Index = 0; (Index < HoleCount) && (Added < ADD_LIMIT); Index++) {
++    Pieces[0]  = Holes[Index];
++    PieceCount = 1;
++    for (Other = 0; Other < ReservedCount; Other++) {
++      PieceCount = Subtract (Pieces, PieceCount, ReservedRanges[Other]);
++    }
++
++    for (Other = 0; (Other < PieceCount) && (Added < ADD_LIMIT); Other++) {
++      Base = ALIGN_VALUE (Pieces[Other].Base, SIZE_2MB);
++      End  = Pieces[Other].End & ~((UINT64)SIZE_2MB - 1);
++      if ((End <= Base) || (End - Base < MIN_PIECE_SIZE) || (End > ADD_BELOW)) {
++        continue;
++      }
++
++      End = MIN (End, Base + (ADD_LIMIT - Added));
++
++      //
++      // Add and map before anything can allocate from it.
++      //
++      Status = gDS->AddMemorySpace (
++                      EfiGcdMemoryTypeSystemMemory,
++                      Base,
++                      End - Base,
++                      EFI_MEMORY_UC | EFI_MEMORY_WC | EFI_MEMORY_WT | EFI_MEMORY_WB
++                      );
++      if (!EFI_ERROR (Status)) {
++        Status = gDS->SetMemorySpaceAttributes (Base, End - Base, EFI_MEMORY_WB);
++        if (EFI_ERROR (Status)) {
++          gDS->RemoveMemorySpace (Base, End - Base);
++        } else {
++          Added += End - Base;
++        }
++      }
++
++      DEBUG ((DEBUG_ERROR, "SHENGMEM: system memory 0x%lx-0x%lx %r\n", Base, End - 1, Status));
++    }
++  }
++
++  DEBUG ((DEBUG_ERROR, "SHENGMEM: added 0x%lx bytes of system memory\n", Added));
++}
++
++#define RAM_BLOCK_SIZE  512
++
++/* BootShim.S stores x0 here. The guacamole memory map reserves this RAM
++   Partition; the old 0x9FFFF000 address is the firmware Info Block. */
++#define BOOT_DTB_POINTER  0x9FF92000
++
++typedef struct {
++  UINT32  Magic;
++  UINT32  DtbValid;
++  UINT64  Dtb;
++  UINT32  Initrd;
++  UINT32  Scan;
++  UINT64  Addr;
++  UINT64  Size;
++} SHENG_STATUS;
++
++#define SHENG_STATUS_MAGIC  0x5348474D
++#define BOOT_STATUS         ((volatile SHENG_STATUS *)(UINTN)0x9FF92010)
++
++STATIC BOOLEAN
++IsPayloadFat (
++  IN  CONST UINT8  *Sector,
++  OUT UINT64       *Size
++  );
++
++#pragma pack(1)
++typedef struct {
++  VENDOR_DEVICE_PATH          Vendor;
++  EFI_DEVICE_PATH_PROTOCOL    End;
++} RAM_BLOCK_DEVICE_PATH;
++#pragma pack()
++
++STATIC RAM_BLOCK_DEVICE_PATH  mDevicePath = {
++  {
++    { HARDWARE_DEVICE_PATH, HW_VENDOR_DP, { (UINT8)sizeof (VENDOR_DEVICE_PATH), (UINT8)(sizeof (VENDOR_DEVICE_PATH) >> 8) } },
++    { 0xA9C6827C, 0x1BD8, 0x410C, { 0x88, 0x5A, 0xC4, 0x65, 0x00, 0xF7, 0xD8, 0x36 } }
++  },
++  { END_DEVICE_PATH_TYPE, END_ENTIRE_DEVICE_PATH_SUBTYPE, { sizeof (EFI_DEVICE_PATH_PROTOCOL), 0 } }
++};
++
++STATIC UINT8                    *mRamBase;
++STATIC EFI_BLOCK_IO_MEDIA       mMedia;
++
++STATIC
++EFI_STATUS
++EFIAPI
++RamBlockReset (
++  IN EFI_BLOCK_IO_PROTOCOL  *This,
++  IN BOOLEAN                ExtendedVerification
++  )
++{
++  return EFI_SUCCESS;
++}
++
++STATIC
++EFI_STATUS
++EFIAPI
++RamBlockRead (
++  IN  EFI_BLOCK_IO_PROTOCOL  *This,
++  IN  UINT32                 MediaId,
++  IN  EFI_LBA                Lba,
++  IN  UINTN                  BufferSize,
++  OUT VOID                   *Buffer
++  )
++{
++  if (Buffer == NULL) {
++    return EFI_INVALID_PARAMETER;
++  }
++
++  if (MediaId != mMedia.MediaId) {
++    return EFI_MEDIA_CHANGED;
++  }
++
++  if ((BufferSize % RAM_BLOCK_SIZE) != 0) {
++    return EFI_BAD_BUFFER_SIZE;
++  }
++
++  if ((Lba > mMedia.LastBlock) || ((BufferSize / RAM_BLOCK_SIZE) > (mMedia.LastBlock + 1 - Lba))) {
++    return EFI_INVALID_PARAMETER;
++  }
++
++  CopyMem (Buffer, mRamBase + Lba * RAM_BLOCK_SIZE, BufferSize);
++  return EFI_SUCCESS;
++}
++
++STATIC
++EFI_STATUS
++EFIAPI
++RamBlockWrite (
++  IN EFI_BLOCK_IO_PROTOCOL  *This,
++  IN UINT32                 MediaId,
++  IN EFI_LBA                Lba,
++  IN UINTN                  BufferSize,
++  IN VOID                   *Buffer
++  )
++{
++  return EFI_WRITE_PROTECTED;
++}
++
++STATIC
++EFI_STATUS
++EFIAPI
++RamBlockFlush (
++  IN EFI_BLOCK_IO_PROTOCOL  *This
++  )
++{
++  return EFI_SUCCESS;
++}
++
++STATIC EFI_BLOCK_IO_PROTOCOL  mBlockIo = {
++  EFI_BLOCK_IO_PROTOCOL_REVISION,
++  &mMedia,
++  RamBlockReset,
++  RamBlockRead,
++  RamBlockWrite,
++  RamBlockFlush
++};
++
++STATIC BOOLEAN  mPublished = FALSE;
++STATIC UINT64   mPublishedAddr;
++STATIC UINT64   mPublishedSize;
++
++STATIC
++VOID
++PublishRange (
++  IN UINT64  Start,
++  IN UINT64  End
++  )
++{
++  EFI_STATUS  Status;
++  EFI_HANDLE  Handle;
++
++  if (mPublished || (End <= Start) || (((End - Start) % RAM_BLOCK_SIZE) != 0)) {
++    return;
++  }
++
++  //
++  // The bootloader's ramdisk may still be described as conventional memory.
++  // Remove it from the GCD so the DXE allocator cannot overwrite the payload
++  // while FatDxe and UniXNU read it.
++  //
++  Status = gDS->RemoveMemorySpace (Start, End - Start);
++  DEBUG ((DEBUG_ERROR, "SHENGMEM: reserve initrd %r\n", Status));
++
++  mRamBase                = (UINT8 *)(UINTN)Start;
++  mMedia.MediaId          = 1;
++  mMedia.RemovableMedia   = FALSE;
++  mMedia.MediaPresent     = TRUE;
++  //
++  // The payload is a FAT volume image, not a partitioned disk. Mark it as a
++  // logical partition so PartitionDxe skips it and FatDxe can bind directly.
++  //
++  mMedia.LogicalPartition = TRUE;
++  mMedia.ReadOnly         = TRUE;
++  mMedia.WriteCaching     = FALSE;
++  mMedia.BlockSize        = RAM_BLOCK_SIZE;
++  mMedia.IoAlign          = 1;
++  mMedia.LastBlock        = (End - Start) / RAM_BLOCK_SIZE - 1;
++
++  Handle = NULL;
++  Status = gBS->InstallMultipleProtocolInterfaces (
++                  &Handle,
++                  &gEfiDevicePathProtocolGuid,
++                  &mDevicePath,
++                  &gEfiBlockIoProtocolGuid,
++                  &mBlockIo,
++                  NULL
++                  );
++  DEBUG ((DEBUG_ERROR, "SHENGMEM: initrd block device 0x%lx size 0x%lx %r\n", Start, End - Start, Status));
++  if (!EFI_ERROR (Status)) {
++    mPublished      = TRUE;
++    mPublishedAddr  = Start;
++    mPublishedSize  = End - Start;
++  }
++}
++
++STATIC
++BOOLEAN
++PublishInitrd (
++  IN CONST VOID  *Fdt
++  )
++{
++  INT32       Chosen;
++  CONST VOID  *StartProp;
++  CONST VOID  *EndProp;
++  INT32       StartLength;
++  INT32       EndLength;
++  UINT64      Start;
++  UINT64      End;
++  UINT64      FatSize;
++
++  Chosen = FdtPathOffset (Fdt, "/chosen");
++  if (Chosen < 0) {
++    DEBUG ((DEBUG_ERROR, "SHENGMEM: no /chosen\n"));
++    return FALSE;
++  }
++
++  StartProp = FdtGetProp (Fdt, Chosen, "linux,initrd-start", &StartLength);
++  EndProp   = FdtGetProp (Fdt, Chosen, "linux,initrd-end", &EndLength);
++  if ((StartProp == NULL) || (EndProp == NULL) ||
++      ((StartLength != 4) && (StartLength != 8)) || ((EndLength != 4) && (EndLength != 8)))
++  {
++    DEBUG ((DEBUG_ERROR, "SHENGMEM: no initrd in /chosen\n"));
++    return FALSE;
++  }
++
++  Start = ReadCells (StartProp, StartLength / 4);
++  End   = ReadCells (EndProp, EndLength / 4);
++  if ((End <= Start) || (((End - Start) % RAM_BLOCK_SIZE) != 0)) {
++    DEBUG ((DEBUG_ERROR, "SHENGMEM: initrd 0x%lx-0x%lx is not a whole number of sectors\n", Start, End));
++    return FALSE;
++  }
++
++  if (!IsPayloadFat ((CONST UINT8 *)(UINTN)Start, &FatSize) || (FatSize > (End - Start))) {
++    DEBUG ((DEBUG_ERROR, "SHENGMEM: DTB initrd 0x%lx is not the GUACESP FAT\n", Start));
++    return FALSE;
++  }
++
++  PublishRange (Start, End);
++  return mPublished;
++}
++
++STATIC
++BOOLEAN
++IsPayloadFat (
++  IN  CONST UINT8  *Sector,
++  OUT UINT64       *Size
++  )
++{
++  UINT16  BytesPerSector;
++  UINT32  TotalSectors;
++
++  if ((Sector == NULL) || (Sector[510] != 0x55) || (Sector[511] != 0xAA)) {
++    return FALSE;
++  }
++
++  if ((CompareMem (Sector + 82, "FAT32   ", 8) != 0) ||
++      (CompareMem (Sector + 71, "GUACESP", 7) != 0))
++  {
++    return FALSE;
++  }
++
++  BytesPerSector = ReadUnaligned16 ((CONST UINT16 *)(Sector + 11));
++  TotalSectors   = ReadUnaligned32 ((CONST UINT32 *)(Sector + 32));
++  if (((BytesPerSector != 512) && (BytesPerSector != 1024) &&
++       (BytesPerSector != 2048) && (BytesPerSector != 4096)) ||
++      (TotalSectors == 0))
++  {
++    return FALSE;
++  }
++
++  *Size = (UINT64)BytesPerSector * TotalSectors;
++  return (*Size >= 0x00100000) && (*Size <= 0x40000000) &&
++         ((*Size % RAM_BLOCK_SIZE) == 0);
++}
++
++STATIC
++BOOLEAN
++PublishScan (
++  VOID
++  )
++{
++  EFI_STATUS             Status;
++  EFI_MEMORY_DESCRIPTOR  *Map;
++  EFI_MEMORY_DESCRIPTOR  *Descriptor;
++  UINTN                  MapSize;
++  UINTN                  MapKey;
++  UINTN                  DescriptorSize;
++  UINTN                  Index;
++  UINT32                 DescriptorVersion;
++  UINT64                 Start;
++  UINT64                 End;
++  UINT64                 Address;
++  UINT64                 FatSize;
++
++  MapSize = 0;
++  Status  = gBS->GetMemoryMap (&MapSize, NULL, &MapKey, &DescriptorSize, &DescriptorVersion);
++  if (Status != EFI_BUFFER_TOO_SMALL) {
++    return FALSE;
++  }
++
++  MapSize += 4 * DescriptorSize;
++  Map      = AllocatePool (MapSize);
++  if (Map == NULL) {
++    return FALSE;
++  }
++
++  Status = gBS->GetMemoryMap (&MapSize, Map, &MapKey, &DescriptorSize, &DescriptorVersion);
++  if (EFI_ERROR (Status)) {
++    FreePool (Map);
++    return FALSE;
++  }
++
++  for (Index = 0; (Index < MapSize / DescriptorSize) && !mPublished; Index++) {
++    Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Index * DescriptorSize);
++    switch (Descriptor->Type) {
++      case EfiConventionalMemory:
++      case EfiBootServicesCode:
++      case EfiBootServicesData:
++      case EfiLoaderCode:
++      case EfiLoaderData:
++      case EfiRuntimeServicesCode:
++      case EfiRuntimeServicesData:
++      case EfiReservedMemoryType:
++        break;
++      default:
++        continue;
++    }
++
++    Start = Descriptor->PhysicalStart;
++    End   = Start + Descriptor->NumberOfPages * EFI_PAGE_SIZE;
++    if (End <= Start) {
++      continue;
++    }
++
++    for (Address = Start; Address + RAM_BLOCK_SIZE <= End; Address += EFI_PAGE_SIZE) {
++      if (IsPayloadFat ((CONST UINT8 *)(UINTN)Address, &FatSize)) {
++        DEBUG ((DEBUG_ERROR, "SHENGMEM: payload FAT at 0x%lx size 0x%lx\n", Address, FatSize));
++        PublishRange (Address, Address + FatSize);
++        break;
++      }
++    }
++  }
++
++  FreePool (Map);
++  return mPublished;
++}
++
++EFI_STATUS
++EFIAPI
++ShengBootMemoryDxeEntry (
++  IN EFI_HANDLE        ImageHandle,
++  IN EFI_SYSTEM_TABLE  *SystemTable
++  )
++{
++  UINT64  Dtb;
++
++  ZeroMem ((VOID *)(UINTN)BOOT_STATUS, sizeof (SHENG_STATUS));
++  BOOT_STATUS->Magic = SHENG_STATUS_MAGIC;
++
++  Dtb = *(UINT64 *)(UINTN)BOOT_DTB_POINTER;
++  if ((Dtb == 0) || ((Dtb & 3) != 0) || (FdtCheckHeader ((VOID *)(UINTN)Dtb) != 0)) {
++    DEBUG ((DEBUG_ERROR, "SHENGMEM: x0 0x%lx is not a device tree\n", Dtb));
++  } else {
++    DEBUG ((DEBUG_ERROR, "SHENGMEM: device tree at 0x%lx, %u bytes\n", Dtb, (UINT32)FdtTotalSize ((VOID *)(UINTN)Dtb)));
++    BOOT_STATUS->DtbValid = 1;
++    BOOT_STATUS->Dtb      = Dtb;
++    AddMemory ((VOID *)(UINTN)Dtb);
++    if (PublishInitrd ((VOID *)(UINTN)Dtb)) {
++      BOOT_STATUS->Initrd = 1;
++      BOOT_STATUS->Addr   = mPublishedAddr;
++      BOOT_STATUS->Size   = mPublishedSize;
++      return EFI_SUCCESS;
++    }
++  }
++
++  //
++  // The OnePlus ABL does not always announce the ramdisk in /chosen, and the
++  // DTB pointer can be lost before DXE. Find the payload FAT by its label in
++  // the UEFI memory map instead of trusting either.
++  //
++  if (PublishScan ()) {
++    BOOT_STATUS->Scan = 1;
++    BOOT_STATUS->Addr = mPublishedAddr;
++    BOOT_STATUS->Size = mPublishedSize;
++    return EFI_SUCCESS;
++  }
++
++  DEBUG ((DEBUG_ERROR, "SHENGMEM: no payload FAT found in memory\n"));
++  return EFI_SUCCESS;
++}
+diff --git a/Platforms/AndromedaPkg/Driver/ShengBootMemoryDxe/ShengBootMemoryDxe.inf b/Platforms/AndromedaPkg/Driver/ShengBootMemoryDxe/ShengBootMemoryDxe.inf
+new file mode 100644
+index 00000000..e54cd0cc
+--- /dev/null
++++ b/Platforms/AndromedaPkg/Driver/ShengBootMemoryDxe/ShengBootMemoryDxe.inf
+@@ -0,0 +1,31 @@
++[Defines]
++  INF_VERSION                    = 0x0001001B
++  BASE_NAME                      = ShengBootMemoryDxe
++  FILE_GUID                      = 5C0E4B7A-31D2-4E8F-9A66-0B1F7D2C8E43
++  MODULE_TYPE                    = DXE_DRIVER
++  VERSION_STRING                 = 1.0
++  ENTRY_POINT                    = ShengBootMemoryDxeEntry
++
++[Sources]
++  ShengBootMemoryDxe.c
++
++[Packages]
++  MdePkg/MdePkg.dec
++  MdeModulePkg/MdeModulePkg.dec
++
++[LibraryClasses]
++  BaseLib
++  BaseMemoryLib
++  DebugLib
++  DxeServicesTableLib
++  FdtLib
++  MemoryAllocationLib
++  UefiBootServicesTableLib
++  UefiDriverEntryPoint
++
++[Protocols]
++  gEfiBlockIoProtocolGuid                       ## PRODUCES
++  gEfiDevicePathProtocolGuid                    ## PRODUCES
++
++[Depex]
++  TRUE
+diff --git a/Platforms/SurfaceDuo1Pkg/Device/oneplus-guacamole/DXE.dsc.inc b/Platforms/SurfaceDuo1Pkg/Device/oneplus-guacamole/DXE.dsc.inc
+index 661e949a..116e6fd8 100644
+--- a/Platforms/SurfaceDuo1Pkg/Device/oneplus-guacamole/DXE.dsc.inc
++++ b/Platforms/SurfaceDuo1Pkg/Device/oneplus-guacamole/DXE.dsc.inc
+@@ -85,3 +85,7 @@ SurfaceDuo1Pkg/Device/$(TARGET_DEVICE)/Binaries/QcomPkg/Drivers/UFSDxe/UFSDxe.in
+ SurfaceDuo1Pkg/Device/$(TARGET_DEVICE)/PatchedBinaries/UsbConfigDxe.inf
+ SurfaceDuo1Pkg/Device/$(TARGET_DEVICE)/PatchedBinaries/PmicDxeLa.inf
+ #SurfaceDuo1Pkg/Device/$(TARGET_DEVICE)/PatchedBinaries/DisplayDxe.inf
++AndromedaPkg/Driver/ShengBootMemoryDxe/ShengBootMemoryDxe.inf
++UniXNUPkg/Application/UniXNU/UniXNU.inf
++UniXNUPkg/Driver/UniXNUDxe/UniXNUDxe.inf
++DarwinBootPkg/Driver/DarwinBoot.inf
+diff --git a/Platforms/SurfaceDuo1Pkg/Device/oneplus-guacamole/DXE.inc b/Platforms/SurfaceDuo1Pkg/Device/oneplus-guacamole/DXE.inc
+index f37b649a..860922dc 100644
+--- a/Platforms/SurfaceDuo1Pkg/Device/oneplus-guacamole/DXE.inc
++++ b/Platforms/SurfaceDuo1Pkg/Device/oneplus-guacamole/DXE.inc
+@@ -232,3 +232,8 @@ FILE FREEFORM = F780C779-DD7C-47CD-BD1A-5EB414C51704 {
+ #    SECTION PE32 = SurfaceDuo1Pkg/UsbcSetDrpDxe.efi
+ #    SECTION UI = "UsbcSetDrpDxe"
+ #}
++
++INF UniXNUPkg/Application/UniXNU/UniXNU.inf
++INF UniXNUPkg/Driver/UniXNUDxe/UniXNUDxe.inf
++INF DarwinBootPkg/Driver/DarwinBoot.inf
++INF AndromedaPkg/Driver/ShengBootMemoryDxe/ShengBootMemoryDxe.inf
+diff --git a/Platforms/SurfaceDuo1Pkg/PlatformBuildNoSb.py b/Platforms/SurfaceDuo1Pkg/PlatformBuildNoSb.py
+index b7e91081..e8de8a4f 100644
+--- a/Platforms/SurfaceDuo1Pkg/PlatformBuildNoSb.py
++++ b/Platforms/SurfaceDuo1Pkg/PlatformBuildNoSb.py
+@@ -50,7 +50,9 @@ class CommonPlatform():
+         "Features/CONFIG",
+         "Binaries",
+ ## aloha patch start
+-        "Silicon/QC/"+SiliconName
++        "Silicon/QC/"+SiliconName,
++        "../build-tree/package",
++        "../build-tree/drivers/DarwinBoot",
+ ## aloha patch end
+     )
+ 
+diff --git a/Platforms/SurfaceDuo1Pkg/SurfaceDuo1NoSb.dsc b/Platforms/SurfaceDuo1Pkg/SurfaceDuo1NoSb.dsc
+index 916cc570..f91803c7 100644
+--- a/Platforms/SurfaceDuo1Pkg/SurfaceDuo1NoSb.dsc
++++ b/Platforms/SurfaceDuo1Pkg/SurfaceDuo1NoSb.dsc
+@@ -103,6 +103,8 @@
+   OskInterruptLib|CranePkg/Library/OskInterruptLib/oskinterrupt.inf
+   # Generic libraries that interact with oskal
+   DebugUartLib|CranePkg/Library/DebugUartLib/debug_uart.inf
++  FdtLib|MdePkg/Library/BaseFdtLib/BaseFdtLib.inf
++  UniXNULib|UniXNUPkg/Library/UniXNULib/UniXNULib.inf
+ 
+ !include QcomPkg/QcomPkg.dsc.inc
+ !include SurfaceDuo1Pkg/Device/$(TARGET_DEVICE)/PcdsFixedAtBuild.dsc.inc
+diff --git a/Resources/Configs/guacamole.toml b/Resources/Configs/guacamole.toml
+new file mode 100644
+index 00000000..f8841bf8
+--- /dev/null
++++ b/Resources/Configs/guacamole.toml
+@@ -0,0 +1,17 @@
++[boot_shim]
++requires_kernel_header = true
++
++[uefi_fd]
++base = 0x9FC00000
++size = 0x00300000
++
++[boot_image_kernel]
++kernel_compression = "gzip"
++append_dtb = true
++
++[boot_image]
++header_version = 0
++base = 0x0
++kernel_offset = 0x8000
++tags_offset = 0x100
++pagesize = 4096
+diff --git a/Resources/Scripts/mkbootimg.py b/Resources/Scripts/mkbootimg.py
+new file mode 100755
+index 00000000..f26046e1
+--- /dev/null
++++ b/Resources/Scripts/mkbootimg.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""Pack an Android v0 boot image with the Aloha guacamole header values.
++
++The prebuilt oneplus-guacamole_NOSB.img has kernel_addr 0x8000, tags 0x100,
++ramdisk_addr 0, page 4096 and header version 0. UniXNU's bootimg driver passes
++the same values from Resources/Configs/guacamole.toml.
++"""
++import argparse
++import hashlib
++import struct
++from pathlib import Path
++
++
++def integer(value):
++    return int(value, 0)
++
++
++def align(value, alignment):
++    return (value + alignment - 1) & ~(alignment - 1)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--kernel", required=True)
++    parser.add_argument("--ramdisk")
++    parser.add_argument("--second")
++    parser.add_argument("-o", "--output", required=True)
++    parser.add_argument("--base", type=integer, default=0)
++    parser.add_argument("--kernel_offset", "--kernel-offset", dest="kernel_offset", type=integer, default=0x8000)
++    parser.add_argument("--ramdisk_offset", "--ramdisk-offset", dest="ramdisk_offset", type=integer, default=0)
++    parser.add_argument("--second_offset", "--second-offset", dest="second_offset", type=integer, default=0)
++    parser.add_argument("--tags_offset", "--tags-offset", dest="tags_offset", type=integer, default=0x100)
++    parser.add_argument("--pagesize", type=integer, default=4096)
++    parser.add_argument("--header_version", "--header-version", dest="header_version", type=integer, default=0)
++    parser.add_argument("--os_version", "--os-version", dest="os_version", type=integer, default=0)
++    parser.add_argument("--cmdline", default="")
++    parser.add_argument("--name", default="")
++    args = parser.parse_args()
++
++    if args.header_version != 0:
++        raise SystemExit("mkbootimg: only Android header version 0 is implemented")
++
++    kernel = Path(args.kernel).read_bytes()
++    ramdisk = Path(args.ramdisk).read_bytes() if args.ramdisk else b""
++    second = Path(args.second).read_bytes() if args.second else b""
++    name = args.name.encode()[:15].ljust(16, b"\0")
++    cmdline = args.cmdline.encode()[:511].ljust(512, b"\0")
++    extra_cmdline = b"\0" * 1024
++    digest = hashlib.sha1(
++        kernel
++        + ramdisk
++        + second
++        + struct.pack("<I", len(kernel))
++        + struct.pack("<I", len(ramdisk))
++        + struct.pack("<I", len(second))
++    ).digest()
++
++    header = struct.pack(
++        "<8s10I16s512s8s1024s",
++        b"ANDROID!",
++        len(kernel),
++        args.base + args.kernel_offset,
++        len(ramdisk),
++        args.base + args.ramdisk_offset,
++        len(second),
++        args.base + args.second_offset,
++        args.base + args.tags_offset,
++        args.pagesize,
++        args.header_version,
++        args.os_version,
++        name,
++        cmdline,
++        digest,
++        extra_cmdline,
++    )
++    assert len(header) == 1608, len(header)
++
++    page = args.pagesize
++    image = bytearray()
++    image += header + b"\0" * (align(len(header), page) - len(header))
++    image += kernel + b"\0" * (align(len(kernel), page) - len(kernel))
++    image += ramdisk + b"\0" * (align(len(ramdisk), page) - len(ramdisk))
++    image += second + b"\0" * (align(len(second), page) - len(second))
++    Path(args.output).write_bytes(image)
++    print(f"{args.output}: {len(image)} bytes")
++
++
++if __name__ == "__main__":
++    main()

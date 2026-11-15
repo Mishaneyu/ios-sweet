@@ -1,0 +1,27 @@
+# Build trees / checkouts (filled by the CI or local runs, never committed)
+unixnu/
+uefi/
+guacamole-ref/
+build-tree/
+out/
+.cache/
+
+# Generated / user-supplied binary inputs (kept out of git on purpose)
+inputs/
+*.macho
+*.dtb
+*.adt
+*.im4p
+*.img
+*.fd
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp

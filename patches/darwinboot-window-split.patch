@@ -1,0 +1,65 @@
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
+index 08cbabe..ac2e56b 100644
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -374,6 +374,51 @@ RunEnd (EFI_MEMORY_DESCRIPTOR *Map, UINTN Size, UINTN Stride, UINT64 Start, UINT
+   return End;
+ }
+ 
++// Reserve [Start, Start + Length) one memory-map entry at a time. The DXE core refuses a single
++// AllocatePages that spans several free entries (ConvertPages: "covers multiple entries" ->
++// EFI_NOT_FOUND), and a run found by RunEnd() is exactly such a chain. The pieces are adjacent, so
++// the window is still physically contiguous; freeing it as one range is allowed.
++STATIC
++EFI_STATUS
++ReserveRange (EFI_MEMORY_DESCRIPTOR *Map, UINTN Size, UINTN Stride, UINT64 Start, UINT64 Length)
++{
++  EFI_MEMORY_DESCRIPTOR *Descriptor;
++  EFI_PHYSICAL_ADDRESS  Piece;
++  EFI_STATUS            Status;
++  UINTN                 Offset;
++  UINT64                Cursor;
++  UINT64                End;
++  UINT64                DescriptorEnd;
++  UINT64                PieceEnd;
++
++  Cursor = Start;
++  End = Start + Length;
++  while (Cursor < End) {
++    PieceEnd = 0;
++    for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
++      Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
++      DescriptorEnd = Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages);
++      if ((Descriptor->Type == EfiConventionalMemory) && (Descriptor->PhysicalStart <= Cursor) &&
++          (Cursor < DescriptorEnd)) {
++        PieceEnd = MIN (DescriptorEnd, End);
++        break;
++      }
++    }
++    if (PieceEnd == 0) {
++      Status = EFI_NOT_FOUND;
++    } else {
++      Piece = Cursor;
++      Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (PieceEnd - Cursor), &Piece);
++    }
++    if (EFI_ERROR (Status)) {
++      if (Cursor > Start) { gBS->FreePages (Start, EFI_SIZE_TO_PAGES (Cursor - Start)); }
++      return Status;
++    }
++    Cursor = PieceEnd;
++  }
++  return EFI_SUCCESS;
++}
++
+ // Large diagnostic text straight into the GOP framebuffer: the UEFI text console font is too small to
+ // photograph. 5x12 glyphs from DiagFont.h scaled 4x, white on a black box; wraps at the right edge.
+ #include "DiagFont.h"
+@@ -458,7 +503,7 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
+     if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
+     Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, KERNEL_BLOCK_SIZE) + (Kernel->Base & (KERNEL_BLOCK_SIZE - 1));
+     if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
+-    Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
++    Status = ReserveRange (Map, Size, Stride, Candidate, WindowSize);
+     if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
+   }
+   if (EFI_ERROR (Status)) {

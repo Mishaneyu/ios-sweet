@@ -1,0 +1,158 @@
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
+index 84dc657..08cbabe 100644
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -17,6 +17,34 @@
+ #include "PackedRamdisk.h"
+ #include "WindowSize.h"
+ 
++//
++// Bring-up diagnostics (UniXNU-raphael): the Boot() step that failed, kept
++// in a volatile variable that the UniXNU menu shows after the entry returns.
++// The boot path itself is unchanged.
++//
++STATIC UINTN   mDiagStep;
++STATIC UINT64  mDiagBytes;
++STATIC UINT64  mDiagKernel;
++STATIC CONST CHAR8 *CONST  mDiagStepName[] = {
++  "entered", "inputs", "ramdisk layout", "command line", "open volume", "read kernel", "parse kernel",
++  "adt path", "read adt", "parse adt", "trust cache", "boot video", "window", "layout", "memory map"
++};
++
++STATIC
++VOID
++DiagRecord (EFI_STATUS Status)
++{
++  CHAR8  Text[160];
++  UINTN  Len;
++
++  Len = AsciiSPrint (Text, sizeof (Text), "step %u %a: %r need 0x%lx kernel 0x%lx",
++                     (UINT32)mDiagStep,
++                     (mDiagStep < ARRAY_SIZE (mDiagStepName)) ? mDiagStepName[mDiagStep] : "?",
++                     Status, mDiagBytes, mDiagKernel);
++  gST->RuntimeServices->SetVariable (L"DarwinBootDiag", &gUniXNULoaderProtocolGuid,
++                                     EFI_VARIABLE_BOOTSERVICE_ACCESS, Len + 1, Text);
++}
++
+ #define WINDOW_SIZE  SIZE_256MB
+ #define BLOCK_SIZE   SIZE_2MB
+ //
+@@ -95,6 +123,7 @@ ReadFile (
+   InfoSize = 0;
+   Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, NULL);
+   if (Status != EFI_BUFFER_TOO_SMALL) { goto Done; }
++  mDiagBytes = InfoSize;
+   Info = AllocatePool (InfoSize);
+   if (Info == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Done; }
+   Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
+@@ -104,6 +133,7 @@ ReadFile (
+     goto Done;
+   }
+   *Size = (UINTN)Info->FileSize;
++  mDiagBytes = *Size;
+   *Data = AllocatePool (*Size);
+   if (*Data == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Done; }
+   Actual = *Size;
+@@ -496,19 +526,29 @@ Boot (
+   UINT64                          Video[6];
+ 
+   (VOID)This;
+-  if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
++  mDiagStep = 0;
++  mDiagBytes = 0;
++  mDiagKernel = 0;
++  DiagRecord (EFI_SUCCESS);
++  mDiagStep = 1;
++  if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { DiagRecord (EFI_INVALID_PARAMETER); return EFI_INVALID_PARAMETER; }
+   if ((Request->KextCount != 0) || (Request->DeviceTree != NULL) || (Request->DeviceTreeSize != 0) ||
+       (DarwinCurrentEl () != 4)) {
+     Print (L"DARWINBOOT: unsupported inputs or exception level; firmware retained\n");
++    DiagRecord (EFI_UNSUPPORTED);
+     return EFI_UNSUPPORTED;
+   }
++  mDiagStep = 2;
++  mDiagBytes = Request->RamdiskSize;
+   if (!RamdiskLayout (Request->Ramdisk, Request->RamdiskSize, &RamdiskExpandedSize, &RamdiskPacked)) {
++    DiagRecord (EFI_BAD_BUFFER_SIZE);
+     return EFI_BAD_BUFFER_SIZE;
+   }
++  mDiagStep = 3;
+   ZeroMem (CommandLine, sizeof (CommandLine));
+   if (Request->BootArgs != NULL) {
+     for (Index = 0; Request->BootArgs[Index] != 0; Index++) {
+-      if ((Index >= sizeof (CommandLine) - 1) || (Request->BootArgs[Index] > 0x7f)) { return EFI_BAD_BUFFER_SIZE; }
++      if ((Index >= sizeof (CommandLine) - 1) || (Request->BootArgs[Index] > 0x7f)) { DiagRecord (EFI_BAD_BUFFER_SIZE); return EFI_BAD_BUFFER_SIZE; }
+       CommandLine[Index] = (CHAR8)Request->BootArgs[Index];
+     }
+   }
+@@ -520,21 +560,29 @@ Boot (
+   Map = NULL;
+   Address = 0;
+   Capacity = 0;
++  mDiagStep = 4;
+   Status = gBS->HandleProtocol (Request->Volume, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
+-  if (EFI_ERROR (Status)) { return Status; }
++  if (EFI_ERROR (Status)) { DiagRecord (Status); return Status; }
+   Status = Fs->OpenVolume (Fs, &Root);
+-  if (EFI_ERROR (Status)) { return Status; }
++  if (EFI_ERROR (Status)) { DiagRecord (Status); return Status; }
++  mDiagStep = 5;
+   Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
+   if (EFI_ERROR (Status)) { goto Fail; }
++  mDiagKernel = ImageSize;
++  mDiagStep = 6;
+   Status = ParseKernel (Image, ImageSize, &Kernel);
+   if (EFI_ERROR (Status)) { goto Fail; }
++  mDiagStep = 7;
+   Length = StrSize (Request->KernelPath);
++  mDiagBytes = Length + 11 * sizeof (CHAR16);
+   TreePath = AllocatePool (Length + 11 * sizeof (CHAR16));
+   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
+   CopyMem (TreePath, Request->KernelPath, Length);
+   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".adt");
++  mDiagStep = 8;
+   Status = ReadFile (Root, TreePath, SIZE_16MB, &Tree, &TreeSize);
+   if (EFI_ERROR (Status)) { goto Fail; }
++  mDiagStep = 9;
+   Offset = 0;
+   RamdiskOffset = MAX_UINTN;
+   TrustCacheOffset = MAX_UINTN;
+@@ -551,6 +599,7 @@ Boot (
+     Status = EFI_UNSUPPORTED;
+     goto Fail;
+   }
++  mDiagStep = 10;
+   CopyMem (TreePath, Request->KernelPath, Length);
+   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".trustcache");
+   Status = ReadFile (Root, TreePath, SIZE_16MB, &TrustCaches, &TrustCacheSize);
+@@ -565,10 +614,14 @@ Boot (
+     Status = EFI_COMPROMISED_DATA;
+     goto Fail;
+   }
++  mDiagStep = 11;
+   Status = ReadBootVideo (Video);
+   if (EFI_ERROR (Status)) { goto Fail; }
++  mDiagStep = 12;
++  mDiagBytes = WindowSize;
+   Status = AllocateWindow (&Kernel, WindowSize, &Address);
+   if (EFI_ERROR (Status)) { goto Fail; }
++  mDiagStep = 13;
+   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
+   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
+   RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
+@@ -610,6 +663,7 @@ Boot (
+   FreePool (Tree); Tree = NULL;
+   FreePool (TreePath); TreePath = NULL;
+   Root->Close (Root); Root = NULL;
++  mDiagStep = 14;
+   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
+   if (EFI_ERROR (Status)) { goto Fail; }
+   Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
+@@ -663,6 +717,7 @@ Fail:
+   if (Map != NULL) { FreePool (Map); }
+   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
+   Print (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);
++  DiagRecord (Status);
+   return Status;
+ }
+ 
