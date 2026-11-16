@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium|raphael|betalm] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium|raphael|betalm] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE] [--mem BASE:SIZE]
 """
 import hashlib, os, struct, sys
 
@@ -192,7 +192,7 @@ def bluetooth_node(ph):
 
 
 def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, points=(375, 812), lowpool=None,
-          identity='d22ap'):
+          identity='d22ap', mem=None):
     ident = IDENTITIES[identity]
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     b = BOARDS[board]
@@ -200,6 +200,8 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
     if board != 'sweet' and not qemu:
         if not highmem:
             phys_base, mem_size = b['mem']
+    if mem is not None:                      # --mem BASE:SIZE (hex): override the kernel RAM window
+        phys_base, mem_size = mem
     fb, fb_size = b['fb']
     fb_w, fb_h = b['fb_wh']
     if lowpool is not None:
@@ -393,8 +395,9 @@ if __name__ == '__main__':
     points = tuple(int(v) for v in sys.argv[sys.argv.index('--points') + 1].split('x')) if '--points' in sys.argv else (375, 812)
     lowpool = parse_lowpool(sys.argv[sys.argv.index('--lowpool') + 1]) if '--lowpool' in sys.argv else None
     identity = sys.argv[sys.argv.index('--identity') + 1] if '--identity' in sys.argv else 'd22ap'
+    mem = tuple(int(v, 16) for v in sys.argv[sys.argv.index('--mem') + 1].split(':')) if '--mem' in sys.argv else None
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, board=board, display_scale=scale, points=points,
-                 lowpool=lowpool, identity=identity)
+                 lowpool=lowpool, identity=identity, mem=mem)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
