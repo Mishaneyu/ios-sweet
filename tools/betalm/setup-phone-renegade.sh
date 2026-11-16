@@ -9,8 +9,18 @@ set -euo pipefail
 HFSZIP=$(realpath "${1:?usage: setup-phone-renegade.sh HFSPROGS.zip}")
 step() { printf '\n=== %s\n' "$*"; }
 
-step "packages (pacman)"
-sudo pacman -S --needed --noconfirm base-devel cmake git python fuse3 bzip2 zlib attr zstd curl unzip
+step "packages (pacman, only if missing; no database sync, no system upgrade)"
+need=()
+for p in base-devel git python fuse3 bzip2 zlib attr zstd curl unzip; do pacman -Qq "$p" >/dev/null 2>&1 || need+=("$p"); done
+if [ ${#need[@]} -gt 0 ]; then sudo pacman -S --needed --noconfirm "${need[@]}"; else echo "all present"; fi
+
+step "cmake (PyPI wheel in a venv; avoids a pacman -Syu of the whole phone)"
+if ! command -v cmake >/dev/null; then
+	python3 -m venv ~/.local/renegade-venv
+	~/.local/renegade-venv/bin/pip install -q --upgrade pip cmake
+	export PATH="$HOME/.local/renegade-venv/bin:$PATH"
+fi
+cmake --version | head -1
 
 step "hfsplus kernel module"
 sudo modprobe hfsplus && lsmod | grep -q '^hfsplus' && echo "hfsplus loaded"
