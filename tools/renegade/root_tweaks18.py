@@ -342,6 +342,23 @@ def host_exe(out, name):
     return p if os.path.isfile(p) else None
 
 
+TOYBOX_ALL = """
+acpi arch ascii base32 base64 basename bc blkdiscard blkid blockdev bunzip2 bzcat cal cat chattr chgrp chmod chown
+chroot chrt chvt cksum clear cmp comm count cp cpio crc32 cut date dd devmem df diff dirname dmesg dnsdomainname
+dos2unix du echo egrep eject env expand expr factor fallocate false fgrep file find flock fmt fold free freeramdisk
+fsfreeze fstype fsync getconf getopt grep groups gunzip gzip head help hexdump hexedit host hostname hwclock iconv id
+ifconfig inotifyd insmod install ionice iorenice iotop kill killall killall5 less link ln logger login logname losetup
+ls lsattr lsmod lsof lspci lsusb makedevs mcookie md5sum memeater microcom mix mkdir mkfifo mknod mkpasswd mkswap
+mktemp modinfo more mount mountpoint mv netcat netstat nice nl nohup nproc nsenter od oneit openvt partprobe passwd
+paste patch pgrep pidof ping ping6 pivot_root pkill pmap printenv printf prlimit ps pwd pwdx pwgen readahead readelf
+readlink realpath reboot renice reset rev rfkill rm rmdir rmmod route rtcwake sed seq setfattr setsid sh sha1sum
+sha224sum sha256sum sha384sum sha3sum sha512sum shred shuf sleep sntp sort split stat strings stty su swapoff swapon
+switch_root sync sysctl tac tail tar taskset tee test time timeout top touch tr traceroute true truncate tsort tty
+tunctl ulimit umount uname uniq unix2dos unlink unshare uptime usleep uudecode uuencode uuid vi vmstat w watch wc wget
+which who whoami xargs xxd yes zcat awk
+"""
+
+
 def toybox_applets(out):
     """Names of the toybox applets (symlinked in /usr/local/bin). Order of preference: the host toybox listing itself
     (what macOS always did), `toybox-applets.txt` next to the binaries, else derived: the CONFIG_X=y lines of
@@ -357,7 +374,12 @@ def toybox_applets(out):
         return open(lst).read().split()
     cfg = os.path.join(HERE, '..', 'ssh', 'toybox.config')
     binary = open(os.path.join(out, 'toybox'), 'rb').read()
-    cand = {m.lower() for m in re.findall(r'^CONFIG_([A-Z0-9_]+)=y', open(cfg).read(), re.M)}
+    if os.path.isfile(cfg):
+        cand = {m.lower() for m in re.findall(r'^CONFIG_([A-Z0-9_]+)=y', open(cfg).read(), re.M)}
+    else:
+        # checkout without tools/ssh (betalm branch): every toybox command name, kept only where the iOS
+        # binary's command table has it as a C string
+        cand = set(TOYBOX_ALL.split())
     found = {c for c in cand if b'\0' + c.encode() + b'\0' in binary} - {'toybox'}
     if 'test' in found:
         found.add('[')
