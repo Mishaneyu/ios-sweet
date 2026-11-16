@@ -494,6 +494,32 @@ class Linux(Backend):
         return pacstrip.entitlements_xml(path)          # parsed from the signature blob (works for Apple and ldid signatures)
 
     @staticmethod
+    def drop_int_entitlements(xml):
+        """(xml without the top-level keys whose value holds an integer, [dropped keys]); xml unchanged if none."""
+        import plistlib
+        try:
+            d = plistlib.loads(xml)
+        except Exception:
+            return xml, []
+
+        def has_int(v):
+            if isinstance(v, bool):
+                return False
+            if isinstance(v, int):
+                return True
+            if isinstance(v, dict):
+                return any(has_int(x) for x in v.values())
+            if isinstance(v, list):
+                return any(has_int(x) for x in v)
+            return False
+        dropped = [k for k, v in d.items() if has_int(v)] if isinstance(d, dict) else []
+        if not dropped:
+            return xml, []
+        for k in dropped:
+            del d[k]
+        return plistlib.dumps(d), dropped
+
+    @staticmethod
     def ldid_cmd(ldid, path, ident=None, flags=None, ents_file=None):
         """ldid ad-hoc signing: -S[ents] pseudo-signs, -I identifier, -C flags (adhoc is always set: codesign sets it too,
         and without it the CodeDirectory is not an ad-hoc one), -Hsha256 (codesign's ad-hoc signature has one sha256
@@ -517,7 +543,13 @@ class Linux(Backend):
         tmpdir = tempfile.mkdtemp(prefix='renegade-ents-')
         ents_file = None
         try:
+            dropped = []
             if entitlements:
+                # ldid 2.1.5 (procursus7) throws std::bad_alloc while DER-encoding integers in entitlements
+                # (iOS 18: com.apple.trial.status.deployment-environment.allow = [0, 1, 2]), after first eating
+                # all free memory. Leave the integer-valued keys out up front (they only gate Trial experiment
+                # environments) and record which ones went.
+                entitlements, dropped = Linux.drop_int_entitlements(entitlements)
                 ents_file = os.path.join(tmpdir, 'ents.plist')
                 with open(ents_file, 'wb') as f:
                     f.write(entitlements)
@@ -525,40 +557,15 @@ class Linux(Backend):
             for _ in range(retries):
                 r = self.run(cmd, check=False)
                 if r.returncode == 0:
-                    return
-                if 'bad_alloc' in (r.stderr or ''):
-                    break                                   # deterministic, retrying does not help
-            if entitlements and 'bad_alloc' in (r.stderr or ''):
-                # ldid 2.1.5 (procursus7) throws std::bad_alloc while DER-encoding integers in entitlements
-                # (iOS 18: com.apple.trial.status.deployment-environment.allow = [0, 1, 2]). Sign without the
-                # integer-valued keys and say which ones went (they only gate Trial experiment environments).
-                import plistlib
-                d = plistlib.loads(entitlements)
-
-                def has_int(v):
-                    if isinstance(v, bool):
-                        return False
-                    if isinstance(v, int):
-                        return True
-                    if isinstance(v, dict):
-                        return any(has_int(x) for x in v.values())
-                    if isinstance(v, list):
-                        return any(has_int(x) for x in v)
-                    return False
-                dropped = [k for k, v in d.items() if has_int(v)]
-                if dropped:
-                    for k in dropped:
-                        del d[k]
-                    with open(ents_file, 'wb') as f:
-                        f.write(plistlib.dumps(d))
-                    r = self.run(cmd, check=False)
-                    if r.returncode == 0:
+                    if dropped:
                         print(f'ldid workaround: {path}: dropped integer entitlement(s) {dropped}', file=sys.stderr, flush=True)
                         log = os.environ.get('RENEGADE_ENTS_DROPPED')
                         if log:
                             with open(log, 'a') as f:
                                 f.write(f'{path}\t{",".join(dropped)}\n')
-                        return
+                    return
+                if 'bad_alloc' in (r.stderr or ''):
+                    break                                   # deterministic, retrying does not help
             raise SystemExit(f'ldid failed for {path}: {(r.stderr or r.stdout).strip()}')
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
