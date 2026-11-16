@@ -38,6 +38,8 @@ step "apfs-fuse (read Apple's APFS disk images)"
 if ! command -v apfs-fuse >/dev/null; then
 	rm -rf ~/src/apfs-fuse; mkdir -p ~/src
 	git clone -q --recursive https://github.com/sgan81/apfs-fuse ~/src/apfs-fuse
+	# GCC 15: PList.h uses uint8_t without <cstdint>
+	grep -q '<cstdint>' ~/src/apfs-fuse/ApfsLib/PList.h || sed -i 's|#include <memory>|#include <memory>\n#include <cstdint>|' ~/src/apfs-fuse/ApfsLib/PList.h
 	# apfs-fuse asks for cmake_minimum_required < 3.5, which CMake 4 rejects without this policy floor
 	cmake -S ~/src/apfs-fuse -B ~/src/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null
 	make -C ~/src/apfs-fuse/build -j"$(nproc)" >/dev/null
