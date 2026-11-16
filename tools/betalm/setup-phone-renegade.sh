@@ -23,7 +23,8 @@ fi
 cmake --version | head -1
 
 step "hfsplus kernel module"
-sudo modprobe hfsplus && lsmod | grep -q '^hfsplus' && echo "hfsplus loaded"
+sudo modprobe hfsplus
+if grep -qw hfsplus /proc/filesystems; then echo "hfsplus available"; else echo "hfsplus NOT available" >&2; exit 1; fi
 echo hfsplus | sudo tee /etc/modules-load.d/hfsplus.conf >/dev/null
 
 step "hfsprogs (mkfs.hfsplus, fsck.hfsplus) from $HFSZIP"
@@ -37,7 +38,8 @@ step "apfs-fuse (read Apple's APFS disk images)"
 if ! command -v apfs-fuse >/dev/null; then
 	rm -rf ~/src/apfs-fuse; mkdir -p ~/src
 	git clone -q --recursive https://github.com/sgan81/apfs-fuse ~/src/apfs-fuse
-	cmake -S ~/src/apfs-fuse -B ~/src/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release >/dev/null
+	# apfs-fuse asks for cmake_minimum_required < 3.5, which CMake 4 rejects without this policy floor
+	cmake -S ~/src/apfs-fuse -B ~/src/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null
 	make -C ~/src/apfs-fuse/build -j"$(nproc)" >/dev/null
 	sudo install -m 755 ~/src/apfs-fuse/build/apfs-fuse /usr/local/bin/
 fi
