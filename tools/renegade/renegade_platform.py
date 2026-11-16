@@ -526,6 +526,39 @@ class Linux(Backend):
                 r = self.run(cmd, check=False)
                 if r.returncode == 0:
                     return
+                if 'bad_alloc' in (r.stderr or ''):
+                    break                                   # deterministic, retrying does not help
+            if entitlements and 'bad_alloc' in (r.stderr or ''):
+                # ldid 2.1.5 (procursus7) throws std::bad_alloc while DER-encoding integers in entitlements
+                # (iOS 18: com.apple.trial.status.deployment-environment.allow = [0, 1, 2]). Sign without the
+                # integer-valued keys and say which ones went (they only gate Trial experiment environments).
+                import plistlib
+                d = plistlib.loads(entitlements)
+
+                def has_int(v):
+                    if isinstance(v, bool):
+                        return False
+                    if isinstance(v, int):
+                        return True
+                    if isinstance(v, dict):
+                        return any(has_int(x) for x in v.values())
+                    if isinstance(v, list):
+                        return any(has_int(x) for x in v)
+                    return False
+                dropped = [k for k, v in d.items() if has_int(v)]
+                if dropped:
+                    for k in dropped:
+                        del d[k]
+                    with open(ents_file, 'wb') as f:
+                        f.write(plistlib.dumps(d))
+                    r = self.run(cmd, check=False)
+                    if r.returncode == 0:
+                        print(f'ldid workaround: {path}: dropped integer entitlement(s) {dropped}', file=sys.stderr, flush=True)
+                        log = os.environ.get('RENEGADE_ENTS_DROPPED')
+                        if log:
+                            with open(log, 'a') as f:
+                                f.write(f'{path}\t{",".join(dropped)}\n')
+                        return
             raise SystemExit(f'ldid failed for {path}: {(r.stderr or r.stdout).strip()}')
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)

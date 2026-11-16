@@ -164,6 +164,9 @@ def stage_copy(a, img, rootmnt, dmgs):
     need_free('copy stage')
     if os.path.exists(JB_OWNERS):
         os.unlink(JB_OWNERS)
+    for stale in ('macho-failed.txt', 'ents-dropped.tsv'):      # a fresh root: no macho resume from an older run
+        if os.path.exists(os.path.join(W, stale)):
+            os.unlink(os.path.join(W, stale))
     for k, v in dmgs.items():
         if not os.path.exists(v) and k not in (a.skip_sources or '').split(','):
             sys.exit(f'missing {k} dmg {v}: run tools/renegade/fetch-root.sh')
@@ -302,8 +305,40 @@ def macho_worker(path):
         return path, 'FAILED: ' + str(e)[:300], None
 
 
+def stage_macho_resign_failed(root, failed_txt):
+    """Resume after a macho stage that stopped on failed files: those are already PAC-stripped on disk but still
+    carry the old (now invalid) signature, so a full re-run would call them 'clean' and never sign them. Re-sign
+    exactly those, add them to identities.tsv, and leave every other file as the first run made it."""
+    paths = [l.split('\t')[0] for l in open(failed_txt).read().splitlines() if l.startswith('/')]
+    log(f'macho resume: re-signing the {len(paths)} files of {failed_txt} (the rest is done)')
+    idf = os.path.join(W, 'identities.tsv')
+    done, failed = [], []
+    for p in paths:
+        try:
+            old = pacstrip.sign(p)
+            done.append((p, old))
+        except BaseException as e:
+            failed.append((p, str(e)[:300]))
+    with open(idf, 'a') as f:
+        for p, i in done:
+            if i:
+                f.write(f'{os.path.relpath(p, root)}\t{i[0]}\t{i[1]}\t{i[2]:x}\n')
+    for p, s in failed:
+        log('  ', p, s)
+    if failed:
+        open(failed_txt, 'w').write('\n'.join(f'{p}\t{s}' for p, s in failed))
+        sys.exit(f'{len(failed)} Mach-O files still fail ({failed_txt}): the build must not continue')
+    os.rename(failed_txt, failed_txt + '.resolved')
+    log(f'macho resume: {len(done)} re-signed, macho stage complete')
+
+
 def stage_macho(a, root):
     need_free('macho stage')
+    os.environ.setdefault('RENEGADE_ENTS_DROPPED', os.path.join(W, 'ents-dropped.tsv'))
+    failed_txt = os.path.join(W, 'macho-failed.txt')
+    if os.path.exists(failed_txt):
+        rplat.prepare_signer()
+        return stage_macho_resign_failed(root, failed_txt)
     skip_prefix = os.path.join(root, 'System/Library/Caches/com.apple.dyld')
     rplat.prepare_signer()                   # Linux: fetch/verify the pinned ldid once, before the pool starts
     inode_first, links, files = {}, [], []
