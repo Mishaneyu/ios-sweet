@@ -92,10 +92,24 @@ def load(path):
 
 
 def save(path, data, uid, gid, mode, fmt=plistlib.FMT_BINARY):
-    with open(path, 'wb') as f:
-        plistlib.dump(data, f, fmt=fmt)
-    os.chown(path, uid, gid)
-    os.chmod(path, mode)
+    """Write the plist as a NEW file (one write, fsync) and rename it over path. Rewriting a big file in place on
+    the Linux hfsplus driver can fail half-way with ENOENT (launchd.plist, iOS 18, after the macho stage) and
+    leaves it truncated; a fresh file never loses the old one."""
+    blob = plistlib.dumps(data, fmt=fmt)
+    tmp = path + '.sweet-new'
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        view = memoryview(blob)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chown(tmp, uid, gid)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
 
 
 def merge_pref(root, name, values):
