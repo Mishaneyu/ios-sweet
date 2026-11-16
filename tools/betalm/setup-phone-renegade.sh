@@ -9,6 +9,10 @@ set -euo pipefail
 HFSZIP=$(realpath "${1:?usage: setup-phone-renegade.sh HFSPROGS.zip}")
 step() { printf '\n=== %s\n' "$*"; }
 
+step "clock (NTP: a wrong date breaks TLS and tar/make timestamps)"
+sudo timedatectl set-ntp true || true
+date
+
 step "packages (pacman, only if missing; no database sync, no system upgrade)"
 need=()
 for p in base-devel git python fuse3 bzip2 zlib attr zstd curl unzip; do pacman -Qq "$p" >/dev/null 2>&1 || need+=("$p"); done
@@ -50,11 +54,11 @@ command -v apfs-fuse
 step "ipsw (blacktop, linux_arm64)"
 if ! command -v ipsw >/dev/null; then
 	URL=$(curl -fsSL https://api.github.com/repos/blacktop/ipsw/releases/latest |
-		python3 -c 'import json,sys; a=[x["browser_download_url"] for x in json.load(sys.stdin)["assets"] if x["name"].endswith("_linux_arm64.tar.gz")]; print(a[0])')
+		python3 -c 'import json,sys; a=[x["browser_download_url"] for x in json.load(sys.stdin)["assets"] if x["name"].startswith("ipsw_") and x["name"].endswith("_linux_arm64.tar.gz")]; print(a[0])')
 	echo "$URL"
 	T=$(mktemp -d); curl -fsSL "$URL" -o "$T/ipsw.tar.gz"
 	tar -xzf "$T/ipsw.tar.gz" -C "$T"
-	sudo install -m 755 "$(find "$T" -type f -name ipsw | head -1)" /usr/local/bin/ipsw
+	sudo install -m 755 "$T/ipsw" /usr/local/bin/ipsw    # the release also has ipswd_* (the daemon): not that one
 	rm -rf "$T"
 fi
 ipsw version 2>/dev/null | head -1 || ipsw --version
